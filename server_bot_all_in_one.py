@@ -190,10 +190,10 @@ def get_env_or_config(env_name: str, config_key: str, default=None):
 
 
 def get_remote_log_config():
-    host = get_env_or_config("PINGPLAYERS_SFTP_HOST", "sftp_host")
-    port = int(get_env_or_config("PINGPLAYERS_SFTP_PORT", "sftp_port", 22) or 22)
-    username = get_env_or_config("PINGPLAYERS_SFTP_USERNAME", "sftp_username")
-    password = get_env_or_config("PINGPLAYERS_SFTP_PASSWORD", "sftp_password")
+    host = get_env_or_config("PINGPLAYERS_SFTP_HOST", "sftp_host", "68.168.208.54")
+    port = int(get_env_or_config("PINGPLAYERS_SFTP_PORT", "sftp_port", 11216) or 11216)
+    username = get_env_or_config("PINGPLAYERS_SFTP_USERNAME", "sftp_username", "server26449")
+    password = get_env_or_config("PINGPLAYERS_SFTP_PASSWORD", "sftp_password", "LYcxz02dLm")
     remote_log_path = get_env_or_config(
         "PINGPLAYERS_REMOTE_LOG_PATH",
         "remote_log_path",
@@ -353,8 +353,11 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
     transport = None
     sftp = None
     try:
+        print(f"[SFTP LOG] Connecting host={cfg['host']} port={cfg['port']} user={cfg['username']}")
         transport, sftp = open_sftp_client(cfg)
         remote_path = cfg["remote_log_path"]
+        print(f"[SFTP LOG] Connected to remote log")
+        print(f"[SFTP LOG] Reading tail from {remote_path}")
         with sftp.open(remote_path, "rb") as remote_file:
             remote_file.seek(0, 2)
             size = remote_file.tell()
@@ -394,6 +397,7 @@ def get_latest_health_log_for_steam(steam_id: str, min_event_time: datetime | No
         if min_event_time and event_time and event_time < min_event_time:
             continue
         last_remote_log_match[str(steam_id)] = parsed
+        print(f"[SFTP LOG] Matched SetHealth for steam_id={steam_id}")
         return parsed
 
     return last_remote_log_match.get(str(steam_id))
@@ -839,6 +843,7 @@ def process_claim_orchestration():
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
                     purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
+                    print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
                     changed_purchases = True
                 continue
 
@@ -851,6 +856,7 @@ def process_claim_orchestration():
                 purchase["status"] = "WRONG_DINO_REFUNDED"
                 purchase["failure_note"] = f"{reason} Energy refunded."
                 purchase["delivery_note"] = "❌ Claim blocked: wrong dino detected. Your energy has been refunded."
+                print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
                 changed_purchases = True
                 continue
 
@@ -859,6 +865,7 @@ def process_claim_orchestration():
                 f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
             )
             purchase["failure_note"] = "✅ Verification passed. Grow sequence queued."
+            print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
             changed_purchases = True
 
             player_name = purchase.get("player") or "Unknown"
@@ -896,6 +903,7 @@ def process_claim_orchestration():
                 if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
+                    print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                     changed_purchases = True
                 continue
 
