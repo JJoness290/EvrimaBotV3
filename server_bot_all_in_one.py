@@ -8,6 +8,9 @@ import subprocess
 import time
 import re
 import uuid
+import os
+
+import paramiko
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GSiZhh.u074voiptO6mC4zIuF6lsD2U59V1APSCrrLugg"
 
@@ -19,7 +22,6 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
-LOG_CURSOR_FILE = Path("log_cursor_state.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -66,16 +68,11 @@ CLAIM_OPEN_STATES = {
     "FINAL_VERIFY_PENDING",
 }
 
-PRECHECK_VERIFY_TIMEOUT_SECONDS = 10
-FINAL_VERIFY_TIMEOUT_SECONDS = 12
-LOG_TAIL_FALLBACK_BYTES = 256 * 1024
+PRECHECK_VERIFY_TIMEOUT_SECONDS = 8
+FINAL_VERIFY_TIMEOUT_SECONDS = 8
+REMOTE_LOG_TAIL_BYTES = 128 * 1024
 
-log_cursor_cache = {
-    "path": None,
-    "offset": 0,
-    "inode": None,
-}
-health_log_recent = []
+last_remote_log_match = {}
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -87,6 +84,9 @@ RCON_IP = "68.168.208.54"
 RCON_PORT = "11218"
 RCON_PASSWORD = "qFHrZpel6qwF"
 ANNOUNCEMENT_INTERVAL_SECONDS = 600
+
+TOKEN = os.getenv("DISCORD_TOKEN", TOKEN)
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", RCON_PASSWORD)
 
 HEALTH_LOG_PATTERN = re.compile(
     r"used command:\s*(?P<command>\w+).*?\[(?P<steam_id>\d{17})\].*?Class:\s*(?P<class_name>[^,]+),"
@@ -180,21 +180,42 @@ def save_state():
     save_json(STATE_FILE, state)
 
 
-def load_log_cursor_state():
-    state = load_json(LOG_CURSOR_FILE, {})
-    if not isinstance(state, dict):
-        return
-    log_cursor_cache["path"] = state.get("path")
-    log_cursor_cache["offset"] = int(state.get("offset", 0) or 0)
-    log_cursor_cache["inode"] = state.get("inode")
+def get_env_or_config(env_name: str, config_key: str, default=None):
+    env_value = os.getenv(env_name)
+    if env_value not in (None, ""):
+        return env_value
+    config = load_config()
+    cfg_value = config.get(config_key, default)
+    return cfg_value
 
 
-def save_log_cursor_state():
-    save_json(LOG_CURSOR_FILE, {
-        "path": log_cursor_cache.get("path"),
-        "offset": int(log_cursor_cache.get("offset", 0) or 0),
-        "inode": log_cursor_cache.get("inode"),
-    })
+def get_remote_log_config():
+    host = get_env_or_config("PINGPLAYERS_SFTP_HOST", "sftp_host")
+    port = int(get_env_or_config("PINGPLAYERS_SFTP_PORT", "sftp_port", 22) or 22)
+    username = get_env_or_config("PINGPLAYERS_SFTP_USERNAME", "sftp_username")
+    password = get_env_or_config("PINGPLAYERS_SFTP_PASSWORD", "sftp_password")
+    remote_log_path = get_env_or_config(
+        "PINGPLAYERS_REMOTE_LOG_PATH",
+        "remote_log_path",
+        "TheIsle/Saved/Logs/TheIsle.log",
+    )
+    return {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "remote_log_path": remote_log_path,
+    }
+
+
+def open_sftp_client(remote_cfg):
+    transport = paramiko.Transport((remote_cfg["host"], int(remote_cfg["port"])))
+    transport.connect(
+        username=remote_cfg["username"],
+        password=remote_cfg["password"],
+    )
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    return transport, sftp
 
 
 def ensure_referral_record(referrals, discord_id: str):
@@ -323,143 +344,59 @@ def parse_health_command_log_line(line: str):
     }
 
 
-def resolve_log_file_path() -> Path | None:
-    config = load_config()
-    configured = config.get("server_log_path") or config.get("log_file")
-    if configured:
-        p = Path(configured)
-        if p.exists():
-            return p
+def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
+    cfg = get_remote_log_config()
+    if not all([cfg.get("host"), cfg.get("username"), cfg.get("password"), cfg.get("remote_log_path")]):
+        print("[SFTP LOG] Missing SFTP config values (host/username/password/remote_log_path).")
+        return [], "missing_sftp_config"
 
-    candidates = [
-        Path("server.log"),
-        Path("TheIsle.log"),
-        Path("Saved/Logs/TheIsle.log"),
-        Path("ShooterGame/Saved/Logs/ShooterGame.log"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-
-    logs_dir = Path("Saved/Logs")
-    if logs_dir.exists() and logs_dir.is_dir():
-        logs = sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if logs:
-            return logs[0]
-
-    return None
-
-
-def _reset_log_cursor_for_path(log_path: Path):
+    transport = None
+    sftp = None
     try:
-        stat = log_path.stat()
-    except Exception:
-        return
-    log_cursor_cache["path"] = str(log_path)
-    log_cursor_cache["offset"] = 0
-    log_cursor_cache["inode"] = getattr(stat, "st_ino", None)
-    save_log_cursor_state()
-
-
-def _read_new_log_lines(log_path: Path):
-    path_str = str(log_path)
-    try:
-        stat = log_path.stat()
-    except Exception:
-        return []
-
-    current_inode = getattr(stat, "st_ino", None)
-    current_size = int(stat.st_size)
-    cached_path = log_cursor_cache.get("path")
-    cached_inode = log_cursor_cache.get("inode")
-    cached_offset = int(log_cursor_cache.get("offset", 0) or 0)
-
-    if cached_path != path_str or (cached_inode is not None and current_inode != cached_inode) or cached_offset > current_size:
-        _reset_log_cursor_for_path(log_path)
-        cached_offset = 0
-
-    if cached_offset < 0:
-        cached_offset = 0
-
-    try:
-        with log_path.open("r", encoding="utf-8", errors="ignore") as f:
-            f.seek(cached_offset)
-            raw = f.read()
-            new_offset = f.tell()
-    except Exception:
-        return []
-
-    log_cursor_cache["path"] = path_str
-    log_cursor_cache["offset"] = int(new_offset)
-    log_cursor_cache["inode"] = current_inode
-    save_log_cursor_state()
-
-    if not raw:
-        return []
-    return raw.splitlines()
-
-
-def _read_log_tail_lines(log_path: Path, tail_bytes: int = LOG_TAIL_FALLBACK_BYTES):
-    try:
-        with log_path.open("rb") as f:
-            f.seek(0, 2)
-            file_size = f.tell()
-            seek_to = max(0, file_size - tail_bytes)
-            f.seek(seek_to)
-            data = f.read()
-        return data.decode("utf-8", errors="ignore").splitlines()
-    except Exception:
-        return []
-
-
-def refresh_health_log_cache():
-    log_path = resolve_log_file_path()
-    if not log_path:
-        return
-
-    new_lines = _read_new_log_lines(log_path)
-    if not new_lines:
-        return
-
-    for line in new_lines:
-        parsed = parse_health_command_log_line(line)
-        if parsed:
-            parsed["log_file"] = str(log_path)
-            health_log_recent.append(parsed)
-
-    if len(health_log_recent) > 500:
-        del health_log_recent[:-500]
+        transport, sftp = open_sftp_client(cfg)
+        remote_path = cfg["remote_log_path"]
+        with sftp.open(remote_path, "rb") as remote_file:
+            remote_file.seek(0, 2)
+            size = remote_file.tell()
+            read_start = max(0, int(size) - int(tail_bytes))
+            remote_file.seek(read_start)
+            raw = remote_file.read()
+        decoded = raw.decode("utf-8", errors="ignore")
+        return decoded.splitlines(), None
+    except Exception as e:
+        print(f"[SFTP LOG] Failed reading remote log tail: {e}")
+        return [], str(e)
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if transport:
+                transport.close()
+        except Exception:
+            pass
 
 
 def get_latest_health_log_for_steam(steam_id: str, min_event_time: datetime | None = None):
-    refresh_health_log_cache()
-
-    for parsed in reversed(health_log_recent):
-        if parsed.get("steam_id") != str(steam_id):
-            continue
-        event_time = parse_dt(parsed.get("event_time"))
-        if min_event_time and event_time and event_time < min_event_time:
-            continue
-        return parsed
-
-    log_path = resolve_log_file_path()
-    if not log_path:
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
         return None
-
-    lines = _read_log_tail_lines(log_path)
 
     for line in reversed(lines):
         parsed = parse_health_command_log_line(line)
         if not parsed:
             continue
-        if parsed["steam_id"] == str(steam_id):
-            event_time = parse_dt(parsed.get("event_time"))
-            if min_event_time and event_time and event_time < min_event_time:
-                continue
-            parsed["log_file"] = str(log_path)
-            return parsed
+        if parsed["steam_id"] != str(steam_id):
+            continue
+        event_time = parse_dt(parsed.get("event_time"))
+        if min_event_time and event_time and event_time < min_event_time:
+            continue
+        last_remote_log_match[str(steam_id)] = parsed
+        return parsed
 
-    return None
+    return last_remote_log_match.get(str(steam_id))
 
 
 def expire_old_purchases():
@@ -867,8 +804,6 @@ def process_claim_orchestration():
     changed_purchases = False
     changed_commands = False
 
-    refresh_health_log_cache()
-
     for purchase in purchases:
         status = purchase.get("status")
         claim_group_id = purchase.get("claim_group_id")
@@ -902,7 +837,7 @@ def process_claim_orchestration():
             if not precheck_log:
                 if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
                     purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Pre-check timed out: no SetHealth verification log found."
+                    purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
                     purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
                     changed_purchases = True
                 continue
@@ -986,7 +921,7 @@ def process_claim_orchestration():
             purchase["delivery_note"] = (
                 f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
             )
-            purchase["failure_note"] = None
+            purchase["failure_note"] = "✅ Claim completed and verified."
             changed_purchases = True
 
     if changed_commands:
@@ -1070,7 +1005,6 @@ async def announcement_loop():
 async def on_ready():
     print(f"[BOT STARTED] Logged in as {bot.user}")
     restore_state()
-    load_log_cursor_state()
 
     if not tracking_loop.is_running():
         tracking_loop.change_interval(seconds=get_scan_interval_seconds())
