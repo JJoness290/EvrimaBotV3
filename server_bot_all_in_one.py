@@ -78,6 +78,7 @@ REMOTE_LOG_TAIL_BYTES = 128 * 1024
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
 last_remote_log_match_raw_line_by_steam = {}
+last_remote_grow_match = {}
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -94,6 +95,12 @@ TOKEN = os.getenv("DISCORD_TOKEN", TOKEN)
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", RCON_PASSWORD)
 
 HEALTH_LOG_PATTERN = re.compile(
+    r"used command:\s*(?P<command>\w+).*?\[(?P<steam_id>\d{17})\].*?Class:\s*(?P<class_name>[^,]+),"
+    r".*?Previous value:\s*(?P<previous_value>[0-9.]+)%"
+    r".*?New value:\s*(?P<new_value>[0-9.]+)%",
+    re.IGNORECASE,
+)
+GROW_LOG_PATTERN = re.compile(
     r"used command:\s*(?P<command>\w+).*?\[(?P<steam_id>\d{17})\].*?Class:\s*(?P<class_name>[^,]+),"
     r".*?Previous value:\s*(?P<previous_value>[0-9.]+)%"
     r".*?New value:\s*(?P<new_value>[0-9.]+)%",
@@ -556,6 +563,41 @@ def parse_health_command_log_line(line: str):
     }
 
 
+def parse_grow_command_log_line(line: str):
+    match = GROW_LOG_PATTERN.search(line or "")
+    if not match:
+        return None
+
+    command = str(match.group("command")).strip().lower()
+    if command != "grow":
+        return None
+
+    try:
+        prev_value = float(match.group("previous_value"))
+        new_value = float(match.group("new_value"))
+    except Exception:
+        return None
+
+    event_ts_match = re.search(r"LogTheIsleCommandData:\s*\[(?P<event_ts>[0-9.\-:]+)\]", line or "", re.IGNORECASE)
+    event_dt = None
+    if event_ts_match:
+        ts_raw = event_ts_match.group("event_ts")
+        try:
+            event_dt = datetime.strptime(ts_raw, "%Y.%m.%d-%H.%M.%S")
+        except Exception:
+            event_dt = None
+
+    return {
+        "steam_id": str(match.group("steam_id")),
+        "class_name": str(match.group("class_name")).strip(),
+        "previous_value": prev_value,
+        "new_value": new_value,
+        "command": "Grow",
+        "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
+        "raw_line": line.strip(),
+    }
+
+
 def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
     cfg = get_remote_log_config()
     if not all([cfg.get("host"), cfg.get("username"), cfg.get("password"), cfg.get("remote_log_path")]):
@@ -620,6 +662,69 @@ def get_latest_health_log_for_steam(steam_id: str):
         return newest_match
 
     return last_remote_log_match.get(str(steam_id))
+
+
+def get_latest_grow_log_for_steam(steam_id: str):
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
+        return None
+
+    newest_match = None
+    for line in reversed(lines):
+        parsed = parse_grow_command_log_line(line)
+        if not parsed:
+            continue
+        if parsed["steam_id"] != str(steam_id):
+            continue
+        newest_match = parsed
+        break
+
+    if newest_match:
+        last_remote_grow_match[str(steam_id)] = newest_match
+        return newest_match
+
+    return last_remote_grow_match.get(str(steam_id))
+
+
+def verify_growth_log_for_purchase(purchase, grow_log):
+    if not grow_log:
+        return False, "No Grow verification log found."
+    if str(grow_log.get("steam_id")) != str(purchase.get("steam_id")):
+        return False, "Grow verification failed: player mismatch."
+    if str(grow_log.get("command", "")).lower() != "grow":
+        return False, "Grow verification failed: wrong command in log."
+
+    item = str(purchase.get("item", "")).lower().strip()
+    if not classes_match(item, grow_log.get("class_name", "")):
+        return False, f"Grow verification failed: expected {item}, detected {grow_log.get('class_name', 'Unknown')}."
+
+    try:
+        new_value = float(grow_log.get("new_value", 0))
+    except Exception:
+        return False, "Grow verification failed: invalid growth value."
+
+    normalized_growth = new_value / 100.0 if new_value > 1.0 else new_value
+    if not (0.64 <= normalized_growth <= 0.66):
+        return False, f"Grow verification failed: growth ended at {new_value:.6f}%."
+
+    return True, f"Growth confirmed at {new_value:.6f}% for {grow_log.get('class_name', 'Unknown')}."
+
+
+def get_claim_status_display(status: str):
+    mapping = {
+        "UNCLAIMED": ("Not claimed yet", 0),
+        "PRECHECK_QUEUED": ("Pre-check queued", 20),
+        "PRECHECK_VERIFYING": ("Verification in progress", 35),
+        "PRECHECK_PASSED": ("Verification passed", 50),
+        "CLAIM_SEQUENCE_QUEUED": ("Growth queued", 75),
+        "FINAL_VERIFY_PENDING": ("Final verification in progress", 90),
+        "DELIVERED": ("Claim completed", 100),
+        "WRONG_DINO": ("Wrong dinosaur", None),
+        "WRONG_DINO_REFUNDED": ("Wrong dinosaur (refunded)", None),
+        "FAILED": ("Failed", None),
+        "EXPIRED": ("Expired", None),
+    }
+    return mapping.get(status, ("In progress", None))
 
 
 def expire_old_purchases():
@@ -1051,7 +1156,7 @@ def process_claim_orchestration():
                 if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
                     purchase["status"] = "PRECHECK_VERIFYING"
                     purchase["precheck_verify_started_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Pre-check command done. Waiting for SetHealth verification log."
+                    purchase["delivery_note"] = "Verification in progress — 35% complete."
                     changed_purchases = True
                 continue
 
@@ -1076,16 +1181,16 @@ def process_claim_orchestration():
                     refund_purchase_energy_if_needed(purchase, reason)
                     purchase["status"] = "WRONG_DINO_REFUNDED"
                     purchase["failure_note"] = f"{reason} Energy refunded."
-                    purchase["delivery_note"] = "❌ Claim blocked: wrong dino detected. Your energy has been refunded."
+                    purchase["delivery_note"] = "Wrong dinosaur detected. Your points were refunded."
                     print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
                     changed_purchases = True
                     continue
 
                 purchase["status"] = "PRECHECK_PASSED"
                 purchase["delivery_note"] = (
-                    f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
+                    "Verification passed. Growth queued — 75% complete."
                 )
-                purchase["failure_note"] = "✅ Verification passed. Grow sequence queued."
+                purchase["failure_note"] = "Verification passed. Growth queued."
                 print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
                 changed_purchases = True
 
@@ -1110,44 +1215,34 @@ def process_claim_orchestration():
                 if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
                     purchase["status"] = "FINAL_VERIFY_PENDING"
                     purchase["final_verify_started_at"] = str(datetime.now())
+                    purchase["delivery_note"] = "Final verification in progress — 90% complete."
                     changed_purchases = True
                     continue
 
             if status == "FINAL_VERIFY_PENDING":
                 final_started_at = parse_dt(purchase.get("final_verify_started_at"))
-                final_log = get_latest_health_log_for_steam(steam_id)
-                if not final_log:
-                    print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
+                grow_log = get_latest_grow_log_for_steam(steam_id)
+                if not grow_log:
+                    print(f"[CLAIM VERIFY] No matching Grow line found in current remote tail for {steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                         purchase["status"] = "FAILED"
-                        purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
+                        purchase["delivery_note"] = "Final verification timed out. No Grow verification log found."
+                        purchase["failure_note"] = "Verification timed out. Please try again."
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                         changed_purchases = True
                     continue
 
-                if final_log["steam_id"] != str(steam_id):
+                growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
+                if not growth_ok:
                     purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Final verify failed: Steam ID mismatch"
-                    changed_purchases = True
-                    continue
-
-                if not classes_match(item, final_log["class_name"]):
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = f"Final verify failed: class mismatch ({final_log['class_name']})"
-                    changed_purchases = True
-                    continue
-
-                if abs(float(final_log["new_value"]) - 100.0) > 0.000001:
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = f"Final verify failed: health ended at {final_log['new_value']:.6f}%"
+                    purchase["delivery_note"] = growth_note
+                    purchase["failure_note"] = "Growth verification failed. Please try again."
                     changed_purchases = True
                     continue
 
                 purchase["status"] = "DELIVERED"
-                purchase["delivery_note"] = (
-                    f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
-                )
-                purchase["failure_note"] = "✅ Claim completed and verified."
+                purchase["delivery_note"] = growth_note
+                purchase["failure_note"] = "Growth confirmed. Claim completed — 100% complete."
                 changed_purchases = True
 
         if changed_commands:
@@ -1325,7 +1420,7 @@ async def link(ctx, steam_id: str):
     links = load_json(LINK_FILE, {})
     links[str(ctx.author.id)] = steam_id
     save_json(LINK_FILE, links)
-    await ctx.send(f"✅ Linked to {steam_id}")
+    await ctx.send("✅ Your account has been linked.")
 
 
 @bot.command()
@@ -1347,7 +1442,6 @@ async def stats(ctx):
 
     await ctx.send(
         f"📊 **{name}**\n"
-        f"🆔 Steam ID: `{steam_id}`\n"
         f"⏱ Current session: {current_session} mins\n"
         f"🕒 Previously played: {previous_total} mins\n"
         f"📈 Total tracked: {combined_total} mins\n"
@@ -1368,7 +1462,6 @@ async def online(ctx):
     for p in players:
         lines.append(
             f"**{p['name']}**\n"
-            f"🆔 `{p['steam_id']}`\n"
             f"⏱ Session: {p['session']} mins\n"
             f"🕒 Previous total: {p['total']} mins\n"
             f"⚡ Energy: {p['energy']}\n"
@@ -1502,11 +1595,11 @@ async def claim(ctx):
         else:
             purchase = purchases[purchase_index]
             if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
+                status_label, pct = get_claim_status_display(purchase.get("status"))
+                pct_text = f"{pct}% complete" if pct is not None else "in progress"
                 response = (
-                    f"⏳ Your claim is already being processed.\n\n"
-                    f"🧬 Dino: **{purchase['item'].upper()}**\n"
-                    f"Status: **{purchase.get('status', 'UNKNOWN')}**\n"
-                    f"Use `!myclaims` to check status."
+                    f"⏳ Your claim is already in progress — {pct_text}.\n"
+                    f"Status: {status_label}."
                 )
             else:
                 game_commands = load_game_commands()
@@ -1523,21 +1616,17 @@ async def claim(ctx):
                     if not purchase.get("claim_group_id"):
                         purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
                     save_purchases(purchases)
-                    response = "⏳ Health/class verification queued. Stay on the dino you bought."
+                    response = "Pre-check queued — 20% complete. Stay on the dinosaur you bought."
                 else:
                     if not purchase.get("claim_group_id"):
                         purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
-                    queued = queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
+                    queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
                     purchase["status"] = "PRECHECK_QUEUED"
                     purchase["claimed_at"] = str(datetime.now())
-                    purchase["delivery_note"] = " | ".join(queued)
+                    purchase["delivery_note"] = "Pre-check queued. Awaiting health/class verification."
                     purchase["failure_note"] = None
                     save_purchases(purchases)
-                    response = (
-                        "🩺 **PRE-CHECK QUEUED**\n\n"
-                        "Health/class verification queued. Stay on the dino you bought.\n"
-                        f"1. `{queued[0]}`"
-                    )
+                    response = "Pre-check queued — 20% complete. Stay on the dinosaur you bought."
 
     await ctx.send(response)
 
@@ -1561,9 +1650,11 @@ async def myclaims(ctx):
 
     lines = ["📦 **Your Purchases**\n"]
     for p in mine[-10:]:
+        label, pct = get_claim_status_display(p.get("status"))
+        pct_text = f"{pct}% complete" if pct is not None else "Not completed"
         extra_note = p.get("failure_note") or p.get("delivery_note") or ""
         lines.append(
-            f"{p.get('item', '?')} — {p.get('status', '?')} — {p.get('time', '?')}"
+            f"{p.get('item', '?').upper()} — {label} — {pct_text}"
             + (f" — {extra_note}" if extra_note else "")
         )
 
