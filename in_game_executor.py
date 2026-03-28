@@ -44,13 +44,13 @@ def get_delay_for_command(command_text: str) -> int:
     return 3
 
 
-def get_active_claim_group(commands_data):
+def get_pending_claim_groups(commands_data):
     pending_group_cmds = [
         c for c in commands_data
         if c.get("status") == "PENDING" and c.get("claim_group_id")
     ]
     if not pending_group_cmds:
-        return None
+        return []
 
     pending_group_cmds.sort(
         key=lambda c: (
@@ -60,7 +60,14 @@ def get_active_claim_group(commands_data):
             str(c.get("id", "")),
         )
     )
-    return pending_group_cmds[0].get("claim_group_id")
+    ordered_groups = []
+    seen = set()
+    for cmd in pending_group_cmds:
+        gid = cmd.get("claim_group_id")
+        if gid and gid not in seen:
+            seen.add(gid)
+            ordered_groups.append(gid)
+    return ordered_groups
 
 
 def process_group(commands_data, claim_group_id: str) -> bool:
@@ -141,11 +148,15 @@ def main():
         commands_data = load_commands()
         changed = False
 
-        active_group = get_active_claim_group(commands_data)
-        if active_group:
-            changed = process_group(commands_data, active_group)
-        else:
-            changed = process_legacy(commands_data)
+        pending_groups = get_pending_claim_groups(commands_data)
+        if pending_groups:
+            for group_id in pending_groups:
+                loop_changed = process_group(commands_data, group_id)
+                changed = changed or loop_changed
+                commands_data = load_commands()
+
+        legacy_changed = process_legacy(commands_data)
+        changed = changed or legacy_changed
 
         if changed:
             save_commands(commands_data)

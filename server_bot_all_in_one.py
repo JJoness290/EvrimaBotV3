@@ -10,6 +10,8 @@ import re
 import uuid
 import os
 import stat
+import threading
+import tempfile
 
 import paramiko
 
@@ -107,18 +109,32 @@ invite_cache = {}
 online_since = {}
 last_minute_tick = {}
 
+PLAYER_DATA_LOCK = threading.RLock()
+PURCHASES_LOCK = threading.RLock()
+GAME_COMMANDS_LOCK = threading.RLock()
+ECONOMY_LOCK = threading.RLock()
+
 
 def load_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
+    with ECONOMY_LOCK:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return default
+        return default
 
 
 def save_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with ECONOMY_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, indent=2)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = tmp.name
+        os.replace(tmp_path, path)
 
 
 def load_config():
@@ -607,65 +623,66 @@ def get_latest_health_log_for_steam(steam_id: str):
 
 
 def expire_old_purchases():
-    purchases = load_purchases()
-    data = load_json(DATA_FILE, {})
-    game_commands = load_game_commands()
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        data = load_json(DATA_FILE, {})
+        game_commands = load_game_commands()
 
-    now = datetime.now()
-    changed_purchases = False
-    changed_data = False
-    changed_commands = False
+        now = datetime.now()
+        changed_purchases = False
+        changed_data = False
+        changed_commands = False
 
-    for purchase in purchases:
-        status = purchase.get("status")
-        steam_id = purchase.get("steam_id")
-        item = str(purchase.get("item", "")).lower().strip()
+        for purchase in purchases:
+            status = purchase.get("status")
+            steam_id = purchase.get("steam_id")
+            item = str(purchase.get("item", "")).lower().strip()
 
-        if status == "UNCLAIMED":
-            created_at = parse_dt(purchase.get("time", ""))
-            if not created_at:
-                continue
+            if status == "UNCLAIMED":
+                created_at = parse_dt(purchase.get("time", ""))
+                if not created_at:
+                    continue
 
-            if now - created_at >= timedelta(minutes=PURCHASE_TIMEOUT_MINUTES):
-                price, _ = find_shop_price(item)
-                if price is not None and steam_id in data and not purchase.get("refund_applied"):
-                    _, _ = adjust_energy_in_data(data, steam_id, int(price))
-                    purchase["refund_applied"] = True
-                    purchase["refund_amount"] = int(price)
-                    purchase["refunded_at"] = str(datetime.now())
-                    purchase["refund_note"] = "Unclaimed purchase expired. Energy refunded."
-                    changed_data = True
+                if now - created_at >= timedelta(minutes=PURCHASE_TIMEOUT_MINUTES):
+                    price, _ = find_shop_price(item)
+                    if price is not None and steam_id in data and not purchase.get("refund_applied"):
+                        _, _ = adjust_energy_in_data(data, steam_id, int(price))
+                        purchase["refund_applied"] = True
+                        purchase["refund_amount"] = int(price)
+                        purchase["refunded_at"] = str(datetime.now())
+                        purchase["refund_note"] = "Unclaimed purchase expired. Energy refunded."
+                        changed_data = True
 
-                purchase["status"] = "EXPIRED"
-                purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
-                changed_purchases = True
+                    purchase["status"] = "EXPIRED"
+                    purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
+                    changed_purchases = True
 
-        elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING"}:
-            claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
-            if not claimed_at:
-                continue
+            elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING"}:
+                claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
+                if not claimed_at:
+                    continue
 
-            if now - claimed_at >= timedelta(minutes=QUEUED_TIMEOUT_MINUTES):
-                for cmd in game_commands:
-                    if (
-                        cmd.get("steam_id") == steam_id
-                        and str(cmd.get("item", "")).lower().strip() == item
-                        and cmd.get("status") in {"PENDING", "EXECUTING"}
-                    ):
-                        cmd["status"] = "EXPIRED"
-                        cmd["completed_at"] = str(datetime.now())
-                        changed_commands = True
+                if now - claimed_at >= timedelta(minutes=QUEUED_TIMEOUT_MINUTES):
+                    for cmd in game_commands:
+                        if (
+                            cmd.get("steam_id") == steam_id
+                            and str(cmd.get("item", "")).lower().strip() == item
+                            and cmd.get("status") in {"PENDING", "EXECUTING"}
+                        ):
+                            cmd["status"] = "EXPIRED"
+                            cmd["completed_at"] = str(datetime.now())
+                            changed_commands = True
 
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = f"Claim queue expired after {QUEUED_TIMEOUT_MINUTES} minutes"
-                changed_purchases = True
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = f"Claim queue expired after {QUEUED_TIMEOUT_MINUTES} minutes"
+                    changed_purchases = True
 
-    if changed_purchases:
-        save_purchases(purchases)
-    if changed_data:
-        save_json(DATA_FILE, data)
-    if changed_commands:
-        save_game_commands(game_commands)
+        if changed_purchases:
+            save_purchases(purchases)
+        if changed_data:
+            save_json(DATA_FILE, data)
+        if changed_commands:
+            save_game_commands(game_commands)
 
 
 def has_open_purchase(steam_id: str) -> bool:
@@ -832,52 +849,53 @@ def update_players(players):
 
 
 def tick_rewards():
-    data = load_json(DATA_FILE, {})
-    now = int(time.time())
+    with ECONOMY_LOCK:
+        data = load_json(DATA_FILE, {})
+        now = int(time.time())
 
-    reward_interval_minutes = get_reward_interval_minutes()
-    reward_amount = get_reward_amount()
+        reward_interval_minutes = get_reward_interval_minutes()
+        reward_amount = get_reward_amount()
 
-    for steam_id in list(online_since.keys()):
-        if steam_id not in data:
-            continue
+        for steam_id in list(online_since.keys()):
+            if steam_id not in data:
+                continue
 
-        last_tick = last_minute_tick.get(steam_id, now)
-        elapsed = now - last_tick
+            last_tick = last_minute_tick.get(steam_id, now)
+            elapsed = now - last_tick
 
-        if elapsed < 60:
-            continue
+            if elapsed < 60:
+                continue
 
-        whole_minutes = elapsed // 60
-        if whole_minutes <= 0:
-            continue
+            whole_minutes = elapsed // 60
+            if whole_minutes <= 0:
+                continue
 
-        player = data[steam_id]
-
-        old_total = int(player.get("total_minutes", 0))
-        new_total = old_total + whole_minutes
-
-        old_rewards = old_total // reward_interval_minutes
-        new_rewards = new_total // reward_interval_minutes
-        gained_energy = (new_rewards - old_rewards) * reward_amount
-
-        player["total_minutes"] = new_total
-        player["current_session_minutes"] = int((now - online_since[steam_id]) // 60)
-
-        if gained_energy > 0:
-            adjust_energy_in_data(data, steam_id, int(gained_energy))
             player = data[steam_id]
-            print(
-                f"[REWARD] {player.get('name', steam_id)} | "
-                f"{steam_id} | +{gained_energy} energy | "
-                f"total={player['total_minutes']} mins | "
-                f"energy={player['energy']}"
-            )
 
-        last_minute_tick[steam_id] = last_tick + (whole_minutes * 60)
+            old_total = int(player.get("total_minutes", 0))
+            new_total = old_total + whole_minutes
 
-    save_json(DATA_FILE, data)
-    save_state()
+            old_rewards = old_total // reward_interval_minutes
+            new_rewards = new_total // reward_interval_minutes
+            gained_energy = (new_rewards - old_rewards) * reward_amount
+
+            player["total_minutes"] = new_total
+            player["current_session_minutes"] = int((now - online_since[steam_id]) // 60)
+
+            if gained_energy > 0:
+                adjust_energy_in_data(data, steam_id, int(gained_energy))
+                player = data[steam_id]
+                print(
+                    f"[REWARD] {player.get('name', steam_id)} | "
+                    f"{steam_id} | +{gained_energy} energy | "
+                    f"total={player['total_minutes']} mins | "
+                    f"energy={player['energy']}"
+                )
+
+            last_minute_tick[steam_id] = last_tick + (whole_minutes * 60)
+
+        save_json(DATA_FILE, data)
+        save_state()
 
 
 def print_live_status(players):
@@ -1008,133 +1026,134 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
 
 
 def process_claim_orchestration():
-    purchases = load_purchases()
-    game_commands = load_game_commands()
-    changed_purchases = False
-    changed_commands = False
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        game_commands = load_game_commands()
+        changed_purchases = False
+        changed_commands = False
 
-    for purchase in purchases:
-        status = purchase.get("status")
-        claim_group_id = purchase.get("claim_group_id")
-        steam_id = purchase.get("steam_id")
-        item = str(purchase.get("item", "")).lower().strip()
+        for purchase in purchases:
+            status = purchase.get("status")
+            claim_group_id = purchase.get("claim_group_id")
+            steam_id = purchase.get("steam_id")
+            item = str(purchase.get("item", "")).lower().strip()
 
-        if status == "PRECHECK_QUEUED" and claim_group_id:
-            if any_group_step_failed(game_commands, claim_group_id):
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = "Pre-check command execution failed"
-                changed_purchases = True
-                continue
-
-            if has_pending_group_commands(game_commands, claim_group_id):
-                continue
-
-            if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
-                purchase["status"] = "PRECHECK_VERIFYING"
-                purchase["precheck_verify_started_at"] = str(datetime.now())
-                purchase["delivery_note"] = "Pre-check command done. Waiting for SetHealth verification log."
-                changed_purchases = True
-            continue
-
-        if status == "PRECHECK_VERIFYING" and claim_group_id:
-            verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
-            precheck_log = get_latest_health_log_for_steam(steam_id)
-            if not precheck_log:
-                print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
-                if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
+            if status == "PRECHECK_QUEUED" and claim_group_id:
+                if any_group_step_failed(game_commands, claim_group_id):
                     purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
-                    purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
-                    print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
+                    purchase["delivery_note"] = "Pre-check command execution failed"
+                    changed_purchases = True
+                    continue
+
+                if has_pending_group_commands(game_commands, claim_group_id):
+                    continue
+
+                if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
+                    purchase["status"] = "PRECHECK_VERIFYING"
+                    purchase["precheck_verify_started_at"] = str(datetime.now())
+                    purchase["delivery_note"] = "Pre-check command done. Waiting for SetHealth verification log."
                     changed_purchases = True
                 continue
 
-            if not classes_match(item, precheck_log["class_name"]):
-                reason = f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}."
-                cancel_reason = f"Claim group cancelled: wrong dino detected ({precheck_log['class_name']})"
-                if cancel_claim_group_commands(game_commands, claim_group_id, cancel_reason):
-                    changed_commands = True
-                refund_purchase_energy_if_needed(purchase, reason)
-                purchase["status"] = "WRONG_DINO_REFUNDED"
-                purchase["failure_note"] = f"{reason} Energy refunded."
-                purchase["delivery_note"] = "❌ Claim blocked: wrong dino detected. Your energy has been refunded."
-                print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
-                changed_purchases = True
-                continue
+            if status == "PRECHECK_VERIFYING" and claim_group_id:
+                verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
+                precheck_log = get_latest_health_log_for_steam(steam_id)
+                if not precheck_log:
+                    print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
+                    if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
+                        purchase["status"] = "FAILED"
+                        purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
+                        purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
+                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
+                        changed_purchases = True
+                    continue
 
-            purchase["status"] = "PRECHECK_PASSED"
-            purchase["delivery_note"] = (
-                f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
-            )
-            purchase["failure_note"] = "✅ Verification passed. Grow sequence queued."
-            print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
-            changed_purchases = True
-
-            player_name = purchase.get("player") or "Unknown"
-            claim_sequence = queue_claim_phase_commands(purchase, player_name, "CLAIM")
-            purchase["status"] = "CLAIM_SEQUENCE_QUEUED"
-            purchase["delivery_note"] = " | ".join(claim_sequence)
-            changed_purchases = True
-            game_commands = load_game_commands()
-            continue
-
-        if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
-            if any_group_step_failed(game_commands, claim_group_id):
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = "Claim sequence command execution failed"
-                changed_purchases = True
-                continue
-
-            if has_pending_group_commands(game_commands, claim_group_id):
-                continue
-
-            if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
-                purchase["status"] = "FINAL_VERIFY_PENDING"
-                purchase["final_verify_started_at"] = str(datetime.now())
-                changed_purchases = True
-                continue
-
-        if status == "FINAL_VERIFY_PENDING":
-            final_started_at = parse_dt(purchase.get("final_verify_started_at"))
-            final_log = get_latest_health_log_for_steam(steam_id)
-            if not final_log:
-                print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
-                if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
-                    print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
+                if not classes_match(item, precheck_log["class_name"]):
+                    reason = f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}."
+                    cancel_reason = f"Claim group cancelled: wrong dino detected ({precheck_log['class_name']})"
+                    if cancel_claim_group_commands(game_commands, claim_group_id, cancel_reason):
+                        changed_commands = True
+                    refund_purchase_energy_if_needed(purchase, reason)
+                    purchase["status"] = "WRONG_DINO_REFUNDED"
+                    purchase["failure_note"] = f"{reason} Energy refunded."
+                    purchase["delivery_note"] = "❌ Claim blocked: wrong dino detected. Your energy has been refunded."
+                    print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
                     changed_purchases = True
-                continue
+                    continue
 
-            if final_log["steam_id"] != str(steam_id):
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = "Final verify failed: Steam ID mismatch"
+                purchase["status"] = "PRECHECK_PASSED"
+                purchase["delivery_note"] = (
+                    f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
+                )
+                purchase["failure_note"] = "✅ Verification passed. Grow sequence queued."
+                print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
                 changed_purchases = True
-                continue
 
-            if not classes_match(item, final_log["class_name"]):
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = f"Final verify failed: class mismatch ({final_log['class_name']})"
+                player_name = purchase.get("player") or "Unknown"
+                claim_sequence = queue_claim_phase_commands(purchase, player_name, "CLAIM")
+                purchase["status"] = "CLAIM_SEQUENCE_QUEUED"
+                purchase["delivery_note"] = " | ".join(claim_sequence)
                 changed_purchases = True
+                game_commands = load_game_commands()
                 continue
 
-            if abs(float(final_log["new_value"]) - 100.0) > 0.000001:
-                purchase["status"] = "FAILED"
-                purchase["delivery_note"] = f"Final verify failed: health ended at {final_log['new_value']:.6f}%"
+            if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
+                if any_group_step_failed(game_commands, claim_group_id):
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = "Claim sequence command execution failed"
+                    changed_purchases = True
+                    continue
+
+                if has_pending_group_commands(game_commands, claim_group_id):
+                    continue
+
+                if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
+                    purchase["status"] = "FINAL_VERIFY_PENDING"
+                    purchase["final_verify_started_at"] = str(datetime.now())
+                    changed_purchases = True
+                    continue
+
+            if status == "FINAL_VERIFY_PENDING":
+                final_started_at = parse_dt(purchase.get("final_verify_started_at"))
+                final_log = get_latest_health_log_for_steam(steam_id)
+                if not final_log:
+                    print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
+                    if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
+                        purchase["status"] = "FAILED"
+                        purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
+                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
+                        changed_purchases = True
+                    continue
+
+                if final_log["steam_id"] != str(steam_id):
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = "Final verify failed: Steam ID mismatch"
+                    changed_purchases = True
+                    continue
+
+                if not classes_match(item, final_log["class_name"]):
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = f"Final verify failed: class mismatch ({final_log['class_name']})"
+                    changed_purchases = True
+                    continue
+
+                if abs(float(final_log["new_value"]) - 100.0) > 0.000001:
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = f"Final verify failed: health ended at {final_log['new_value']:.6f}%"
+                    changed_purchases = True
+                    continue
+
+                purchase["status"] = "DELIVERED"
+                purchase["delivery_note"] = (
+                    f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
+                )
+                purchase["failure_note"] = "✅ Claim completed and verified."
                 changed_purchases = True
-                continue
 
-            purchase["status"] = "DELIVERED"
-            purchase["delivery_note"] = (
-                f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
-            )
-            purchase["failure_note"] = "✅ Claim completed and verified."
-            changed_purchases = True
-
-    if changed_commands:
-        save_game_commands(game_commands)
-    if changed_purchases:
-        save_purchases(purchases)
+        if changed_commands:
+            save_game_commands(game_commands)
+        if changed_purchases:
+            save_purchases(purchases)
 
 
 def process_game_command_queue():
@@ -1378,16 +1397,6 @@ async def shop(ctx):
 async def buy(ctx, item: str):
     expire_old_purchases()
 
-    data = load_json(DATA_FILE, {})
-    links = load_json(LINK_FILE, {})
-    purchases = load_purchases()
-    steam_id = get_steam_id_for_discord(str(ctx.author.id), links)
-    player = data.get(steam_id) if steam_id else None
-
-    if not player:
-        await ctx.send("❌ Use !link first")
-        return
-
     item = item.lower().strip()
     price, category = find_shop_price(item)
 
@@ -1399,70 +1408,65 @@ async def buy(ctx, item: str):
         await ctx.send("❌ Extras are not part of the prime claim flow")
         return
 
-    if has_open_purchase(steam_id):
-        await ctx.send("❌ You already have an active purchase. Use `!claim` first.")
-        return
-
-    current_energy = int(player.get("energy", 0))
-    if current_energy < int(price):
-        await ctx.send("❌ Not enough energy")
-        return
-
-    # Guard against duplicate open purchase entries for same item in-flight.
-    duplicate_unclaimed = any(
-        p.get("steam_id") == steam_id
-        and str(p.get("item", "")).lower().strip() == item
-        and p.get("status") in CLAIM_OPEN_STATES
-        for p in purchases
-    )
-    if duplicate_unclaimed:
-        await ctx.send("❌ You already have an active purchase for this dino. Use `!claim` first.")
-        return
-
-    before, after = adjust_energy_in_data(data, steam_id, -int(price))
-    if before is None or after is None:
-        await ctx.send("❌ Could not update your balance. Try again.")
-        return
-    if after < 0:
-        data[steam_id]["energy"] = 0
-        after = 0
-    save_json(DATA_FILE, data)
-
-    new_purchase = {
-        "player": player["name"],
-        "steam_id": steam_id,
-        "item": item,
-        "status": "UNCLAIMED",
-        "time": str(datetime.now()),
-        "claimed_at": None,
-        "delivery_note": None,
-        "failure_note": None,
-        "claim_group_id": None,
-        "refund_applied": False,
-        "refund_amount": 0,
-        "refunded_at": None,
-        "refund_note": None,
-    }
-    purchases.append(new_purchase)
-    try:
-        save_purchases(purchases)
-    except Exception:
-        # Roll back deduction if purchase write fails.
+    response_message = None
+    with ECONOMY_LOCK:
         data = load_json(DATA_FILE, {})
-        if steam_id in data:
-            adjust_energy_in_data(data, steam_id, int(price))
-            save_json(DATA_FILE, data)
-        await ctx.send("❌ Purchase failed to save. Your energy was restored.")
-        return
+        links = load_json(LINK_FILE, {})
+        purchases = load_purchases()
 
-    await ctx.send(
-        f"🧬 **{item.upper()} PURCHASED**\n\n"
-        f"⚡ -{price} energy\n"
-        f"💰 Remaining energy: {after}\n"
-        f"📦 Claim saved\n"
-        f"⏳ Expires in {PURCHASE_TIMEOUT_MINUTES} minutes if not claimed\n\n"
-        f"Use `!claim` when you are ready to be primed."
-    )
+        steam_id = get_steam_id_for_discord(str(ctx.author.id), links)
+        player = data.get(steam_id) if steam_id else None
+        if not player:
+            response_message = "❌ Use !link first"
+        elif any(p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES for p in purchases):
+            response_message = "❌ You already have an active purchase. Use `!claim` first."
+        elif int(player.get("energy", 0)) < int(price):
+            response_message = "❌ Not enough energy"
+        else:
+            duplicate_unclaimed = any(
+                p.get("steam_id") == steam_id
+                and str(p.get("item", "")).lower().strip() == item
+                and p.get("status") in CLAIM_OPEN_STATES
+                for p in purchases
+            )
+            if duplicate_unclaimed:
+                response_message = "❌ You already have an active purchase for this dino. Use `!claim` first."
+            else:
+                _, after = adjust_energy_in_data(data, steam_id, -int(price))
+                save_json(DATA_FILE, data)
+                new_purchase = {
+                    "player": player["name"],
+                    "steam_id": steam_id,
+                    "item": item,
+                    "status": "UNCLAIMED",
+                    "time": str(datetime.now()),
+                    "claimed_at": None,
+                    "delivery_note": None,
+                    "failure_note": None,
+                    "claim_group_id": None,
+                    "refund_applied": False,
+                    "refund_amount": 0,
+                    "refunded_at": None,
+                    "refund_note": None,
+                    "economy_note": f"Buy deducted {price} energy @ {datetime.now()}",
+                }
+                purchases.append(new_purchase)
+                try:
+                    save_purchases(purchases)
+                    response_message = (
+                        f"🧬 **{item.upper()} PURCHASED**\n\n"
+                        f"⚡ -{price} energy\n"
+                        f"💰 Remaining energy: {after}\n"
+                        f"📦 Claim saved\n"
+                        f"⏳ Expires in {PURCHASE_TIMEOUT_MINUTES} minutes if not claimed\n\n"
+                        f"Use `!claim` when you are ready to be primed."
+                    )
+                except Exception:
+                    adjust_energy_in_data(data, steam_id, int(price))
+                    save_json(DATA_FILE, data)
+                    response_message = "❌ Purchase failed to save. Your energy was restored."
+
+    await ctx.send(response_message or "❌ Purchase failed unexpectedly.")
 
 
 @bot.command()
@@ -1475,72 +1479,67 @@ async def claim(ctx):
         await ctx.send("❌ Use !link first")
         return
 
-    purchases = load_purchases()
-    purchase_index, purchase_status = get_claimable_purchase_index(purchases, steam_id)
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        purchase_index, purchase_status = get_claimable_purchase_index(purchases, steam_id)
 
-    if purchase_index is None:
-        latest_mine = None
-        for p in reversed(purchases):
-            if p.get("steam_id") == steam_id:
-                latest_mine = p
-                break
-        if latest_mine and latest_mine.get("status") == "WRONG_DINO_REFUNDED":
-            await ctx.send(
-                "❌ Claim blocked: wrong dino detected on your last attempt. "
-                "Your energy has been refunded. Switch dinos and buy again when ready."
-            )
-            return
-        if latest_mine and latest_mine.get("status") == "FAILED":
-            note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
-            await ctx.send(f"⚠️ {note}")
-            return
-        await ctx.send("❌ You do not have any active dinosaur purchases.")
-        return
+        if purchase_index is None:
+            latest_mine = None
+            for p in reversed(purchases):
+                if p.get("steam_id") == steam_id:
+                    latest_mine = p
+                    break
+            if latest_mine and latest_mine.get("status") == "WRONG_DINO_REFUNDED":
+                response = (
+                    "❌ Claim blocked: wrong dino detected on your last attempt. "
+                    "Your energy has been refunded. Switch dinos and buy again when ready."
+                )
+            elif latest_mine and latest_mine.get("status") == "FAILED":
+                note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
+                response = f"⚠️ {note}"
+            else:
+                response = "❌ You do not have any active dinosaur purchases."
+        else:
+            purchase = purchases[purchase_index]
+            if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
+                response = (
+                    f"⏳ Your claim is already being processed.\n\n"
+                    f"🧬 Dino: **{purchase['item'].upper()}**\n"
+                    f"Status: **{purchase.get('status', 'UNKNOWN')}**\n"
+                    f"Use `!myclaims` to check status."
+                )
+            else:
+                game_commands = load_game_commands()
+                existing_pending = any(
+                    cmd.get("steam_id") == steam_id
+                    and str(cmd.get("item", "")).lower().strip() == str(purchase.get("item", "")).lower().strip()
+                    and cmd.get("status") in {"PENDING", "EXECUTING"}
+                    for cmd in game_commands
+                )
+                if existing_pending:
+                    purchase["status"] = "PRECHECK_QUEUED"
+                    purchase["claimed_at"] = str(datetime.now())
+                    purchase["delivery_note"] = "Existing pending command found"
+                    if not purchase.get("claim_group_id"):
+                        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
+                    save_purchases(purchases)
+                    response = "⏳ Health/class verification queued. Stay on the dino you bought."
+                else:
+                    if not purchase.get("claim_group_id"):
+                        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
+                    queued = queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
+                    purchase["status"] = "PRECHECK_QUEUED"
+                    purchase["claimed_at"] = str(datetime.now())
+                    purchase["delivery_note"] = " | ".join(queued)
+                    purchase["failure_note"] = None
+                    save_purchases(purchases)
+                    response = (
+                        "🩺 **PRE-CHECK QUEUED**\n\n"
+                        "Health/class verification queued. Stay on the dino you bought.\n"
+                        f"1. `{queued[0]}`"
+                    )
 
-    purchase = purchases[purchase_index]
-
-    if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
-        await ctx.send(
-            f"⏳ Your claim is already being processed.\n\n"
-            f"🧬 Dino: **{purchase['item'].upper()}**\n"
-            f"Status: **{purchase.get('status', 'UNKNOWN')}**\n"
-            f"Use `!myclaims` to check status."
-        )
-        return
-
-    game_commands = load_game_commands()
-    existing_pending = any(
-        cmd.get("steam_id") == steam_id
-        and str(cmd.get("item", "")).lower().strip() == str(purchase.get("item", "")).lower().strip()
-        and cmd.get("status") in {"PENDING", "EXECUTING"}
-        for cmd in game_commands
-    )
-    if existing_pending:
-        purchase["status"] = "PRECHECK_QUEUED"
-        purchase["claimed_at"] = str(datetime.now())
-        purchase["delivery_note"] = "Existing pending command found"
-        if not purchase.get("claim_group_id"):
-            purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
-        save_purchases(purchases)
-
-        await ctx.send("⏳ Health/class verification queued. Stay on the dino you bought.")
-        return
-
-    if not purchase.get("claim_group_id"):
-        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
-
-    queued = queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
-    purchase["status"] = "PRECHECK_QUEUED"
-    purchase["claimed_at"] = str(datetime.now())
-    purchase["delivery_note"] = " | ".join(queued)
-    purchase["failure_note"] = None
-    save_purchases(purchases)
-
-    await ctx.send(
-        "🩺 **PRE-CHECK QUEUED**\n\n"
-        "Health/class verification queued. Stay on the dino you bought.\n"
-        f"1. `{queued[0]}`"
-    )
+    await ctx.send(response)
 
 
 @bot.command()
