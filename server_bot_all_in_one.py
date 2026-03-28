@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import subprocess
 import time
+import re
+import uuid
 
 TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GSiZhh.u074voiptO6mC4zIuF6lsD2U59V1APSCrrLugg"
 
@@ -31,6 +33,37 @@ REFERRAL_REWARDS = {
     20: 60,
 }
 
+DINO_CLASS_MAP = {
+    "hypsi": ["Hypsilophodon"],
+    "dryo": ["Dryosaurus"],
+    "pachy": ["Pachycephalosaurus"],
+    "beipi": ["Beipiaosaurus"],
+    "galli": ["Gallimimus"],
+    "tenonto": ["Tenontosaurus"],
+    "maia": ["Maiasaura"],
+    "dibble": ["Diabloceratops", "Dibble"],
+    "stego": ["Stegosaurus"],
+    "trike": ["Triceratops"],
+    "ptera": ["Pteranodon"],
+    "troodon": ["Troodon"],
+    "herrera": ["Herrerasaurus"],
+    "omni": ["Omniraptor", "Omni"],
+    "dilo": ["Dilophosaurus"],
+    "carno": ["Carnotaurus"],
+    "cera": ["Ceratosaurus"],
+    "deino": ["Deinosuchus"],
+    "rex": ["Tyrannosaurus", "TRex", "Rex"],
+}
+
+CLAIM_PRECHECK_STATES = {"PRECHECK_QUEUED"}
+CLAIM_OPEN_STATES = {
+    "UNCLAIMED",
+    "PRECHECK_QUEUED",
+    "PRECHECK_PASSED",
+    "CLAIM_SEQUENCE_QUEUED",
+    "FINAL_VERIFY_PENDING",
+}
+
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
 ]
@@ -42,6 +75,13 @@ RCON_PORT = "11218"
 RCON_PASSWORD = "qFHrZpel6qwF"
 ANNOUNCEMENT_INTERVAL_SECONDS = 600
 
+HEALTH_LOG_PATTERN = re.compile(
+    r"used command:\s*(?P<command>\w+).*?\[(?P<steam_id>\d{17})\].*?Class:\s*(?P<class_name>[^,]+),"
+    r".*?Previous value:\s*(?P<previous_value>[0-9.]+)%"
+    r".*?New value:\s*(?P<new_value>[0-9.]+)%",
+    re.IGNORECASE,
+)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -50,6 +90,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 invite_cache = {}
 online_since = {}
 last_minute_tick = {}
+
 
 def load_json(path: Path, default):
     if path.exists():
@@ -165,6 +206,24 @@ def find_shop_price(item_name: str):
     return None, None
 
 
+def normalize_class_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def classes_match(item_key: str, actual_class: str) -> bool:
+    aliases = DINO_CLASS_MAP.get(str(item_key or "").lower().strip(), [])
+    if not aliases:
+        return False
+
+    norm_actual = normalize_class_name(actual_class)
+    norm_aliases = {normalize_class_name(x) for x in aliases}
+    if norm_actual in norm_aliases:
+        return True
+
+    # safe alias fallback: substring-safe normalization match
+    return any(norm_actual == alias or norm_actual in alias or alias in norm_actual for alias in norm_aliases)
+
+
 def get_next_command_id(commands_data):
     if not commands_data:
         return 1
@@ -199,6 +258,79 @@ def parse_dt(value: str):
     return None
 
 
+def parse_health_command_log_line(line: str):
+    match = HEALTH_LOG_PATTERN.search(line or "")
+    if not match:
+        return None
+
+    command = match.group("command")
+    if str(command).strip().lower() != "sethealth":
+        return None
+
+    try:
+        prev_value = float(match.group("previous_value"))
+        new_value = float(match.group("new_value"))
+    except Exception:
+        return None
+
+    return {
+        "steam_id": str(match.group("steam_id")),
+        "class_name": str(match.group("class_name")).strip(),
+        "previous_value": prev_value,
+        "new_value": new_value,
+        "command": "SetHealth",
+        "raw_line": line.strip(),
+    }
+
+
+def resolve_log_file_path() -> Path | None:
+    config = load_config()
+    configured = config.get("server_log_path") or config.get("log_file")
+    if configured:
+        p = Path(configured)
+        if p.exists():
+            return p
+
+    candidates = [
+        Path("server.log"),
+        Path("TheIsle.log"),
+        Path("Saved/Logs/TheIsle.log"),
+        Path("ShooterGame/Saved/Logs/ShooterGame.log"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    logs_dir = Path("Saved/Logs")
+    if logs_dir.exists() and logs_dir.is_dir():
+        logs = sorted(logs_dir.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if logs:
+            return logs[0]
+
+    return None
+
+
+def get_latest_health_log_for_steam(steam_id: str):
+    log_path = resolve_log_file_path()
+    if not log_path:
+        return None
+
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        parsed = parse_health_command_log_line(line)
+        if not parsed:
+            continue
+        if parsed["steam_id"] == str(steam_id):
+            parsed["log_file"] = str(log_path)
+            return parsed
+
+    return None
+
+
 def expire_old_purchases():
     purchases = load_purchases()
     data = load_json(DATA_FILE, {})
@@ -229,7 +361,7 @@ def expire_old_purchases():
                 purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
                 changed_purchases = True
 
-        elif status == "QUEUED_FOR_PRIME":
+        elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "FINAL_VERIFY_PENDING"}:
             claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
             if not claimed_at:
                 continue
@@ -239,14 +371,14 @@ def expire_old_purchases():
                     if (
                         cmd.get("steam_id") == steam_id
                         and str(cmd.get("item", "")).lower().strip() == item
-                        and cmd.get("status") in {"PENDING", "SENDING"}
+                        and cmd.get("status") in {"PENDING", "EXECUTING"}
                     ):
                         cmd["status"] = "EXPIRED"
                         cmd["completed_at"] = str(datetime.now())
                         changed_commands = True
 
-                purchase["status"] = "UNCLAIMED"
-                purchase["delivery_note"] = f"Prime queue expired after {QUEUED_TIMEOUT_MINUTES} minutes"
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = f"Claim queue expired after {QUEUED_TIMEOUT_MINUTES} minutes"
                 changed_purchases = True
 
     if changed_purchases:
@@ -259,9 +391,8 @@ def expire_old_purchases():
 
 def has_open_purchase(steam_id: str) -> bool:
     purchases = load_purchases()
-    open_statuses = {"UNCLAIMED", "QUEUED_FOR_PRIME", "CLAIMING"}
     return any(
-        p.get("steam_id") == steam_id and p.get("status") in open_statuses
+        p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES
         for p in purchases
     )
 
@@ -269,13 +400,13 @@ def has_open_purchase(steam_id: str) -> bool:
 def get_claimable_purchase_index(purchases, steam_id: str):
     for i in range(len(purchases) - 1, -1, -1):
         p = purchases[i]
-        if p.get("steam_id") == steam_id and p.get("status") == "UNCLAIMED":
-            return i, "UNCLAIMED"
+        if p.get("steam_id") == steam_id and p.get("status") in {"UNCLAIMED", "WRONG_DINO"}:
+            return i, p.get("status")
 
     for i in range(len(purchases) - 1, -1, -1):
         p = purchases[i]
-        if p.get("steam_id") == steam_id and p.get("status") == "QUEUED_FOR_PRIME":
-            return i, "QUEUED_FOR_PRIME"
+        if p.get("steam_id") == steam_id and p.get("status") in CLAIM_PRECHECK_STATES.union({"CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}):
+            return i, p.get("status")
 
     return None, None
 
@@ -488,66 +619,180 @@ def print_live_status(players):
         )
 
 
-def process_game_command_queue():
-    game_commands = load_game_commands()
-    purchases = load_purchases()
+def find_purchase_by_group(purchases, claim_group_id: str):
+    for purchase in purchases:
+        if purchase.get("claim_group_id") == claim_group_id:
+            return purchase
+    return None
 
-    changed_commands = False
+
+def has_pending_group_commands(commands_data, claim_group_id: str):
+    if not claim_group_id:
+        return False
+    return any(
+        c.get("claim_group_id") == claim_group_id
+        and c.get("status") in {"PENDING", "EXECUTING"}
+        for c in commands_data
+    )
+
+
+def all_group_steps_done(commands_data, claim_group_id: str, expected_phase: str):
+    group_cmds = [
+        c for c in commands_data
+        if c.get("claim_group_id") == claim_group_id and c.get("claim_phase") == expected_phase
+    ]
+    if not group_cmds:
+        return False
+
+    return all(c.get("status") == "DONE" for c in group_cmds)
+
+
+def any_group_step_failed(commands_data, claim_group_id: str):
+    return any(
+        c.get("claim_group_id") == claim_group_id and c.get("status") == "FAILED"
+        for c in commands_data
+    )
+
+
+def queue_claim_phase_commands(purchase, player_name: str, phase: str):
+    game_commands = load_game_commands()
+    next_id = get_next_command_id(game_commands)
+    steam_id = purchase["steam_id"]
+    item = str(purchase.get("item", "")).lower().strip()
+    claim_group_id = purchase.get("claim_group_id")
+
+    if phase == "PRECHECK":
+        sequence = [f"/health {steam_id} 100"]
+    else:
+        sequence = [
+            f"/elder {steam_id} prime",
+            f"/hunger {steam_id} 100",
+            f"/hunger {steam_id} 30",
+            f"/elder {steam_id} prime",
+            f"/hunger {steam_id} 100",
+            f"/health {steam_id} 100",
+        ]
+
+    for idx, command_text in enumerate(sequence, start=1):
+        game_commands.append({
+            "id": f"cmd_{next_id + idx - 1:03d}",
+            "steam_id": steam_id,
+            "player_name": player_name,
+            "item": item,
+            "command": command_text,
+            "status": "PENDING",
+            "created_at": str(datetime.now()),
+            "completed_at": None,
+            "claim_group_id": claim_group_id,
+            "claim_step": idx,
+            "claim_final": idx == len(sequence),
+            "claim_phase": phase,
+        })
+
+    save_game_commands(game_commands)
+    return sequence
+
+
+def process_claim_orchestration():
+    purchases = load_purchases()
+    game_commands = load_game_commands()
     changed_purchases = False
 
-    for cmd in game_commands:
-        if cmd.get("status") != "PENDING":
+    for purchase in purchases:
+        status = purchase.get("status")
+        claim_group_id = purchase.get("claim_group_id")
+        steam_id = purchase.get("steam_id")
+        item = str(purchase.get("item", "")).lower().strip()
+
+        if status == "PRECHECK_QUEUED" and claim_group_id:
+            if any_group_step_failed(game_commands, claim_group_id):
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = "Pre-check command execution failed"
+                changed_purchases = True
+                continue
+
+            if not all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
+                continue
+
+            precheck_log = get_latest_health_log_for_steam(steam_id)
+            if not precheck_log:
+                continue
+
+            if not classes_match(item, precheck_log["class_name"]):
+                purchase["status"] = "WRONG_DINO"
+                purchase["failure_note"] = (
+                    f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}"
+                )
+                purchase["delivery_note"] = "Claim blocked: you are not on the correct dino for this purchase."
+                changed_purchases = True
+                continue
+
+            purchase["status"] = "PRECHECK_PASSED"
+            purchase["delivery_note"] = (
+                f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
+            )
+            changed_purchases = True
+
+            player_name = purchase.get("player") or "Unknown"
+            claim_sequence = queue_claim_phase_commands(purchase, player_name, "CLAIM")
+            purchase["status"] = "CLAIM_SEQUENCE_QUEUED"
+            purchase["delivery_note"] = " | ".join(claim_sequence)
+            changed_purchases = True
+            game_commands = load_game_commands()
             continue
 
-        steam_id = cmd.get("steam_id")
-        item = str(cmd.get("item", "")).lower().strip()
-        command_text = cmd.get("command", "")
+        if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
+            if any_group_step_failed(game_commands, claim_group_id):
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = "Claim sequence command execution failed"
+                changed_purchases = True
+                continue
 
-        cmd["status"] = "SENDING"
-        changed_commands = True
+            if has_pending_group_commands(game_commands, claim_group_id):
+                continue
 
-        try:
-            run_rcon(command_text)
-            cmd["status"] = "SENT"
-            cmd["completed_at"] = str(datetime.now())
-            print(f"[CLAIM QUEUED] {steam_id} | {item} | {command_text}")
+            if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
+                purchase["status"] = "FINAL_VERIFY_PENDING"
+                changed_purchases = True
+                continue
 
-            final_command_text = f"/hunger {steam_id} 100"
-            if str(command_text).strip() == final_command_text:
-                completed_statuses = {"SENT", "DONE"}
-                sent_for_purchase = [
-                    c for c in game_commands
-                    if c.get("steam_id") == steam_id
-                    and str(c.get("item", "")).lower().strip() == item
-                    and c.get("status") in completed_statuses
-                ]
-                sent_texts = [str(c.get("command", "")).strip() for c in sent_for_purchase]
+        if status == "FINAL_VERIFY_PENDING":
+            final_log = get_latest_health_log_for_steam(steam_id)
+            if not final_log:
+                continue
 
-                elder_count = sum(1 for t in sent_texts if t == f"/elder {steam_id} prime")
-                hunger_30_seen = any(t == f"/hunger {steam_id} 30" for t in sent_texts)
-                hunger_100_count = sum(1 for t in sent_texts if t == final_command_text)
+            if final_log["steam_id"] != str(steam_id):
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = "Final verify failed: Steam ID mismatch"
+                changed_purchases = True
+                continue
 
-                if elder_count >= 2 and hunger_30_seen and hunger_100_count >= 2:
-                    for purchase in purchases:
-                        if (
-                            purchase.get("steam_id") == steam_id
-                            and str(purchase.get("item", "")).lower().strip() == item
-                            and purchase.get("status") == "QUEUED_FOR_PRIME"
-                        ):
-                            purchase["status"] = "DELIVERED"
-                            purchase["delivery_note"] = command_text
-                            changed_purchases = True
+            if not classes_match(item, final_log["class_name"]):
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = f"Final verify failed: class mismatch ({final_log['class_name']})"
+                changed_purchases = True
+                continue
 
-        except Exception as e:
-            cmd["status"] = "FAILED"
-            cmd["completed_at"] = str(datetime.now())
-            cmd["error"] = str(e)
-            print(f"[ERROR] claim queue send failed: {e}")
+            if abs(float(final_log["new_value"]) - 100.0) > 0.000001:
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = f"Final verify failed: health ended at {final_log['new_value']:.6f}%"
+                changed_purchases = True
+                continue
 
-    if changed_commands:
-        save_game_commands(game_commands)
+            purchase["status"] = "DELIVERED"
+            purchase["delivery_note"] = (
+                f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
+            )
+            changed_purchases = True
+
     if changed_purchases:
         save_purchases(purchases)
+
+
+def process_game_command_queue():
+    # Command execution ownership is handled exclusively by in_game_executor.py.
+    # This bot-side function only orchestrates claim-state transitions from metadata/logs.
+    process_claim_orchestration()
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -822,6 +1067,8 @@ async def buy(ctx, item: str):
         "time": str(datetime.now()),
         "claimed_at": None,
         "delivery_note": None,
+        "failure_note": None,
+        "claim_group_id": None,
     })
     save_purchases(purchases)
 
@@ -851,72 +1098,49 @@ async def claim(ctx):
         await ctx.send("❌ You do not have any active dinosaur purchases.")
         return
 
-    if purchase_status == "QUEUED_FOR_PRIME":
-        purchase = purchases[purchase_index]
+    purchase = purchases[purchase_index]
+
+    if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
         await ctx.send(
-            f"⏳ Your prime is already queued.\n\n"
+            f"⏳ Your claim is already being processed.\n\n"
             f"🧬 Dino: **{purchase['item'].upper()}**\n"
-            f"Use `!myclaims` to check status, or wait for the bridge."
+            f"Status: **{purchase.get('status', 'UNKNOWN')}**\n"
+            f"Use `!myclaims` to check status."
         )
         return
 
     game_commands = load_game_commands()
-
-    claim_sequence_commands = [
-        f"/elder {steam_id} prime",
-        f"/hunger {steam_id} 100",
-        f"/hunger {steam_id} 30",
-        f"/elder {steam_id} prime",
-        f"/hunger {steam_id} 100",
-    ]
-
     existing_pending = any(
         cmd.get("steam_id") == steam_id
-        and str(cmd.get("item", "")).lower().strip() == str(purchases[purchase_index]["item"]).lower().strip()
-        and str(cmd.get("command", "")) in set(claim_sequence_commands)
-        and cmd.get("status") in {"PENDING", "SENDING", "EXECUTING"}
+        and str(cmd.get("item", "")).lower().strip() == str(purchase.get("item", "")).lower().strip()
+        and cmd.get("status") in {"PENDING", "EXECUTING"}
         for cmd in game_commands
     )
     if existing_pending:
-        purchases[purchase_index]["status"] = "QUEUED_FOR_PRIME"
-        purchases[purchase_index]["claimed_at"] = str(datetime.now())
-        purchases[purchase_index]["delivery_note"] = "Existing pending prime command found"
+        purchase["status"] = "PRECHECK_QUEUED"
+        purchase["claimed_at"] = str(datetime.now())
+        purchase["delivery_note"] = "Existing pending command found"
+        if not purchase.get("claim_group_id"):
+            purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
         save_purchases(purchases)
 
-        await ctx.send("⏳ Your prime is already queued and waiting to be sent.")
+        await ctx.send("⏳ Health/class verification queued. Stay on the dino you bought.")
         return
 
-    next_id = get_next_command_id(game_commands)
-    for idx, command_text in enumerate(claim_sequence_commands):
-        game_commands.append({
-            "id": f"cmd_{next_id + idx:03d}",
-            "steam_id": steam_id,
-            "player_name": player["name"],
-            "item": purchases[purchase_index]["item"],
-            "command": command_text,
-            "status": "PENDING",
-            "created_at": str(datetime.now()),
-            "completed_at": None
-        })
-    save_game_commands(game_commands)
+    if not purchase.get("claim_group_id"):
+        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
 
-    purchases[purchase_index]["status"] = "QUEUED_FOR_PRIME"
-    purchases[purchase_index]["claimed_at"] = str(datetime.now())
-    purchases[purchase_index]["delivery_note"] = " | ".join(claim_sequence_commands)
+    queued = queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
+    purchase["status"] = "PRECHECK_QUEUED"
+    purchase["claimed_at"] = str(datetime.now())
+    purchase["delivery_note"] = " | ".join(queued)
+    purchase["failure_note"] = None
     save_purchases(purchases)
 
-    print(f"[CLAIM QUEUED] {player['name']} | {steam_id} | {' ; '.join(claim_sequence_commands)}")
-
-    queued_commands_display = "\n".join(
-        f"{i + 1}. `{command}`" for i, command in enumerate(claim_sequence_commands)
-    )
-
     await ctx.send(
-        f"⚡ **PRIME QUEUED**\n\n"
-        f"🧬 Dino: **{purchases[purchase_index]['item'].upper()}**\n"
-        f"👤 Player: **{player['name']}**\n"
-        f"📨 Commands queued:\n{queued_commands_display}\n\n"
-        f"Stay in game while the admin bridge sends it."
+        "🩺 **PRE-CHECK QUEUED**\n\n"
+        "Health/class verification queued. Stay on the dino you bought.\n"
+        f"1. `{queued[0]}`"
     )
 
 
