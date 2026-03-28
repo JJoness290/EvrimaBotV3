@@ -115,6 +115,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 invite_cache = {}
 online_since = {}
 last_minute_tick = {}
+MAIN_LOOP = None
+
+DEFAULT_RESTART_TIMES = ["00:00", "06:00", "12:00", "18:00"]
+RESTART_WARN_MINUTES = [3, 2, 1]
+restart_warning_sent = set()
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
@@ -727,6 +732,78 @@ def get_claim_status_display(status: str):
     return mapping.get(status, ("In progress", None))
 
 
+def render_claim_progress_text(purchase):
+    status = purchase.get("status")
+    label, pct = get_claim_status_display(status)
+    item = str(purchase.get("item", "dino")).upper()
+
+    if status == "DELIVERED":
+        return f"🧬 {item}\nGrowth confirmed — 100% complete."
+    if status in {"WRONG_DINO", "WRONG_DINO_REFUNDED"}:
+        return f"🧬 {item}\nWrong dinosaur detected — points refunded."
+    if status == "FAILED":
+        note = purchase.get("failure_note") or purchase.get("delivery_note") or "Verification timed out — please try again."
+        return f"🧬 {item}\n{note}"
+    if pct is None:
+        return f"🧬 {item}\n{label}."
+    return f"🧬 {item}\n{label} — {pct}% complete."
+
+
+async def _update_claim_progress_message_async(purchase_snapshot: dict):
+    channel_id = purchase_snapshot.get("progress_channel_id")
+    message_id = purchase_snapshot.get("progress_message_id")
+    if not channel_id:
+        return
+
+    text = render_claim_progress_text(purchase_snapshot)
+    try:
+        channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+                await message.edit(content=text)
+                return
+            except Exception:
+                pass
+
+        sent = await channel.send(text)
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            for p in purchases:
+                if p.get("claim_group_id") == purchase_snapshot.get("claim_group_id"):
+                    p["progress_channel_id"] = int(channel_id)
+                    p["progress_message_id"] = int(sent.id)
+                    p["progress_guild_id"] = purchase_snapshot.get("progress_guild_id")
+                    p["progress_user_id"] = purchase_snapshot.get("progress_user_id")
+                    break
+            save_purchases(purchases)
+    except Exception:
+        return
+
+
+def queue_claim_progress_message_update(purchase_snapshot: dict):
+    if not MAIN_LOOP:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _update_claim_progress_message_async(dict(purchase_snapshot)),
+            MAIN_LOOP,
+        )
+    except Exception:
+        return
+
+
+def set_purchase_status(purchase: dict, new_status: str, delivery_note: str | None = None, failure_note: str | None = None):
+    old_status = purchase.get("status")
+    purchase["status"] = new_status
+    if delivery_note is not None:
+        purchase["delivery_note"] = delivery_note
+    if failure_note is not None:
+        purchase["failure_note"] = failure_note
+    if old_status != new_status:
+        queue_claim_progress_message_update(purchase)
+
+
 def expire_old_purchases():
     with ECONOMY_LOCK:
         purchases = load_purchases()
@@ -879,6 +956,61 @@ def send_announcement_silent(message: str):
         print(f"[ANNOUNCEMENT STDERR] ERROR: {e}")
         print("[ANNOUNCEMENT RETURN CODE] -1")
         return False
+
+
+def get_restart_schedule_times():
+    config = load_config()
+    raw = config.get("restart_times", DEFAULT_RESTART_TIMES)
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    if not isinstance(raw, list) or not raw:
+        raw = DEFAULT_RESTART_TIMES
+    times = []
+    for t in raw:
+        try:
+            hh, mm = str(t).split(":")
+            times.append((int(hh), int(mm)))
+        except Exception:
+            continue
+    return times or [(0, 0), (6, 0), (12, 0), (18, 0)]
+
+
+def process_restart_announcements():
+    now = datetime.utcnow().replace(second=0, microsecond=0)
+    schedule = get_restart_schedule_times()
+
+    valid_keys = set()
+    for hour, minute in schedule:
+        restart_dt = now.replace(hour=hour, minute=minute)
+        if restart_dt < now - timedelta(minutes=3):
+            restart_dt = restart_dt + timedelta(days=1)
+
+        for warn_min in RESTART_WARN_MINUTES:
+            warn_dt = restart_dt - timedelta(minutes=warn_min)
+            key = f"{restart_dt.isoformat()}_{warn_min}"
+            if now == warn_dt:
+                valid_keys.add(key)
+                if key in restart_warning_sent:
+                    continue
+                if warn_min == 1:
+                    msg = "Server restart in 1 minute. Please move to safety."
+                else:
+                    msg = f"Server restart in {warn_min} minutes."
+                sent = send_announcement_silent(msg)
+                if sent:
+                    restart_warning_sent.add(key)
+
+    # keep set from growing forever
+    stale_cutoff = now - timedelta(days=2)
+    restart_warning_sent_copy = set(restart_warning_sent)
+    for key in restart_warning_sent_copy:
+        try:
+            restart_iso = key.rsplit("_", 1)[0]
+            restart_time = datetime.fromisoformat(restart_iso)
+            if restart_time < stale_cutoff:
+                restart_warning_sent.discard(key)
+        except Exception:
+            restart_warning_sent.discard(key)
 
 
 def get_players_from_rcon():
@@ -1145,8 +1277,7 @@ def process_claim_orchestration():
 
             if status == "PRECHECK_QUEUED" and claim_group_id:
                 if any_group_step_failed(game_commands, claim_group_id):
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Pre-check command execution failed"
+                    set_purchase_status(purchase, "FAILED", "Pre-check command execution failed", "Verification timed out — claim failed.")
                     changed_purchases = True
                     continue
 
@@ -1154,7 +1285,7 @@ def process_claim_orchestration():
                     continue
 
                 if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
-                    purchase["status"] = "PRECHECK_VERIFYING"
+                    set_purchase_status(purchase, "PRECHECK_VERIFYING")
                     purchase["precheck_verify_started_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Verification in progress — 35% complete."
                     changed_purchases = True
@@ -1166,9 +1297,12 @@ def process_claim_orchestration():
                 if not precheck_log:
                     print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
                     if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
-                        purchase["status"] = "FAILED"
-                        purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
-                        purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
+                        set_purchase_status(
+                            purchase,
+                            "FAILED",
+                            "Verification timed out. Please try again.",
+                            "Verification timed out — claim failed.",
+                        )
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
                         changed_purchases = True
                     continue
@@ -1179,14 +1313,17 @@ def process_claim_orchestration():
                     if cancel_claim_group_commands(game_commands, claim_group_id, cancel_reason):
                         changed_commands = True
                     refund_purchase_energy_if_needed(purchase, reason)
-                    purchase["status"] = "WRONG_DINO_REFUNDED"
-                    purchase["failure_note"] = f"{reason} Energy refunded."
-                    purchase["delivery_note"] = "Wrong dinosaur detected. Your points were refunded."
+                    set_purchase_status(
+                        purchase,
+                        "WRONG_DINO_REFUNDED",
+                        "Wrong dinosaur detected. Your points were refunded.",
+                        f"{reason} Energy refunded.",
+                    )
                     print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
                     changed_purchases = True
                     continue
 
-                purchase["status"] = "PRECHECK_PASSED"
+                set_purchase_status(purchase, "PRECHECK_PASSED")
                 purchase["delivery_note"] = (
                     "Verification passed. Growth queued — 75% complete."
                 )
@@ -1196,16 +1333,15 @@ def process_claim_orchestration():
 
                 player_name = purchase.get("player") or "Unknown"
                 claim_sequence = queue_claim_phase_commands(purchase, player_name, "CLAIM")
-                purchase["status"] = "CLAIM_SEQUENCE_QUEUED"
-                purchase["delivery_note"] = " | ".join(claim_sequence)
+                set_purchase_status(purchase, "CLAIM_SEQUENCE_QUEUED")
+                purchase["delivery_note"] = "Growth queued — 75% complete."
                 changed_purchases = True
                 game_commands = load_game_commands()
                 continue
 
             if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
                 if any_group_step_failed(game_commands, claim_group_id):
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = "Claim sequence command execution failed"
+                    set_purchase_status(purchase, "FAILED", "Claim sequence command execution failed", "Verification timed out — claim failed.")
                     changed_purchases = True
                     continue
 
@@ -1213,7 +1349,7 @@ def process_claim_orchestration():
                     continue
 
                 if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
-                    purchase["status"] = "FINAL_VERIFY_PENDING"
+                    set_purchase_status(purchase, "FINAL_VERIFY_PENDING")
                     purchase["final_verify_started_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Final verification in progress — 90% complete."
                     changed_purchases = True
@@ -1225,24 +1361,23 @@ def process_claim_orchestration():
                 if not grow_log:
                     print(f"[CLAIM VERIFY] No matching Grow line found in current remote tail for {steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
-                        purchase["status"] = "FAILED"
-                        purchase["delivery_note"] = "Final verification timed out. No Grow verification log found."
-                        purchase["failure_note"] = "Verification timed out. Please try again."
+                        set_purchase_status(
+                            purchase,
+                            "FAILED",
+                            "Verification timed out. Please try again.",
+                            "Verification timed out — claim failed.",
+                        )
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                         changed_purchases = True
                     continue
 
                 growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
                 if not growth_ok:
-                    purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = growth_note
-                    purchase["failure_note"] = "Growth verification failed. Please try again."
+                    set_purchase_status(purchase, "FAILED", growth_note, "Growth verification failed. Please try again.")
                     changed_purchases = True
                     continue
 
-                purchase["status"] = "DELIVERED"
-                purchase["delivery_note"] = growth_note
-                purchase["failure_note"] = "Growth confirmed. Claim completed — 100% complete."
+                set_purchase_status(purchase, "DELIVERED", growth_note, "Growth confirmed — 100% complete.")
                 changed_purchases = True
 
         if changed_commands:
@@ -1303,6 +1438,7 @@ async def tracking_loop():
         tick_rewards()
         expire_old_purchases()
         await asyncio.to_thread(process_game_command_queue)
+        await asyncio.to_thread(process_restart_announcements)
         print_live_status(players)
     except Exception as e:
         print(f"[ERROR] tracking loop failed: {e}")
@@ -1323,7 +1459,9 @@ async def announcement_loop():
 
 @bot.event
 async def on_ready():
+    global MAIN_LOOP
     print(f"[BOT STARTED] Logged in as {bot.user}")
+    MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
 
     if not tracking_loop.is_running():
@@ -1628,7 +1766,20 @@ async def claim(ctx):
                     save_purchases(purchases)
                     response = "Pre-check queued — 20% complete. Stay on the dinosaur you bought."
 
-    await ctx.send(response)
+    sent_message = await ctx.send(response)
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        target = None
+        for p in reversed(purchases):
+            if p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES.union({"FAILED", "WRONG_DINO_REFUNDED", "DELIVERED"}):
+                target = p
+                break
+        if target and target.get("claim_group_id"):
+            target["progress_channel_id"] = int(ctx.channel.id)
+            target["progress_message_id"] = int(sent_message.id)
+            target["progress_guild_id"] = int(ctx.guild.id) if ctx.guild else None
+            target["progress_user_id"] = int(ctx.author.id)
+            save_purchases(purchases)
 
 
 @bot.command()
