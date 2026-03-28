@@ -382,6 +382,20 @@ def get_player(ctx):
     return data.get(steam_id), steam_id
 
 
+def get_steam_id_for_discord(discord_id: str, links_data=None):
+    links = links_data if isinstance(links_data, dict) else load_json(LINK_FILE, {})
+    return links.get(str(discord_id))
+
+
+def get_latest_player_record_by_discord_id(discord_id: str):
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+    steam_id = get_steam_id_for_discord(discord_id, links)
+    if not steam_id:
+        return None, None, data, links
+    return data.get(steam_id), steam_id, data, links
+
+
 def get_player_by_discord_id(discord_id: str):
     links = load_json(LINK_FILE, {})
     data = load_json(DATA_FILE, {})
@@ -391,6 +405,44 @@ def get_player_by_discord_id(discord_id: str):
         return None, None, data
 
     return data.get(steam_id), steam_id, data
+
+
+def adjust_energy_in_data(data: dict, steam_id: str, delta: int):
+    if steam_id not in data:
+        return None, None
+    before = int(data[steam_id].get("energy", 0))
+    after = max(0, before + int(delta))
+    data[steam_id]["energy"] = after
+    return before, after
+
+
+def deduct_player_energy(steam_id: str, amount: int, reason: str = ""):
+    if amount < 0:
+        amount = abs(amount)
+    data = load_json(DATA_FILE, {})
+    if steam_id not in data:
+        return False, None, None
+    before = int(data[steam_id].get("energy", 0))
+    if before < int(amount):
+        return False, before, before
+    _, after = adjust_energy_in_data(data, steam_id, -int(amount))
+    if reason:
+        data[steam_id]["last_energy_note"] = f"{reason} @ {datetime.now()}"
+    save_json(DATA_FILE, data)
+    return True, before, after
+
+
+def refund_player_energy(steam_id: str, amount: int, reason: str = ""):
+    if amount < 0:
+        amount = abs(amount)
+    data = load_json(DATA_FILE, {})
+    if steam_id not in data:
+        return False, None, None
+    before, after = adjust_energy_in_data(data, steam_id, int(amount))
+    if reason:
+        data[steam_id]["last_energy_note"] = f"{reason} @ {datetime.now()}"
+    save_json(DATA_FILE, data)
+    return True, before, after
 
 
 def find_shop_price(item_name: str):
@@ -576,8 +628,12 @@ def expire_old_purchases():
 
             if now - created_at >= timedelta(minutes=PURCHASE_TIMEOUT_MINUTES):
                 price, _ = find_shop_price(item)
-                if price is not None and steam_id in data:
-                    data[steam_id]["energy"] = data[steam_id].get("energy", 0) + price
+                if price is not None and steam_id in data and not purchase.get("refund_applied"):
+                    _, _ = adjust_energy_in_data(data, steam_id, int(price))
+                    purchase["refund_applied"] = True
+                    purchase["refund_amount"] = int(price)
+                    purchase["refunded_at"] = str(datetime.now())
+                    purchase["refund_note"] = "Unclaimed purchase expired. Energy refunded."
                     changed_data = True
 
                 purchase["status"] = "EXPIRED"
@@ -809,7 +865,8 @@ def tick_rewards():
         player["current_session_minutes"] = int((now - online_since[steam_id]) // 60)
 
         if gained_energy > 0:
-            player["energy"] = int(player.get("energy", 0)) + gained_energy
+            adjust_energy_in_data(data, steam_id, int(gained_energy))
+            player = data[steam_id]
             print(
                 f"[REWARD] {player.get('name', steam_id)} | "
                 f"{steam_id} | +{gained_energy} energy | "
@@ -900,12 +957,9 @@ def refund_purchase_energy_if_needed(purchase, reason_suffix: str):
     if price is None:
         return False
 
-    data = load_json(DATA_FILE, {})
-    if steam_id not in data:
+    ok, _, _ = refund_player_energy(steam_id, int(price), reason=f"Purchase refund ({item})")
+    if not ok:
         return False
-
-    data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + int(price)
-    save_json(DATA_FILE, data)
 
     purchase["refund_applied"] = True
     purchase["refund_amount"] = int(price)
@@ -925,7 +979,7 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
         sequence = [f"/health {steam_id} 100"]
     else:
         sequence = [
-            f"/growth {steam_id} 73",
+            f"/growth {steam_id} 65",
             f"/diet1 {steam_id} 100",
             f"/diet2 {steam_id} 100",
             f"/diet3 {steam_id} 100",
@@ -1111,8 +1165,7 @@ def reward_referral_if_eligible(inviter_id: str, guild: discord.Guild):
         if record.get("count", 0) >= invite_count and reward_key not in rewarded_levels:
             player, steam_id, data = get_player_by_discord_id(inviter_id)
             if player and steam_id and steam_id in data:
-                data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + energy_reward
-                save_json(DATA_FILE, data)
+                refund_player_energy(steam_id, int(energy_reward), reason=f"Referral milestone {invite_count}")
                 record["rewards"].append(reward_key)
                 gained_messages.append(
                     f"🎉 <@{inviter_id}> reached **{invite_count} invites** and earned **+{energy_reward} energy**!"
@@ -1260,10 +1313,12 @@ async def link(ctx, steam_id: str):
 async def stats(ctx):
     expire_old_purchases()
 
-    player, steam_id = get_player(ctx)
+    player, steam_id, data, _ = get_latest_player_record_by_discord_id(str(ctx.author.id))
     if not player:
         await ctx.send("❌ Use !link first")
         return
+
+    player = data.get(steam_id, player)
 
     previous_total = int(player.get("total_minutes", 0))
     current_session = int(player.get("current_session_minutes", 0))
@@ -1324,8 +1379,10 @@ async def buy(ctx, item: str):
     expire_old_purchases()
 
     data = load_json(DATA_FILE, {})
+    links = load_json(LINK_FILE, {})
     purchases = load_purchases()
-    player, steam_id = get_player(ctx)
+    steam_id = get_steam_id_for_discord(str(ctx.author.id), links)
+    player = data.get(steam_id) if steam_id else None
 
     if not player:
         await ctx.send("❌ Use !link first")
@@ -1346,14 +1403,32 @@ async def buy(ctx, item: str):
         await ctx.send("❌ You already have an active purchase. Use `!claim` first.")
         return
 
-    if player.get("energy", 0) < price:
+    current_energy = int(player.get("energy", 0))
+    if current_energy < int(price):
         await ctx.send("❌ Not enough energy")
         return
 
-    player["energy"] -= price
+    # Guard against duplicate open purchase entries for same item in-flight.
+    duplicate_unclaimed = any(
+        p.get("steam_id") == steam_id
+        and str(p.get("item", "")).lower().strip() == item
+        and p.get("status") in CLAIM_OPEN_STATES
+        for p in purchases
+    )
+    if duplicate_unclaimed:
+        await ctx.send("❌ You already have an active purchase for this dino. Use `!claim` first.")
+        return
+
+    before, after = adjust_energy_in_data(data, steam_id, -int(price))
+    if before is None or after is None:
+        await ctx.send("❌ Could not update your balance. Try again.")
+        return
+    if after < 0:
+        data[steam_id]["energy"] = 0
+        after = 0
     save_json(DATA_FILE, data)
 
-    purchases.append({
+    new_purchase = {
         "player": player["name"],
         "steam_id": steam_id,
         "item": item,
@@ -1367,12 +1442,23 @@ async def buy(ctx, item: str):
         "refund_amount": 0,
         "refunded_at": None,
         "refund_note": None,
-    })
-    save_purchases(purchases)
+    }
+    purchases.append(new_purchase)
+    try:
+        save_purchases(purchases)
+    except Exception:
+        # Roll back deduction if purchase write fails.
+        data = load_json(DATA_FILE, {})
+        if steam_id in data:
+            adjust_energy_in_data(data, steam_id, int(price))
+            save_json(DATA_FILE, data)
+        await ctx.send("❌ Purchase failed to save. Your energy was restored.")
+        return
 
     await ctx.send(
         f"🧬 **{item.upper()} PURCHASED**\n\n"
         f"⚡ -{price} energy\n"
+        f"💰 Remaining energy: {after}\n"
         f"📦 Claim saved\n"
         f"⏳ Expires in {PURCHASE_TIMEOUT_MINUTES} minutes if not claimed\n\n"
         f"Use `!claim` when you are ready to be primed."
