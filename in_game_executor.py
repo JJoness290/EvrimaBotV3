@@ -10,7 +10,7 @@ GAME_COMMANDS_FILE = Path("game_commands.json")
 POST_SEND_DELAYS = {
     "/elder": 5,
     "/hunger": 3,
-    "/health": 3,
+    "/health": 1,
 }
 
 

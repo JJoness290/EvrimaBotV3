@@ -19,6 +19,7 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
+LOG_CURSOR_FILE = Path("log_cursor_state.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -59,10 +60,22 @@ CLAIM_PRECHECK_STATES = {"PRECHECK_QUEUED"}
 CLAIM_OPEN_STATES = {
     "UNCLAIMED",
     "PRECHECK_QUEUED",
+    "PRECHECK_VERIFYING",
     "PRECHECK_PASSED",
     "CLAIM_SEQUENCE_QUEUED",
     "FINAL_VERIFY_PENDING",
 }
+
+PRECHECK_VERIFY_TIMEOUT_SECONDS = 10
+FINAL_VERIFY_TIMEOUT_SECONDS = 12
+LOG_TAIL_FALLBACK_BYTES = 256 * 1024
+
+log_cursor_cache = {
+    "path": None,
+    "offset": 0,
+    "inode": None,
+}
+health_log_recent = []
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -165,6 +178,23 @@ def save_state():
         "last_minute_tick": last_minute_tick,
     }
     save_json(STATE_FILE, state)
+
+
+def load_log_cursor_state():
+    state = load_json(LOG_CURSOR_FILE, {})
+    if not isinstance(state, dict):
+        return
+    log_cursor_cache["path"] = state.get("path")
+    log_cursor_cache["offset"] = int(state.get("offset", 0) or 0)
+    log_cursor_cache["inode"] = state.get("inode")
+
+
+def save_log_cursor_state():
+    save_json(LOG_CURSOR_FILE, {
+        "path": log_cursor_cache.get("path"),
+        "offset": int(log_cursor_cache.get("offset", 0) or 0),
+        "inode": log_cursor_cache.get("inode"),
+    })
 
 
 def ensure_referral_record(referrals, discord_id: str):
@@ -273,12 +303,22 @@ def parse_health_command_log_line(line: str):
     except Exception:
         return None
 
+    event_ts_match = re.search(r"LogTheIsleCommandData:\s*\[(?P<event_ts>[0-9.\-:]+)\]", line or "", re.IGNORECASE)
+    event_dt = None
+    if event_ts_match:
+        ts_raw = event_ts_match.group("event_ts")
+        try:
+            event_dt = datetime.strptime(ts_raw, "%Y.%m.%d-%H.%M.%S")
+        except Exception:
+            event_dt = None
+
     return {
         "steam_id": str(match.group("steam_id")),
         "class_name": str(match.group("class_name")).strip(),
         "previous_value": prev_value,
         "new_value": new_value,
         "command": "SetHealth",
+        "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
         "raw_line": line.strip(),
     }
 
@@ -310,21 +350,112 @@ def resolve_log_file_path() -> Path | None:
     return None
 
 
-def get_latest_health_log_for_steam(steam_id: str):
+def _reset_log_cursor_for_path(log_path: Path):
+    try:
+        stat = log_path.stat()
+    except Exception:
+        return
+    log_cursor_cache["path"] = str(log_path)
+    log_cursor_cache["offset"] = 0
+    log_cursor_cache["inode"] = getattr(stat, "st_ino", None)
+    save_log_cursor_state()
+
+
+def _read_new_log_lines(log_path: Path):
+    path_str = str(log_path)
+    try:
+        stat = log_path.stat()
+    except Exception:
+        return []
+
+    current_inode = getattr(stat, "st_ino", None)
+    current_size = int(stat.st_size)
+    cached_path = log_cursor_cache.get("path")
+    cached_inode = log_cursor_cache.get("inode")
+    cached_offset = int(log_cursor_cache.get("offset", 0) or 0)
+
+    if cached_path != path_str or (cached_inode is not None and current_inode != cached_inode) or cached_offset > current_size:
+        _reset_log_cursor_for_path(log_path)
+        cached_offset = 0
+
+    if cached_offset < 0:
+        cached_offset = 0
+
+    try:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as f:
+            f.seek(cached_offset)
+            raw = f.read()
+            new_offset = f.tell()
+    except Exception:
+        return []
+
+    log_cursor_cache["path"] = path_str
+    log_cursor_cache["offset"] = int(new_offset)
+    log_cursor_cache["inode"] = current_inode
+    save_log_cursor_state()
+
+    if not raw:
+        return []
+    return raw.splitlines()
+
+
+def _read_log_tail_lines(log_path: Path, tail_bytes: int = LOG_TAIL_FALLBACK_BYTES):
+    try:
+        with log_path.open("rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            seek_to = max(0, file_size - tail_bytes)
+            f.seek(seek_to)
+            data = f.read()
+        return data.decode("utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+
+
+def refresh_health_log_cache():
+    log_path = resolve_log_file_path()
+    if not log_path:
+        return
+
+    new_lines = _read_new_log_lines(log_path)
+    if not new_lines:
+        return
+
+    for line in new_lines:
+        parsed = parse_health_command_log_line(line)
+        if parsed:
+            parsed["log_file"] = str(log_path)
+            health_log_recent.append(parsed)
+
+    if len(health_log_recent) > 500:
+        del health_log_recent[:-500]
+
+
+def get_latest_health_log_for_steam(steam_id: str, min_event_time: datetime | None = None):
+    refresh_health_log_cache()
+
+    for parsed in reversed(health_log_recent):
+        if parsed.get("steam_id") != str(steam_id):
+            continue
+        event_time = parse_dt(parsed.get("event_time"))
+        if min_event_time and event_time and event_time < min_event_time:
+            continue
+        return parsed
+
     log_path = resolve_log_file_path()
     if not log_path:
         return None
 
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return None
+    lines = _read_log_tail_lines(log_path)
 
     for line in reversed(lines):
         parsed = parse_health_command_log_line(line)
         if not parsed:
             continue
         if parsed["steam_id"] == str(steam_id):
+            event_time = parse_dt(parsed.get("event_time"))
+            if min_event_time and event_time and event_time < min_event_time:
+                continue
             parsed["log_file"] = str(log_path)
             return parsed
 
@@ -361,7 +492,7 @@ def expire_old_purchases():
                 purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
                 changed_purchases = True
 
-        elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "FINAL_VERIFY_PENDING"}:
+        elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING"}:
             claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
             if not claimed_at:
                 continue
@@ -405,7 +536,7 @@ def get_claimable_purchase_index(purchases, steam_id: str):
 
     for i in range(len(purchases) - 1, -1, -1):
         p = purchases[i]
-        if p.get("steam_id") == steam_id and p.get("status") in CLAIM_PRECHECK_STATES.union({"CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}):
+        if p.get("steam_id") == steam_id and p.get("status") in CLAIM_PRECHECK_STATES.union({"PRECHECK_VERIFYING", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}):
             return i, p.get("status")
 
     return None, None
@@ -654,6 +785,43 @@ def any_group_step_failed(commands_data, claim_group_id: str):
     )
 
 
+def cancel_claim_group_commands(commands_data, claim_group_id: str, reason: str):
+    changed = False
+    for command_entry in commands_data:
+        if command_entry.get("claim_group_id") != claim_group_id:
+            continue
+        if command_entry.get("status") in {"PENDING", "EXECUTING"}:
+            command_entry["status"] = "CANCELLED"
+            command_entry["completed_at"] = str(datetime.now())
+            command_entry["error"] = reason
+            changed = True
+    return changed
+
+
+def refund_purchase_energy_if_needed(purchase, reason_suffix: str):
+    if purchase.get("refund_applied"):
+        return False
+
+    steam_id = purchase.get("steam_id")
+    item = str(purchase.get("item", "")).lower().strip()
+    price, _ = find_shop_price(item)
+    if price is None:
+        return False
+
+    data = load_json(DATA_FILE, {})
+    if steam_id not in data:
+        return False
+
+    data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + int(price)
+    save_json(DATA_FILE, data)
+
+    purchase["refund_applied"] = True
+    purchase["refund_amount"] = int(price)
+    purchase["refunded_at"] = str(datetime.now())
+    purchase["refund_note"] = f"Wrong dino detected. Energy refunded. {reason_suffix}".strip()
+    return True
+
+
 def queue_claim_phase_commands(purchase, player_name: str, phase: str):
     game_commands = load_game_commands()
     next_id = get_next_command_id(game_commands)
@@ -697,6 +865,9 @@ def process_claim_orchestration():
     purchases = load_purchases()
     game_commands = load_game_commands()
     changed_purchases = False
+    changed_commands = False
+
+    refresh_health_log_cache()
 
     for purchase in purchases:
         status = purchase.get("status")
@@ -711,19 +882,40 @@ def process_claim_orchestration():
                 changed_purchases = True
                 continue
 
-            if not all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
+            if has_pending_group_commands(game_commands, claim_group_id):
                 continue
 
-            precheck_log = get_latest_health_log_for_steam(steam_id)
+            if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
+                purchase["status"] = "PRECHECK_VERIFYING"
+                purchase["precheck_verify_started_at"] = str(datetime.now())
+                purchase["delivery_note"] = "Pre-check command done. Waiting for SetHealth verification log."
+                changed_purchases = True
+            continue
+
+        if status == "PRECHECK_VERIFYING" and claim_group_id:
+            verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
+            min_event_time = None
+            if verify_started_at:
+                min_event_time = verify_started_at - timedelta(seconds=2)
+
+            precheck_log = get_latest_health_log_for_steam(steam_id, min_event_time=min_event_time)
             if not precheck_log:
+                if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = "Pre-check timed out: no SetHealth verification log found."
+                    purchase["failure_note"] = "⚠️ Verification timed out. No grow was applied."
+                    changed_purchases = True
                 continue
 
             if not classes_match(item, precheck_log["class_name"]):
-                purchase["status"] = "WRONG_DINO"
-                purchase["failure_note"] = (
-                    f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}"
-                )
-                purchase["delivery_note"] = "Claim blocked: you are not on the correct dino for this purchase."
+                reason = f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}."
+                cancel_reason = f"Claim group cancelled: wrong dino detected ({precheck_log['class_name']})"
+                if cancel_claim_group_commands(game_commands, claim_group_id, cancel_reason):
+                    changed_commands = True
+                refund_purchase_energy_if_needed(purchase, reason)
+                purchase["status"] = "WRONG_DINO_REFUNDED"
+                purchase["failure_note"] = f"{reason} Energy refunded."
+                purchase["delivery_note"] = "❌ Claim blocked: wrong dino detected. Your energy has been refunded."
                 changed_purchases = True
                 continue
 
@@ -731,6 +923,7 @@ def process_claim_orchestration():
             purchase["delivery_note"] = (
                 f"Pre-check verified class {precheck_log['class_name']} via {precheck_log['command']}"
             )
+            purchase["failure_note"] = "✅ Verification passed. Grow sequence queued."
             changed_purchases = True
 
             player_name = purchase.get("player") or "Unknown"
@@ -753,12 +946,22 @@ def process_claim_orchestration():
 
             if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
                 purchase["status"] = "FINAL_VERIFY_PENDING"
+                purchase["final_verify_started_at"] = str(datetime.now())
                 changed_purchases = True
                 continue
 
         if status == "FINAL_VERIFY_PENDING":
-            final_log = get_latest_health_log_for_steam(steam_id)
+            final_started_at = parse_dt(purchase.get("final_verify_started_at"))
+            min_event_time = None
+            if final_started_at:
+                min_event_time = final_started_at - timedelta(seconds=2)
+
+            final_log = get_latest_health_log_for_steam(steam_id, min_event_time=min_event_time)
             if not final_log:
+                if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
+                    purchase["status"] = "FAILED"
+                    purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
+                    changed_purchases = True
                 continue
 
             if final_log["steam_id"] != str(steam_id):
@@ -783,8 +986,11 @@ def process_claim_orchestration():
             purchase["delivery_note"] = (
                 f"Claim completed and verified: class {final_log['class_name']} | new health {final_log['new_value']:.6f}%"
             )
+            purchase["failure_note"] = None
             changed_purchases = True
 
+    if changed_commands:
+        save_game_commands(game_commands)
     if changed_purchases:
         save_purchases(purchases)
 
@@ -864,6 +1070,7 @@ async def announcement_loop():
 async def on_ready():
     print(f"[BOT STARTED] Logged in as {bot.user}")
     restore_state()
+    load_log_cursor_state()
 
     if not tracking_loop.is_running():
         tracking_loop.change_interval(seconds=get_scan_interval_seconds())
@@ -1069,6 +1276,10 @@ async def buy(ctx, item: str):
         "delivery_note": None,
         "failure_note": None,
         "claim_group_id": None,
+        "refund_applied": False,
+        "refund_amount": 0,
+        "refunded_at": None,
+        "refund_note": None,
     })
     save_purchases(purchases)
 
@@ -1095,12 +1306,27 @@ async def claim(ctx):
     purchase_index, purchase_status = get_claimable_purchase_index(purchases, steam_id)
 
     if purchase_index is None:
+        latest_mine = None
+        for p in reversed(purchases):
+            if p.get("steam_id") == steam_id:
+                latest_mine = p
+                break
+        if latest_mine and latest_mine.get("status") == "WRONG_DINO_REFUNDED":
+            await ctx.send(
+                "❌ Claim blocked: wrong dino detected on your last attempt. "
+                "Your energy has been refunded. Switch dinos and buy again when ready."
+            )
+            return
+        if latest_mine and latest_mine.get("status") == "FAILED":
+            note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
+            await ctx.send(f"⚠️ {note}")
+            return
         await ctx.send("❌ You do not have any active dinosaur purchases.")
         return
 
     purchase = purchases[purchase_index]
 
-    if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
+    if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
         await ctx.send(
             f"⏳ Your claim is already being processed.\n\n"
             f"🧬 Dino: **{purchase['item'].upper()}**\n"
@@ -1163,8 +1389,10 @@ async def myclaims(ctx):
 
     lines = ["📦 **Your Purchases**\n"]
     for p in mine[-10:]:
+        extra_note = p.get("failure_note") or p.get("delivery_note") or ""
         lines.append(
             f"{p.get('item', '?')} — {p.get('status', '?')} — {p.get('time', '?')}"
+            + (f" — {extra_note}" if extra_note else "")
         )
 
     await ctx.send("\n".join(lines))
