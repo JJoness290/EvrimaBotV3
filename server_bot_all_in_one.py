@@ -75,6 +75,7 @@ REMOTE_LOG_TAIL_BYTES = 128 * 1024
 
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
+last_remote_log_match_raw_line_by_steam = {}
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -528,23 +529,27 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
             pass
 
 
-def get_latest_health_log_for_steam(steam_id: str, min_event_time: datetime | None = None):
+def get_latest_health_log_for_steam(steam_id: str):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         return None
 
+    newest_match = None
     for line in reversed(lines):
         parsed = parse_health_command_log_line(line)
         if not parsed:
             continue
         if parsed["steam_id"] != str(steam_id):
             continue
-        event_time = parse_dt(parsed.get("event_time"))
-        if min_event_time and event_time and event_time < min_event_time:
-            continue
-        last_remote_log_match[str(steam_id)] = parsed
-        print(f"[SFTP LOG] Matched SetHealth for steam_id={steam_id}")
-        return parsed
+        print(f"[SFTP LOG] Found candidate SetHealth line for steam_id={steam_id}")
+        newest_match = parsed
+        break
+
+    if newest_match:
+        last_remote_log_match[str(steam_id)] = newest_match
+        last_remote_log_match_raw_line_by_steam[str(steam_id)] = newest_match.get("raw_line")
+        print(f"[SFTP LOG] Using newest SetHealth line for steam_id={steam_id}")
+        return newest_match
 
     return last_remote_log_match.get(str(steam_id))
 
@@ -979,12 +984,9 @@ def process_claim_orchestration():
 
         if status == "PRECHECK_VERIFYING" and claim_group_id:
             verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
-            min_event_time = None
-            if verify_started_at:
-                min_event_time = verify_started_at - timedelta(seconds=2)
-
-            precheck_log = get_latest_health_log_for_steam(steam_id, min_event_time=min_event_time)
+            precheck_log = get_latest_health_log_for_steam(steam_id)
             if not precheck_log:
+                print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
                 if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = "Pre-check timed out. No SetHealth verification log found."
@@ -1040,12 +1042,9 @@ def process_claim_orchestration():
 
         if status == "FINAL_VERIFY_PENDING":
             final_started_at = parse_dt(purchase.get("final_verify_started_at"))
-            min_event_time = None
-            if final_started_at:
-                min_event_time = final_started_at - timedelta(seconds=2)
-
-            final_log = get_latest_health_log_for_steam(steam_id, min_event_time=min_event_time)
+            final_log = get_latest_health_log_for_steam(steam_id)
             if not final_log:
+                print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
                 if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = "Final verify timed out: no SetHealth verification log found."
