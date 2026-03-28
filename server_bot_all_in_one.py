@@ -925,10 +925,10 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
         sequence = [f"/health {steam_id} 100"]
     else:
         sequence = [
-            f"/elder {steam_id} prime",
-            f"/hunger {steam_id} 100",
-            f"/hunger {steam_id} 30",
-            f"/elder {steam_id} prime",
+            f"/growth {steam_id} 73",
+            f"/diet1 {steam_id} 100",
+            f"/diet2 {steam_id} 100",
+            f"/diet3 {steam_id} 100",
             f"/hunger {steam_id} 100",
             f"/health {steam_id} 100",
         ]
