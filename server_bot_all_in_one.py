@@ -9,6 +9,7 @@ import time
 import re
 import uuid
 import os
+import stat
 
 import paramiko
 
@@ -73,6 +74,7 @@ FINAL_VERIFY_TIMEOUT_SECONDS = 8
 REMOTE_LOG_TAIL_BYTES = 128 * 1024
 
 last_remote_log_match = {}
+cached_resolved_remote_log_path = None
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -218,6 +220,147 @@ def open_sftp_client(remote_cfg):
     return transport, sftp
 
 
+def _remote_file_exists(sftp, remote_path: str) -> bool:
+    try:
+        attrs = sftp.stat(remote_path)
+        return not stat.S_ISDIR(attrs.st_mode)
+    except Exception:
+        return False
+
+
+def _normalize_path_variants(configured_path: str):
+    path = str(configured_path or "").strip()
+    variants = []
+    if path:
+        variants.append(path)
+        variants.append("/" + path.lstrip("/"))
+        variants.append("./" + path.lstrip("./"))
+        if path.startswith("TheIsle/"):
+            stripped = path[len("TheIsle/"):]
+            variants.extend([
+                stripped,
+                "/" + stripped.lstrip("/"),
+                "./" + stripped.lstrip("./"),
+            ])
+    variants.extend([
+        "Saved/Logs/TheIsle.log",
+        "./Saved/Logs/TheIsle.log",
+        "/Saved/Logs/TheIsle.log",
+        "TheIsle.log",
+        "./TheIsle.log",
+    ])
+
+    seen = set()
+    deduped = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            deduped.append(v)
+    return deduped
+
+
+def _is_log_file(name: str) -> bool:
+    return str(name or "").lower().endswith(".log")
+
+
+def _is_preferred_log_name(name: str) -> bool:
+    lname = str(name or "").lower()
+    return lname in {"theisle.log", "shootergame.log"}
+
+
+def _score_log_candidate(path_name: str, attrs) -> tuple:
+    p = str(path_name or "")
+    lname = p.lower()
+    base = p.rsplit("/", 1)[-1].lower()
+    in_logs_dir = "logs" in lname
+    is_theisle = base == "theisle.log"
+    is_shooter = base == "shootergame.log"
+    mtime = int(getattr(attrs, "st_mtime", 0) or 0)
+    # Higher is better, mtime secondary.
+    return (
+        3 if is_theisle and in_logs_dir else
+        2 if is_shooter and in_logs_dir else
+        1 if in_logs_dir else
+        0,
+        mtime,
+    )
+
+
+def resolve_remote_log_path(sftp, configured_path: str):
+    global cached_resolved_remote_log_path
+
+    if cached_resolved_remote_log_path and _remote_file_exists(sftp, cached_resolved_remote_log_path):
+        return cached_resolved_remote_log_path
+
+    for candidate in _normalize_path_variants(configured_path):
+        print(f"[SFTP LOG] Trying remote path: {candidate}")
+        if _remote_file_exists(sftp, candidate):
+            cached_resolved_remote_log_path = candidate
+            print(f"[SFTP LOG] Found remote log path: {candidate}")
+            return candidate
+
+    candidate_dirs = [
+        ".",
+        "./TheIsle",
+        "./Saved",
+        "./Saved/Logs",
+        "/",
+        "/TheIsle",
+        "/TheIsle/Saved",
+        "/TheIsle/Saved/Logs",
+    ]
+
+    discovered = []
+    for d in candidate_dirs:
+        try:
+            entries = sftp.listdir_attr(d)
+        except Exception:
+            print(f"[SFTP LOG] Candidate directory missing: {d}")
+            continue
+
+        for entry in entries:
+            name = entry.filename
+            full_path = f"{d.rstrip('/')}/{name}" if d not in {".", "/"} else (name if d == "." else f"/{name}")
+            if _is_log_file(name):
+                discovered.append((full_path, entry))
+            elif stat.S_ISDIR(entry.st_mode) and "log" in name.lower():
+                try:
+                    sub_entries = sftp.listdir_attr(full_path)
+                    for sub in sub_entries:
+                        if _is_log_file(sub.filename):
+                            sub_path = f"{full_path.rstrip('/')}/{sub.filename}"
+                            discovered.append((sub_path, sub))
+                except Exception:
+                    continue
+
+    if discovered:
+        preferred = [c for c in discovered if _is_preferred_log_name(c[0].rsplit("/", 1)[-1])]
+        ranked = preferred if preferred else discovered
+        ranked.sort(key=lambda x: _score_log_candidate(x[0], x[1]), reverse=True)
+        best_path = ranked[0][0]
+        if _remote_file_exists(sftp, best_path):
+            cached_resolved_remote_log_path = best_path
+            print(f"[SFTP LOG] Auto-discovered remote log path: {best_path}")
+            return best_path
+
+    # Diagnostics only on failure.
+    try:
+        cwd = sftp.getcwd()
+        print(f"[SFTP LOG] Path resolution failed. SFTP cwd: {cwd}")
+    except Exception:
+        print("[SFTP LOG] Path resolution failed. Could not read SFTP cwd.")
+
+    for d in [".", "/", "./Saved", "./Saved/Logs", "/TheIsle/Saved/Logs"]:
+        try:
+            names = sftp.listdir(d)
+            preview = ", ".join(names[:15])
+            print(f"[SFTP LOG] Directory snapshot {d}: {preview}")
+        except Exception:
+            continue
+
+    return None
+
+
 def ensure_referral_record(referrals, discord_id: str):
     if discord_id not in referrals:
         referrals[discord_id] = {
@@ -355,7 +498,10 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
     try:
         print(f"[SFTP LOG] Connecting host={cfg['host']} port={cfg['port']} user={cfg['username']}")
         transport, sftp = open_sftp_client(cfg)
-        remote_path = cfg["remote_log_path"]
+        remote_path = resolve_remote_log_path(sftp, cfg["remote_log_path"])
+        if not remote_path:
+            print("[SFTP LOG] Could not resolve remote log path.")
+            return [], "remote_log_not_found"
         print(f"[SFTP LOG] Connected to remote log")
         print(f"[SFTP LOG] Reading tail from {remote_path}")
         with sftp.open(remote_path, "rb") as remote_file:
