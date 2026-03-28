@@ -74,6 +74,7 @@ CLAIM_OPEN_STATES = {
 PRECHECK_VERIFY_TIMEOUT_SECONDS = 8
 FINAL_VERIFY_TIMEOUT_SECONDS = 8
 REMOTE_LOG_TAIL_BYTES = 128 * 1024
+CLAIM_ACTIVE_TIMEOUT_SECONDS = 30
 
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
@@ -724,12 +725,25 @@ def get_claim_status_display(status: str):
         "CLAIM_SEQUENCE_QUEUED": ("Growth queued", 75),
         "FINAL_VERIFY_PENDING": ("Final verification in progress", 90),
         "DELIVERED": ("Claim completed", 100),
-        "WRONG_DINO": ("Wrong dinosaur", None),
-        "WRONG_DINO_REFUNDED": ("Wrong dinosaur (refunded)", None),
+        "WRONG_DINO": ("Refunded", None),
+        "WRONG_DINO_REFUNDED": ("Refunded", None),
+        "CANCELLED_TIMEOUT": ("Failed", None),
         "FAILED": ("Failed", None),
         "EXPIRED": ("Expired", None),
     }
     return mapping.get(status, ("In progress", None))
+
+
+def clean_claim_note_for_user(note: str):
+    text = str(note or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"/[a-z0-9]+\s+\d{5,}\s+\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{17}\b", "", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" -|")
+    if not text:
+        return ""
+    return text
 
 
 def render_claim_progress_text(purchase):
@@ -1392,6 +1406,59 @@ def process_game_command_queue():
     process_claim_orchestration()
 
 
+def enforce_claim_watchdog_timeout():
+    active_states = {
+        "PRECHECK_QUEUED",
+        "PRECHECK_VERIFYING",
+        "PRECHECK_PASSED",
+        "CLAIM_SEQUENCE_QUEUED",
+        "FINAL_VERIFY_PENDING",
+    }
+    now = datetime.now()
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        game_commands = load_game_commands()
+        changed_purchases = False
+        changed_commands = False
+
+        for purchase in purchases:
+            if purchase.get("status") not in active_states:
+                continue
+
+            started_at = parse_dt(purchase.get("claim_started_at")) or parse_dt(purchase.get("claimed_at")) or parse_dt(purchase.get("time"))
+            if not started_at:
+                purchase["claim_started_at"] = str(now)
+                changed_purchases = True
+                continue
+
+            if (now - started_at).total_seconds() <= CLAIM_ACTIVE_TIMEOUT_SECONDS:
+                continue
+
+            claim_group_id = purchase.get("claim_group_id")
+            if claim_group_id and cancel_claim_group_commands(
+                game_commands,
+                claim_group_id,
+                f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds.",
+            ):
+                changed_commands = True
+
+            timeout_note = f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds. Points refunded."
+            refund_purchase_energy_if_needed(purchase, timeout_note)
+            set_purchase_status(
+                purchase,
+                "CANCELLED_TIMEOUT",
+                timeout_note,
+                "Claim timed out — points refunded.",
+            )
+            purchase["timeout_at"] = str(now)
+            changed_purchases = True
+
+        if changed_commands:
+            save_game_commands(game_commands)
+        if changed_purchases:
+            save_purchases(purchases)
+
+
 async def cache_guild_invites(guild: discord.Guild):
     try:
         invites = await guild.invites()
@@ -1438,6 +1505,7 @@ async def tracking_loop():
         tick_rewards()
         expire_old_purchases()
         await asyncio.to_thread(process_game_command_queue)
+        await asyncio.to_thread(enforce_claim_watchdog_timeout)
         await asyncio.to_thread(process_restart_announcements)
         print_live_status(players)
     except Exception as e:
@@ -1749,6 +1817,7 @@ async def claim(ctx):
                 )
                 if existing_pending:
                     purchase["status"] = "PRECHECK_QUEUED"
+                    purchase["claim_started_at"] = purchase.get("claim_started_at") or str(datetime.now())
                     purchase["claimed_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Existing pending command found"
                     if not purchase.get("claim_group_id"):
@@ -1760,6 +1829,7 @@ async def claim(ctx):
                         purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
                     queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
                     purchase["status"] = "PRECHECK_QUEUED"
+                    purchase["claim_started_at"] = str(datetime.now())
                     purchase["claimed_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Pre-check queued. Awaiting health/class verification."
                     purchase["failure_note"] = None
@@ -1803,7 +1873,7 @@ async def myclaims(ctx):
     for p in mine[-10:]:
         label, pct = get_claim_status_display(p.get("status"))
         pct_text = f"{pct}% complete" if pct is not None else "Not completed"
-        extra_note = p.get("failure_note") or p.get("delivery_note") or ""
+        extra_note = clean_claim_note_for_user(p.get("failure_note") or p.get("delivery_note") or "")
         lines.append(
             f"{p.get('item', '?').upper()} — {label} — {pct_text}"
             + (f" — {extra_note}" if extra_note else "")
