@@ -1,0 +1,91 @@
+{
+  "76561198091988153": {
+    "name": "Kaos Maximo",
+    "total_minutes": 147,
+    "current_session_minutes": 0,
+    "energy": 45,
+    "sessions": 4
+  },
+  "76561199812354519": {
+    "name": "duck",
+    "total_minutes": 148,
+    "current_session_minutes": 0,
+    "energy": 30,
+    "sessions": 3
+  },
+  "76561199368775257": {
+    "name": "Fish :)",
+    "total_minutes": 96,
+    "current_session_minutes": 14,
+    "energy": 1200,
+    "sessions": 3,
+    "steam_id": "76561199368775257"
+  },
+  "76561199446883966": {
+    "name": "splatter",
+    "total_minutes": 146,
+    "current_session_minutes": 0,
+    "energy": 30,
+    "sessions": 3
+  },
+  "76561199170469822": {
+    "name": "SleepyBear",
+    "total_minutes": 229,
+    "current_session_minutes": 14,
+    "energy": 1240,
+    "sessions": 5,
+    "steam_id": "76561199170469822"
+  },
+  "76561198752520824": {
+    "name": "shadbear",
+    "total_minutes": 144,
+    "current_session_minutes": 0,
+    "energy": 30,
+    "sessions": 4
+  },
+  "76561198798435427": {
+    "name": "JJoness290",
+    "total_minutes": 445,
+    "current_session_minutes": 14,
+    "energy": 1635,
+    "sessions": 15,
+    "steam_id": "76561198798435427"
+  },
+  "76561199825068385": {
+    "name": "sleepy mat",
+    "total_minutes": 124,
+    "current_session_minutes": 0,
+    "energy": 30,
+    "sessions": 2
+  },
+  "76561199436698935": {
+    "name": "KidBear",
+    "total_minutes": 232,
+    "current_session_minutes": 14,
+    "energy": 1230,
+    "sessions": 5,
+    "steam_id": "76561199436698935"
+  },
+  "76561198826479081": {
+    "name": "Aedot44",
+    "total_minutes": 78,
+    "current_session_minutes": 0,
+    "energy": 15,
+    "sessions": 1
+  },
+  "76561198018914237": {
+    "name": "HellHound",
+    "total_minutes": 17,
+    "current_session_minutes": 0,
+    "energy": 0,
+    "sessions": 2
+  },
+  "76561199230260982": {
+    "name": "Vegeta",
+    "total_minutes": 194,
+    "current_session_minutes": 14,
+    "energy": 1275,
+    "sessions": 8,
+    "steam_id": "76561199230260982"
+  }
+}

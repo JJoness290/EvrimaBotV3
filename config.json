@@ -1,0 +1,5 @@
+{
+  "scan_interval": 5,
+  "energy_per_interval": 15,
+  "interval_minutes": 1
+}

@@ -1,0 +1,28 @@
+{
+  "herbivores": {
+    "hypsi": 15,
+    "dryo": 15,
+    "pachy": 25,
+    "beipi": 25,
+    "galli": 25,
+    "tenonto": 35,
+    "maia": 40,
+    "dibble": 55,
+    "stego": 75,
+    "trike": 90
+  },
+  "carnivores": {
+    "ptera": 15,
+    "troodon": 15,
+    "herrera": 30,
+    "omni": 45,
+    "dilo": 50,
+    "carno": 65,
+    "cera": 65,
+    "deino": 85,
+    "rex": 100
+  },
+  "extras": {
+    "growth": 20
+  }
+}
