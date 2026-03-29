@@ -1185,6 +1185,19 @@ def has_pending_group_commands(commands_data, claim_group_id: str):
     )
 
 
+def find_existing_active_claim_group_id(commands_data, steam_id: str, item: str):
+    normalized_item = str(item or "").lower().strip()
+    for command_entry in commands_data:
+        if (
+            command_entry.get("steam_id") == steam_id
+            and str(command_entry.get("item", "")).lower().strip() == normalized_item
+            and command_entry.get("status") in {"PENDING", "EXECUTING"}
+            and command_entry.get("claim_group_id")
+        ):
+            return command_entry.get("claim_group_id")
+    return None
+
+
 def all_group_steps_done(commands_data, claim_group_id: str, expected_phase: str):
     group_cmds = [
         c for c in commands_data
@@ -1233,7 +1246,17 @@ def refund_purchase_energy_if_needed(purchase, reason_suffix: str):
     purchase["refund_applied"] = True
     purchase["refund_amount"] = int(price)
     purchase["refunded_at"] = str(datetime.now())
-    purchase["refund_note"] = f"Wrong dino detected. Energy refunded. {reason_suffix}".strip()
+    purchase["refund_note"] = f"{reason_suffix}".strip()
+    return True
+
+
+def fail_purchase_with_refund(purchase: dict, status: str, delivery_note: str, failure_note: str):
+    if purchase.get("status") == "DELIVERED":
+        return False
+    refund_purchase_energy_if_needed(purchase, delivery_note)
+    if status not in {"FAILED", "CANCELLED_TIMEOUT"}:
+        status = "FAILED"
+    set_purchase_status(purchase, status, delivery_note, failure_note)
     return True
 
 
@@ -1291,7 +1314,12 @@ def process_claim_orchestration():
 
             if status == "PRECHECK_QUEUED" and claim_group_id:
                 if any_group_step_failed(game_commands, claim_group_id):
-                    set_purchase_status(purchase, "FAILED", "Pre-check command execution failed", "Verification timed out — claim failed.")
+                    fail_purchase_with_refund(
+                        purchase,
+                        "FAILED",
+                        "Claim failed. Points refunded.",
+                        "Claim failed. Points refunded.",
+                    )
                     changed_purchases = True
                     continue
 
@@ -1311,11 +1339,11 @@ def process_claim_orchestration():
                 if not precheck_log:
                     print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
                     if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
-                        set_purchase_status(
+                        fail_purchase_with_refund(
                             purchase,
                             "FAILED",
-                            "Verification timed out. Please try again.",
-                            "Verification timed out — claim failed.",
+                            "Verification timed out. Points refunded.",
+                            "Verification timed out. Points refunded.",
                         )
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
                         changed_purchases = True
@@ -1355,7 +1383,12 @@ def process_claim_orchestration():
 
             if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
                 if any_group_step_failed(game_commands, claim_group_id):
-                    set_purchase_status(purchase, "FAILED", "Claim sequence command execution failed", "Verification timed out — claim failed.")
+                    fail_purchase_with_refund(
+                        purchase,
+                        "FAILED",
+                        "Claim failed. Points refunded.",
+                        "Claim failed. Points refunded.",
+                    )
                     changed_purchases = True
                     continue
 
@@ -1375,11 +1408,11 @@ def process_claim_orchestration():
                 if not grow_log:
                     print(f"[CLAIM VERIFY] No matching Grow line found in current remote tail for {steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
-                        set_purchase_status(
+                        fail_purchase_with_refund(
                             purchase,
                             "FAILED",
-                            "Verification timed out. Please try again.",
-                            "Verification timed out — claim failed.",
+                            "Verification timed out. Points refunded.",
+                            "Verification timed out. Points refunded.",
                         )
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                         changed_purchases = True
@@ -1387,7 +1420,12 @@ def process_claim_orchestration():
 
                 growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
                 if not growth_ok:
-                    set_purchase_status(purchase, "FAILED", growth_note, "Growth verification failed. Please try again.")
+                    fail_purchase_with_refund(
+                        purchase,
+                        "FAILED",
+                        "Claim failed. Points refunded.",
+                        "Claim failed. Points refunded.",
+                    )
                     changed_purchases = True
                     continue
 
@@ -1443,8 +1481,7 @@ def enforce_claim_watchdog_timeout():
                 changed_commands = True
 
             timeout_note = f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds. Points refunded."
-            refund_purchase_energy_if_needed(purchase, timeout_note)
-            set_purchase_status(
+            fail_purchase_with_refund(
                 purchase,
                 "CANCELLED_TIMEOUT",
                 timeout_note,
@@ -1809,21 +1846,19 @@ async def claim(ctx):
                 )
             else:
                 game_commands = load_game_commands()
-                existing_pending = any(
-                    cmd.get("steam_id") == steam_id
-                    and str(cmd.get("item", "")).lower().strip() == str(purchase.get("item", "")).lower().strip()
-                    and cmd.get("status") in {"PENDING", "EXECUTING"}
-                    for cmd in game_commands
+                existing_group_id = find_existing_active_claim_group_id(
+                    game_commands,
+                    steam_id,
+                    purchase.get("item", ""),
                 )
-                if existing_pending:
+                if existing_group_id:
                     purchase["status"] = "PRECHECK_QUEUED"
                     purchase["claim_started_at"] = purchase.get("claim_started_at") or str(datetime.now())
                     purchase["claimed_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Existing pending command found"
-                    if not purchase.get("claim_group_id"):
-                        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
+                    purchase["claim_group_id"] = existing_group_id
                     save_purchases(purchases)
-                    response = "Pre-check queued — 20% complete. Stay on the dinosaur you bought."
+                    response = "Your claim is already in progress — 20% complete."
                 else:
                     if not purchase.get("claim_group_id"):
                         purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
