@@ -12,6 +12,7 @@ import os
 import stat
 import threading
 import tempfile
+from zoneinfo import ZoneInfo
 
 import paramiko
 
@@ -120,7 +121,8 @@ MAIN_LOOP = None
 
 DEFAULT_RESTART_TIMES = ["00:00", "06:00", "12:00", "18:00"]
 RESTART_WARN_MINUTES = [3, 2, 1]
-restart_warning_sent = set()
+LONDON_TZ = ZoneInfo("Europe/London")
+restart_cycle_state = {}
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
@@ -201,13 +203,21 @@ def save_referrals(data):
 
 
 def load_state():
-    return load_json(STATE_FILE, {"online_since": {}, "last_minute_tick": {}})
+    return load_json(
+        STATE_FILE,
+        {
+            "online_since": {},
+            "last_minute_tick": {},
+            "restart_cycle_state": {},
+        },
+    )
 
 
 def save_state():
     state = {
         "online_since": online_since,
         "last_minute_tick": last_minute_tick,
+        "restart_cycle_state": restart_cycle_state,
     }
     save_json(STATE_FILE, state)
 
@@ -989,42 +999,154 @@ def get_restart_schedule_times():
     return times or [(0, 0), (6, 0), (12, 0), (18, 0)]
 
 
-def process_restart_announcements():
-    now = datetime.utcnow().replace(second=0, microsecond=0)
+def get_next_restart_datetime_london(now_london: datetime | None = None):
+    if now_london is None:
+        now_london = datetime.now(LONDON_TZ)
+
     schedule = get_restart_schedule_times()
-
-    valid_keys = set()
+    candidates = []
     for hour, minute in schedule:
-        restart_dt = now.replace(hour=hour, minute=minute)
-        if restart_dt < now - timedelta(minutes=3):
-            restart_dt = restart_dt + timedelta(days=1)
+        dt = now_london.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt <= now_london:
+            dt += timedelta(days=1)
+        candidates.append(dt)
 
-        for warn_min in RESTART_WARN_MINUTES:
-            warn_dt = restart_dt - timedelta(minutes=warn_min)
-            key = f"{restart_dt.isoformat()}_{warn_min}"
-            if now == warn_dt:
-                valid_keys.add(key)
-                if key in restart_warning_sent:
-                    continue
-                if warn_min == 1:
-                    msg = "Server restart in 1 minute. Please move to safety."
-                else:
-                    msg = f"Server restart in {warn_min} minutes."
-                sent = send_announcement_silent(msg)
-                if sent:
-                    restart_warning_sent.add(key)
+    return min(candidates)
 
-    # keep set from growing forever
-    stale_cutoff = now - timedelta(days=2)
-    restart_warning_sent_copy = set(restart_warning_sent)
-    for key in restart_warning_sent_copy:
+
+def _ensure_restart_cycle_state(now_london: datetime):
+    next_restart = get_next_restart_datetime_london(now_london)
+    next_iso = next_restart.isoformat()
+
+    if restart_cycle_state.get("next_restart_iso") != next_iso:
+        restart_cycle_state["next_restart_iso"] = next_iso
+        restart_cycle_state["is_active"] = True
+        restart_cycle_state["sent_3m"] = False
+        restart_cycle_state["sent_2m"] = False
+        restart_cycle_state["sent_1m"] = False
+        restart_cycle_state["sent_restart_now"] = False
+        restart_cycle_state["sent_back_up"] = False
+        restart_cycle_state["last_countdown_text"] = None
+        save_state()
+
+    return next_restart
+
+
+def process_restart_announcements():
+    now_london = datetime.now(LONDON_TZ).replace(second=0, microsecond=0)
+    next_restart = _ensure_restart_cycle_state(now_london)
+
+    mins_until = int((next_restart - now_london).total_seconds() // 60)
+
+    warn_flags = {
+        3: "sent_3m",
+        2: "sent_2m",
+        1: "sent_1m",
+    }
+
+    for warn_min in RESTART_WARN_MINUTES:
+        if mins_until == warn_min and not restart_cycle_state.get(warn_flags[warn_min]):
+            if warn_min == 1:
+                msg = "Server restart in 1 minute. Please move to safety."
+            else:
+                msg = f"Server restart in {warn_min} minutes."
+            sent = send_announcement_silent(msg)
+            if sent:
+                restart_cycle_state[warn_flags[warn_min]] = True
+                save_state()
+
+
+def format_restart_countdown(seconds_until: int):
+    if seconds_until <= 0:
+        return "🔄 Server restarting now."
+    if seconds_until >= 60:
+        mins = seconds_until // 60
+        secs = seconds_until % 60
+        if secs == 0:
+            if mins == 1:
+                return "⏳ Server restart in 1 minute."
+            return f"⏳ Server restart in {mins} minutes."
+        return f"⏳ Server restart in {mins}m {secs}s."
+    return f"⏳ Server restart in {seconds_until}s."
+
+
+async def get_restarts_channel():
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name="restarts")
+        if channel:
+            return channel
+    return None
+
+
+async def _send_or_edit_restart_message(text: str):
+    channel = await get_restarts_channel()
+    if not channel:
+        return
+
+    message_id = restart_cycle_state.get("progress_message_id")
+    if message_id:
         try:
-            restart_iso = key.rsplit("_", 1)[0]
-            restart_time = datetime.fromisoformat(restart_iso)
-            if restart_time < stale_cutoff:
-                restart_warning_sent.discard(key)
+            msg = await channel.fetch_message(int(message_id))
+            if msg.content != text:
+                await msg.edit(content=text)
+            restart_cycle_state["progress_channel_id"] = int(channel.id)
+            restart_cycle_state["last_countdown_text"] = text
+            save_state()
+            return
         except Exception:
-            restart_warning_sent.discard(key)
+            restart_cycle_state["progress_message_id"] = None
+
+    try:
+        sent = await channel.send(text)
+        restart_cycle_state["progress_message_id"] = int(sent.id)
+        restart_cycle_state["progress_channel_id"] = int(channel.id)
+        restart_cycle_state["last_countdown_text"] = text
+        save_state()
+    except Exception:
+        return
+
+
+def detect_server_back_up():
+    try:
+        raw = run_rcon("list")
+        lowered = str(raw or "").lower()
+        if "error" in lowered and "connection" in lowered:
+            return False
+        if "timeout" in lowered:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def process_restart_discord_updates():
+    now_london = datetime.now(LONDON_TZ)
+    next_restart = _ensure_restart_cycle_state(now_london)
+    seconds_until = int((next_restart - now_london).total_seconds())
+
+    if seconds_until > 180:
+        return
+
+    if seconds_until > 0:
+        text = format_restart_countdown(seconds_until)
+        last_text = restart_cycle_state.get("last_countdown_text")
+        if text != last_text:
+            await _send_or_edit_restart_message(text)
+        return
+
+    if not restart_cycle_state.get("sent_restart_now"):
+        await _send_or_edit_restart_message("🔄 Server restarting now.")
+        restart_cycle_state["sent_restart_now"] = True
+        save_state()
+        return
+
+    if not restart_cycle_state.get("sent_back_up"):
+        is_up = await asyncio.to_thread(detect_server_back_up)
+        if is_up:
+            await _send_or_edit_restart_message("✅ Server is back up.")
+            restart_cycle_state["sent_back_up"] = True
+            restart_cycle_state["is_active"] = False
+            save_state()
 
 
 def get_players_from_rcon():
@@ -1054,11 +1176,14 @@ def restore_state():
     state = load_state()
     saved_online_since = state.get("online_since", {})
     saved_last_tick = state.get("last_minute_tick", {})
+    saved_restart_cycle = state.get("restart_cycle_state", {})
 
     if isinstance(saved_online_since, dict):
         online_since.update({str(k): int(v) for k, v in saved_online_since.items()})
     if isinstance(saved_last_tick, dict):
         last_minute_tick.update({str(k): int(v) for k, v in saved_last_tick.items()})
+    if isinstance(saved_restart_cycle, dict):
+        restart_cycle_state.update(saved_restart_cycle)
 
 
 def update_players(players):
@@ -1544,6 +1669,7 @@ async def tracking_loop():
         await asyncio.to_thread(process_game_command_queue)
         await asyncio.to_thread(enforce_claim_watchdog_timeout)
         await asyncio.to_thread(process_restart_announcements)
+        await process_restart_discord_updates()
         print_live_status(players)
     except Exception as e:
         print(f"[ERROR] tracking loop failed: {e}")
