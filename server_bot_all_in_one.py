@@ -229,6 +229,10 @@ def get_reward_interval_seconds() -> int:
     return ConfigManager.get_int("reward_interval_seconds", "REWARD_INTERVAL_SECONDS", 60, minimum=10)
 
 
+def get_max_reward_catchup_minutes() -> int:
+    return ConfigManager.get_int("max_reward_catchup_minutes", "MAX_REWARD_CATCHUP_MINUTES", 60, minimum=1)
+
+
 def load_shop():
     return load_json(SHOP_FILE, {})
 
@@ -344,6 +348,15 @@ def _normalize_path_variants(configured_path: str):
                 "./" + stripped.lstrip("./"),
             ])
     variants.extend([
+        "server/TheIsle/Saved/Logs/TheIsle.log",
+        "./server/TheIsle/Saved/Logs/TheIsle.log",
+        "/server/TheIsle/Saved/Logs/TheIsle.log",
+        "server/Saved/Logs/TheIsle.log",
+        "./server/Saved/Logs/TheIsle.log",
+        "/server/Saved/Logs/TheIsle.log",
+        "server/TheIsle.log",
+        "./server/TheIsle.log",
+        "/server/TheIsle.log",
         "Saved/Logs/TheIsle.log",
         "./Saved/Logs/TheIsle.log",
         "/Saved/Logs/TheIsle.log",
@@ -402,10 +415,18 @@ def resolve_remote_log_path(sftp, configured_path: str):
 
     candidate_dirs = [
         ".",
+        "./server",
+        "./server/TheIsle",
+        "./server/Saved",
+        "./server/Saved/Logs",
         "./TheIsle",
         "./Saved",
         "./Saved/Logs",
         "/",
+        "/server",
+        "/server/TheIsle",
+        "/server/Saved",
+        "/server/Saved/Logs",
         "/TheIsle",
         "/TheIsle/Saved",
         "/TheIsle/Saved/Logs",
@@ -413,6 +434,7 @@ def resolve_remote_log_path(sftp, configured_path: str):
 
     discovered = []
     for d in candidate_dirs:
+        print(f"[SFTP LOG] Scanning candidate directory: {d}")
         try:
             entries = sftp.listdir_attr(d)
         except Exception:
@@ -1448,11 +1470,56 @@ def restore_state():
     saved_online_since = state.get("online_since", {})
     saved_last_tick = state.get("last_minute_tick", {})
     saved_restart_cycle = state.get("restart_cycle_state", {})
+    now_ts = int(time.time())
+    catchup_cap_minutes = get_max_reward_catchup_minutes()
+    catchup_cap_seconds = catchup_cap_minutes * 60
 
     if isinstance(saved_online_since, dict):
-        online_since.update({str(k): int(v) for k, v in saved_online_since.items()})
+        for k, v in saved_online_since.items():
+            steam_id = str(k)
+            try:
+                restored_online_since = int(v)
+            except Exception:
+                continue
+
+            missed_seconds = max(0, now_ts - restored_online_since)
+            capped_seconds = min(missed_seconds, catchup_cap_seconds)
+            if restored_online_since <= 0 or missed_seconds > catchup_cap_seconds:
+                restored_online_since = now_ts - capped_seconds
+
+            online_since[steam_id] = restored_online_since
+            print(
+                f"[RECOVERY] online_since steam={steam_id} restored={restored_online_since} "
+                f"missed_minutes={missed_seconds // 60} capped_minutes={capped_seconds // 60}"
+            )
+
     if isinstance(saved_last_tick, dict):
-        last_minute_tick.update({str(k): int(v) for k, v in saved_last_tick.items()})
+        for k, v in saved_last_tick.items():
+            steam_id = str(k)
+            try:
+                restored_last_tick = int(v)
+            except Exception:
+                continue
+
+            if steam_id not in online_since:
+                continue
+
+            missed_seconds = max(0, now_ts - restored_last_tick)
+            capped_seconds = min(missed_seconds, catchup_cap_seconds)
+            if restored_last_tick <= 0 or missed_seconds > catchup_cap_seconds:
+                restored_last_tick = now_ts - capped_seconds
+            if restored_last_tick < online_since[steam_id]:
+                restored_last_tick = online_since[steam_id]
+
+            default_rate = DEFAULT_ENERGY_RATE_PER_HOUR
+            reward_estimate = int((capped_seconds * (default_rate / 3600.0)))
+            last_minute_tick[steam_id] = restored_last_tick
+            print(
+                f"[RECOVERY] last_minute_tick steam={steam_id} restored={restored_last_tick} "
+                f"missed_minutes={missed_seconds // 60} capped_minutes={capped_seconds // 60} "
+                f"estimated_reward={reward_estimate}"
+            )
+
     if isinstance(saved_restart_cycle, dict):
         restart_cycle_state.update(saved_restart_cycle)
 
@@ -1501,13 +1568,26 @@ def tick_rewards():
         data = load_json(DATA_FILE, {})
         now = int(time.time())
         reward_interval_seconds = get_reward_interval_seconds()
+        catchup_cap_seconds = get_max_reward_catchup_minutes() * 60
 
         for steam_id in list(online_since.keys()):
             if steam_id not in data:
                 continue
 
             last_tick = last_minute_tick.get(steam_id, now)
+            if not isinstance(last_tick, int) or last_tick <= 0:
+                last_tick = now
             elapsed = now - last_tick
+            if elapsed < 0:
+                last_tick = now
+                elapsed = 0
+            if elapsed > catchup_cap_seconds:
+                print(
+                    f"[REWARD] Catch-up clamped steam={steam_id} elapsed_minutes={elapsed // 60} "
+                    f"cap_minutes={catchup_cap_seconds // 60}"
+                )
+                elapsed = catchup_cap_seconds
+                last_tick = now - elapsed
 
             if elapsed < reward_interval_seconds:
                 continue
@@ -1541,7 +1621,7 @@ def tick_rewards():
                     f"energy={player['energy']}"
                 )
 
-            last_minute_tick[steam_id] = last_tick + add_seconds
+            last_minute_tick[steam_id] = int(last_tick + add_seconds)
 
         save_json(DATA_FILE, data)
         save_state()

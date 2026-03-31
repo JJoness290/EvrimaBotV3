@@ -7,6 +7,7 @@
   "scan_interval": 5,
   "starting_energy": 100,
   "reward_interval_seconds": 60,
+  "max_reward_catchup_minutes": 60,
   "patreon_role_cache_ttl_seconds": 120,
   "health_poll_interval_seconds": 10,
   "crash_suspect_threshold": 2,
