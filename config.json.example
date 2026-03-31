@@ -59,8 +59,25 @@
     "enabled": true,
     "steps": [
       {"type": "focus_window", "window_title_contains": "The Isle"},
-      {"type": "wait_seconds", "seconds": 2},
-      {"type": "join_server_macro"}
+      {"type": "press_key", "key": "esc"},
+      {"type": "wait_seconds", "seconds": 1},
+      {"type": "hotkey", "keys": ["f1"]},
+      {"type": "wait_seconds", "seconds": 5},
+      {"type": "verify_in_game_presence"}
     ]
+  },
+  "ui_control": {
+    "use_admin_panel": true,
+    "player_name": "JJoness290",
+    "open_panel_key": "insert",
+    "stat_delay": 0.5,
+    "loop_interval": 90,
+    "player_row": {"x": 0, "y": 0},
+    "input_box": {"x": 0, "y": 0},
+    "buttons": {
+      "hunger": {"x": 0, "y": 0},
+      "thirst": {"x": 0, "y": 0},
+      "health": {"x": 0, "y": 0}
+    }
   }
 }

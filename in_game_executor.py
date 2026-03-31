@@ -143,6 +143,40 @@ def execute_recovery_step(command_entry: dict):
     except Exception:
         step = {"type": "type_text", "text": command_entry.get("command", "")}
     step_type = str(step.get("type", "")).strip().lower()
+    if step_type == "open_admin_panel":
+        key = str(step.get("key", "insert")).strip().lower() or "insert"
+        print("[BOT UI] opening admin panel")
+        pyautogui.press(key)
+        time.sleep(1.0)
+        return
+    if step_type == "close_admin_panel":
+        key = str(step.get("key", "insert")).strip().lower() or "insert"
+        pyautogui.press(key)
+        return
+    if step_type == "select_self_player":
+        print("[BOT UI] selecting player")
+        row = step.get("player_row", {}) if isinstance(step.get("player_row"), dict) else {}
+        if "x" in row and "y" in row:
+            pyautogui.click(int(row["x"]), int(row["y"]))
+            time.sleep(0.25)
+        return
+    if step_type == "set_stat":
+        stat_name = str(step.get("stat_name", "")).strip().lower()
+        value = str(step.get("value", 100))
+        print(f"[BOT UI] setting {stat_name}={value}")
+        buttons = step.get("buttons", {}) if isinstance(step.get("buttons"), dict) else {}
+        input_box = step.get("input_box", {}) if isinstance(step.get("input_box"), dict) else {}
+        b = buttons.get(stat_name, {})
+        if isinstance(b, dict) and "x" in b and "y" in b:
+            pyautogui.click(int(b["x"]), int(b["y"]))
+            time.sleep(0.2)
+        if "x" in input_box and "y" in input_box:
+            pyautogui.click(int(input_box["x"]), int(input_box["y"]))
+            time.sleep(0.2)
+        pyautogui.hotkey("ctrl", "a")
+        pyautogui.write(value)
+        pyautogui.press("enter")
+        return
     if step_type == "wait_seconds":
         time.sleep(max(0, int(step.get("seconds", 1))))
         return
@@ -257,8 +291,11 @@ def process_group(commands_data, claim_group_id: str) -> bool:
                 execute_recovery_step(command_entry)
             elif ctype in {"sustain", "sustain_command"}:
                 print("[EXECUTOR] processing sustain command")
-                type_command(command_text)
-                time.sleep(get_delay_for_command(command_text))
+                if str(command_text).strip().startswith("{"):
+                    execute_recovery_step(command_entry)
+                else:
+                    type_command(command_text)
+                    time.sleep(get_delay_for_command(command_text))
             else:
                 print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
                 type_command(command_text)

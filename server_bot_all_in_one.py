@@ -1300,12 +1300,13 @@ def get_server_recovery_config():
 
 def get_bot_sustain_config():
     section = ConfigManager.get_section("bot_sustain")
+    ui_section = ConfigManager.get_section("ui_control")
     commands = section.get("commands", ["/hunger 100", "/thirst 100", "/health 100"])
     if not isinstance(commands, list) or not commands:
         commands = ["/hunger 100", "/thirst 100", "/health 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
-        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 90)) or 90),
+        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", ui_section.get("loop_interval", 90))) or 90),
         "commands": [str(x).strip() for x in commands if str(x).strip()],
     }
 
@@ -1314,14 +1315,31 @@ def get_rejoin_sequence_config():
     section = ConfigManager.get_section("rejoin_sequence")
     steps = section.get("steps", [
         {"type": "focus_window", "window_title_contains": "The Isle"},
-        {"type": "wait_seconds", "seconds": 2},
-        {"type": "join_server_macro"},
+        {"type": "press_key", "key": "esc"},
+        {"type": "wait_seconds", "seconds": 1},
+        {"type": "hotkey", "keys": ["f1"]},
+        {"type": "wait_seconds", "seconds": 5},
+        {"type": "verify_in_game_presence"},
     ])
     if not isinstance(steps, list):
         steps = []
     return {
         "enabled": bool(section.get("enabled", True)),
         "steps": steps,
+    }
+
+
+def get_ui_control_config():
+    section = ConfigManager.get_section("ui_control")
+    return {
+        "use_admin_panel": bool(section.get("use_admin_panel", True)),
+        "player_name": str(section.get("player_name", get_bot_presence_config().get("player_name", "JJoness290"))),
+        "open_panel_key": str(section.get("open_panel_key", "insert")),
+        "stat_delay": float(section.get("stat_delay", 0.5) or 0.5),
+        "loop_interval": int(section.get("loop_interval", 90) or 90),
+        "buttons": section.get("buttons", {}),
+        "input_box": section.get("input_box", {}),
+        "player_row": section.get("player_row", {}),
     }
 
 
@@ -1378,26 +1396,57 @@ def build_rejoin_executor_commands():
 
 def queue_sustain_commands():
     cfg = get_bot_sustain_config()
+    ui = get_ui_control_config()
     now_iso = datetime.now(timezone.utc).isoformat()
     payload = []
-    for i, cmd in enumerate(cfg["commands"], start=1):
-        payload.append({
-            "steam_id": "__bot__",
-            "player_name": "SYSTEM",
-            "item": "sustain",
-            "command": cmd,
-            "status": "PENDING",
-            "created_at": now_iso,
-            "completed_at": None,
-            "claim_group_id": f"sustain_{int(time.time())}",
-            "claim_step": i,
-            "claim_final": i == len(cfg["commands"]),
-            "claim_phase": "SUSTAIN",
-            "command_type": "sustain",
-            "priority": 10,
-            "requires_bot_in_game": True,
-            "max_age_seconds": cfg["interval_seconds"] * 2,
-        })
+    if ui["use_admin_panel"]:
+        steps = [
+            {"type": "open_admin_panel", "key": ui["open_panel_key"]},
+            {"type": "select_self_player", "player_name": ui["player_name"], "player_row": ui.get("player_row", {})},
+            {"type": "set_stat", "stat_name": "hunger", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
+            {"type": "wait_seconds", "seconds": ui["stat_delay"]},
+            {"type": "set_stat", "stat_name": "thirst", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
+            {"type": "wait_seconds", "seconds": ui["stat_delay"]},
+            {"type": "set_stat", "stat_name": "health", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
+            {"type": "close_admin_panel", "key": ui["open_panel_key"]},
+        ]
+        for i, step in enumerate(steps, start=1):
+            payload.append({
+                "steam_id": "__bot__",
+                "player_name": "SYSTEM",
+                "item": "sustain",
+                "command": json.dumps(step),
+                "status": "PENDING",
+                "created_at": now_iso,
+                "completed_at": None,
+                "claim_group_id": f"sustain_{int(time.time())}",
+                "claim_step": i,
+                "claim_final": i == len(steps),
+                "claim_phase": "SUSTAIN",
+                "command_type": "sustain",
+                "priority": 10,
+                "requires_bot_in_game": True,
+                "max_age_seconds": cfg["interval_seconds"] * 2,
+            })
+    else:
+        for i, cmd in enumerate(cfg["commands"], start=1):
+            payload.append({
+                "steam_id": "__bot__",
+                "player_name": "SYSTEM",
+                "item": "sustain",
+                "command": cmd,
+                "status": "PENDING",
+                "created_at": now_iso,
+                "completed_at": None,
+                "claim_group_id": f"sustain_{int(time.time())}",
+                "claim_step": i,
+                "claim_final": i == len(cfg["commands"]),
+                "claim_phase": "SUSTAIN",
+                "command_type": "sustain",
+                "priority": 10,
+                "requires_bot_in_game": True,
+                "max_age_seconds": cfg["interval_seconds"] * 2,
+            })
     queue_priority_commands(payload)
 
 async def get_restarts_channel():
@@ -1683,8 +1732,17 @@ async def process_bot_presence_and_recovery(players: dict):
         if now - float(bot_runtime_state.get("last_sustain_at", 0.0)) >= cfg_sustain["interval_seconds"]:
             queue_sustain_commands()
             bot_runtime_state["last_sustain_at"] = now
-            for cmd in cfg_sustain["commands"]:
-                print(f"[BOT SUSTAIN] sending {cmd}")
+            ui = get_ui_control_config()
+            if ui["use_admin_panel"]:
+                print("[BOT UI] opening admin panel")
+                print("[BOT UI] selecting player")
+                print("[BOT UI] setting hunger=100")
+                print("[BOT UI] setting thirst=100")
+                print("[BOT UI] setting health=100")
+                print("[BOT UI] sustain loop complete")
+            else:
+                for cmd in cfg_sustain["commands"]:
+                    print(f"[BOT SUSTAIN] sending {cmd}")
     elif cfg_sustain["enabled"]:
         if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 60:
             print("[BOT SUSTAIN] skipped because bot not confirmed in-game")
