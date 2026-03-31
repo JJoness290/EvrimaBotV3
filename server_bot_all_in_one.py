@@ -27,6 +27,7 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
+EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -131,6 +132,14 @@ server_health_state = {
     "last_status_at": None,
     "last_health_poll": 0.0,
 }
+patreon_role_cache = {}
+last_role_cache_refresh = 0.0
+DEFAULT_ENERGY_RATE_PER_HOUR = 15.0
+PATREON_TIER_RATES = {
+    "supporter": 18.0,
+    "vip": 22.5,
+    "apex supporter": 30.0,
+}
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
@@ -210,6 +219,14 @@ def get_reward_amount() -> int:
     config = load_config()
     value = int(config.get("energy_per_interval", DEFAULT_REWARD_AMOUNT))
     return max(1, value)
+
+
+def get_starting_energy() -> int:
+    return ConfigManager.get_int("starting_energy", "STARTING_ENERGY", 100, minimum=0)
+
+
+def get_reward_interval_seconds() -> int:
+    return ConfigManager.get_int("reward_interval_seconds", "REWARD_INTERVAL_SECONDS", 60, minimum=10)
 
 
 def load_shop():
@@ -488,6 +505,47 @@ def get_player_by_discord_id(discord_id: str):
         return None, None, data
 
     return data.get(steam_id), steam_id, data
+
+
+async def refresh_patreon_role_cache(force: bool = False):
+    global last_role_cache_refresh
+    now = time.time()
+    ttl = ConfigManager.get_int("patreon_role_cache_ttl_seconds", "PATREON_ROLE_CACHE_TTL_SECONDS", 120, minimum=30)
+    if not force and (now - last_role_cache_refresh) < ttl:
+        return
+
+    links = load_json(LINK_FILE, {})
+    updated = {}
+    for discord_id, steam_id in links.items():
+        member = None
+        for guild in bot.guilds:
+            try:
+                member = guild.get_member(int(discord_id)) or await guild.fetch_member(int(discord_id))
+            except Exception:
+                member = None
+            if member:
+                break
+        rate = DEFAULT_ENERGY_RATE_PER_HOUR
+        tier_name = "Default"
+        if member:
+            names = {str(role.name).strip().lower() for role in getattr(member, "roles", [])}
+            for tier_key, tier_rate in PATREON_TIER_RATES.items():
+                if tier_key in names:
+                    rate = float(tier_rate)
+                    tier_name = tier_key.title()
+        updated[str(steam_id)] = {"rate_per_hour": rate, "tier": tier_name, "discord_id": str(discord_id)}
+
+    patreon_role_cache.clear()
+    patreon_role_cache.update(updated)
+    last_role_cache_refresh = now
+
+
+def get_player_energy_rate_per_hour(steam_id: str):
+    info = patreon_role_cache.get(str(steam_id), {})
+    try:
+        return float(info.get("rate_per_hour", DEFAULT_ENERGY_RATE_PER_HOUR))
+    except Exception:
+        return DEFAULT_ENERGY_RATE_PER_HOUR
 
 
 def adjust_energy_in_data(data: dict, steam_id: str, delta: int):
@@ -1153,6 +1211,17 @@ def build_restart_embed(title: str, description: str, color: discord.Color | Non
     return embed
 
 
+def build_action_embed(title: str, description: str, player_name: str = "", energy: int | None = None, color: discord.Color | None = None):
+    embed = discord.Embed(title=title, description=description, color=color or discord.Color.blurple())
+    if player_name:
+        embed.add_field(name="Player", value=player_name, inline=True)
+    if energy is not None:
+        percent = max(0, min(100, int((energy / 200.0) * 100)))
+        embed.add_field(name="Energy", value=render_progress_bar(percent), inline=True)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
 async def get_restarts_channel():
     configured_id = ConfigManager.get_int("restart_channel_id", "RESTART_CHANNEL_ID", 0, minimum=0)
     if configured_id:
@@ -1321,6 +1390,36 @@ async def process_server_health_updates():
                 discord.Color.green(),
             )
 
+
+async def process_executor_health_updates():
+    if not EXECUTOR_HEARTBEAT_FILE.exists():
+        return
+    heartbeat = load_json(EXECUTOR_HEARTBEAT_FILE, {})
+    ts = parse_dt(str(heartbeat.get("timestamp", "")))
+    if not ts:
+        return
+    timeout = ConfigManager.get_int("executor_heartbeat_timeout_seconds", "EXECUTOR_HEARTBEAT_TIMEOUT_SECONDS", 60, minimum=15)
+    age = (datetime.now(timezone.utc) - ts).total_seconds() if ts.tzinfo else (datetime.now() - ts).total_seconds()
+    if age > timeout:
+        if restart_cycle_state.get("executor_stale_reported"):
+            return
+        restart_cycle_state["executor_stale_reported"] = True
+        save_state()
+        await send_restart_incident(
+            "Server Issue Detected",
+            "Executor heartbeat is stale. Attempting recovery...",
+            discord.Color.red(),
+        )
+    else:
+        if restart_cycle_state.get("executor_stale_reported"):
+            restart_cycle_state["executor_stale_reported"] = False
+            save_state()
+            await send_restart_incident(
+                "Recovery Complete",
+                "Executor heartbeat recovered and command processing resumed.",
+                discord.Color.green(),
+            )
+
 def get_players_from_rcon():
     raw = run_rcon("list")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -1370,7 +1469,8 @@ def update_players(players):
                 "steam_id": steam_id,
                 "total_minutes": 0,
                 "current_session_minutes": 0,
-                "energy": 0,
+                "energy": get_starting_energy(),
+                "energy_fraction": 0.0,
                 "sessions": 0,
             }
 
@@ -1400,9 +1500,7 @@ def tick_rewards():
     with ECONOMY_LOCK:
         data = load_json(DATA_FILE, {})
         now = int(time.time())
-
-        reward_interval_minutes = get_reward_interval_minutes()
-        reward_amount = get_reward_amount()
+        reward_interval_seconds = get_reward_interval_seconds()
 
         for steam_id in list(online_since.keys()):
             if steam_id not in data:
@@ -1411,36 +1509,39 @@ def tick_rewards():
             last_tick = last_minute_tick.get(steam_id, now)
             elapsed = now - last_tick
 
-            if elapsed < 60:
+            if elapsed < reward_interval_seconds:
                 continue
 
-            whole_minutes = elapsed // 60
-            if whole_minutes <= 0:
+            intervals = elapsed // reward_interval_seconds
+            if intervals <= 0:
                 continue
 
             player = data[steam_id]
+            add_seconds = intervals * reward_interval_seconds
+            gained_minutes = add_seconds / 60.0
+            old_total = float(player.get("total_minutes", 0))
+            new_total = old_total + gained_minutes
 
-            old_total = int(player.get("total_minutes", 0))
-            new_total = old_total + whole_minutes
+            rate_per_hour = get_player_energy_rate_per_hour(steam_id)
+            energy_per_second = rate_per_hour / 3600.0
+            energy_to_add = add_seconds * energy_per_second + float(player.get("energy_fraction", 0.0))
+            gained_energy_int = int(energy_to_add)
+            player["energy_fraction"] = max(0.0, energy_to_add - gained_energy_int)
 
-            old_rewards = old_total // reward_interval_minutes
-            new_rewards = new_total // reward_interval_minutes
-            gained_energy = (new_rewards - old_rewards) * reward_amount
-
-            player["total_minutes"] = new_total
+            player["total_minutes"] = int(new_total)
             player["current_session_minutes"] = int((now - online_since[steam_id]) // 60)
 
-            if gained_energy > 0:
-                adjust_energy_in_data(data, steam_id, int(gained_energy))
+            if gained_energy_int > 0:
+                adjust_energy_in_data(data, steam_id, int(gained_energy_int))
                 player = data[steam_id]
                 print(
                     f"[REWARD] {player.get('name', steam_id)} | "
-                    f"{steam_id} | +{gained_energy} energy | "
+                    f"{steam_id} | +{gained_energy_int} energy | "
                     f"total={player['total_minutes']} mins | "
                     f"energy={player['energy']}"
                 )
 
-            last_minute_tick[steam_id] = last_tick + (whole_minutes * 60)
+            last_minute_tick[steam_id] = last_tick + add_seconds
 
         save_json(DATA_FILE, data)
         save_state()
@@ -1604,7 +1705,7 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
             "claim_step": idx,
             "claim_final": idx == len(sequence),
             "claim_phase": phase,
-            "command_type": "claim_command",
+            "command_type": "recovery_command" if phase == "RECOVERY" else "claim_command",
         })
 
     save_game_commands(game_commands)
@@ -1860,6 +1961,7 @@ def reward_referral_if_eligible(inviter_id: str, guild: discord.Guild):
 @tasks.loop(seconds=1)
 async def tracking_loop():
     try:
+        await refresh_patreon_role_cache()
         players = await asyncio.to_thread(get_players_from_rcon)
         update_players(players)
         tick_rewards()
@@ -1869,6 +1971,7 @@ async def tracking_loop():
         await asyncio.to_thread(process_restart_announcements)
         await process_restart_discord_updates()
         await process_server_health_updates()
+        await process_executor_health_updates()
         print_live_status(players)
     except Exception as e:
         print(f"[ERROR] tracking loop failed: {e}")
@@ -1994,7 +2097,19 @@ async def link(ctx, steam_id: str):
     links = load_json(LINK_FILE, {})
     links[str(ctx.author.id)] = steam_id
     save_json(LINK_FILE, links)
-    await ctx.send("✅ Your account has been linked.")
+    data = load_json(DATA_FILE, {})
+    if steam_id not in data:
+        data[steam_id] = {
+            "name": ctx.author.display_name,
+            "steam_id": steam_id,
+            "total_minutes": 0,
+            "current_session_minutes": 0,
+            "energy": get_starting_energy(),
+            "energy_fraction": 0.0,
+            "sessions": 0,
+        }
+        save_json(DATA_FILE, data)
+    await ctx.send(embed=build_action_embed("Account Linked", "Your Steam account has been linked.", ctx.author.display_name, int(data.get(steam_id, {}).get("energy", get_starting_energy())), discord.Color.green()))
 
 
 @bot.command()
@@ -2284,6 +2399,48 @@ async def leaderboard(ctx):
         lines.append(f"{idx}. **{display_name}** — {count} invites")
 
     await ctx.send("\n".join(lines))
+
+
+@bot.command()
+async def patreon(ctx):
+    embed = discord.Embed(
+        title="Patreon Benefits",
+        description="Support the server and unlock higher passive energy rates.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Supporter", value="18 energy/hour", inline=False)
+    embed.add_field(name="VIP", value="22.5 energy/hour", inline=False)
+    embed.add_field(name="Apex Supporter", value="30 energy/hour", inline=False)
+    embed.add_field(name="Default", value="15 energy/hour", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def tiers(ctx):
+    await patreon(ctx)
+
+
+@bot.command()
+async def checktier(ctx):
+    await refresh_patreon_role_cache(force=True)
+    links = load_json(LINK_FILE, {})
+    steam_id = links.get(str(ctx.author.id))
+    if not steam_id:
+        await ctx.send(embed=build_action_embed("Tier Check", "Use `!link <steamid>` first.", ctx.author.display_name, None, discord.Color.red()))
+        return
+    info = patreon_role_cache.get(str(steam_id), {})
+    tier = info.get("tier", "Default")
+    rate = float(info.get("rate_per_hour", DEFAULT_ENERGY_RATE_PER_HOUR))
+    data = load_json(DATA_FILE, {})
+    energy = int(data.get(str(steam_id), {}).get("energy", 0))
+    embed = build_action_embed(
+        "Current Tier",
+        f"Tier: **{tier}**\nRate: **{rate}/hour**",
+        ctx.author.display_name,
+        energy,
+        discord.Color.green(),
+    )
+    await ctx.send(embed=embed)
 
 
 if __name__ == "__main__":
