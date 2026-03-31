@@ -10,6 +10,7 @@ import pyautogui
 GAME_COMMANDS_FILE = Path("game_commands.json")
 CONFIG_FILE = Path("config.json")
 EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
+PLAYER_STATE_FILE = Path("player_state.json")
 
 DEFAULT_POST_SEND_DELAYS = {
     "/elder": 5,
@@ -80,6 +81,7 @@ def write_heartbeat(state: str, extra: dict | None = None):
     if extra:
         payload.update(extra)
     save_json(EXECUTOR_HEARTBEAT_FILE, payload)
+    print("[EXECUTOR] heartbeat updated")
 
 
 def type_command(cmd: str):
@@ -88,6 +90,11 @@ def type_command(cmd: str):
     pyautogui.write(cmd)
     time.sleep(0.25)
     pyautogui.press("enter")
+
+
+def is_bot_in_game():
+    state = load_json(PLAYER_STATE_FILE, {})
+    return str(state.get("bot_presence_state", "")).strip().upper() == "BOT_IN_GAME"
 
 
 def get_delay_overrides():
@@ -111,6 +118,54 @@ def get_delay_for_command(command_text: str) -> int:
         if normalized.startswith(prefix):
             return int(delay)
     return 3
+
+
+def is_command_expired(command_entry: dict):
+    max_age_seconds = command_entry.get("max_age_seconds")
+    if max_age_seconds in (None, "", 0):
+        return False
+    try:
+        max_age_seconds = int(max_age_seconds)
+    except Exception:
+        return False
+    created_at = command_entry.get("created_at")
+    try:
+        created_dt = datetime.fromisoformat(str(created_at))
+    except Exception:
+        return False
+    age = (datetime.now(timezone.utc) - created_dt).total_seconds() if created_dt.tzinfo else (datetime.now() - created_dt).total_seconds()
+    return age > max_age_seconds
+
+
+def execute_recovery_step(command_entry: dict):
+    try:
+        step = json.loads(str(command_entry.get("command", "{}")))
+    except Exception:
+        step = {"type": "type_text", "text": command_entry.get("command", "")}
+    step_type = str(step.get("type", "")).strip().lower()
+    if step_type == "wait_seconds":
+        time.sleep(max(0, int(step.get("seconds", 1))))
+        return
+    if step_type == "press_key":
+        pyautogui.press(str(step.get("key", "enter")))
+        return
+    if step_type == "hotkey":
+        keys = step.get("keys", [])
+        if isinstance(keys, list) and keys:
+            pyautogui.hotkey(*[str(k) for k in keys])
+        return
+    if step_type == "click_position":
+        pyautogui.click(int(step.get("x", 0)), int(step.get("y", 0)))
+        return
+    if step_type == "type_text":
+        text = str(step.get("text", ""))
+        if text:
+            pyautogui.write(text)
+        return
+    if step_type in {"focus_window", "join_server_macro", "verify_in_game_presence", "click_image"}:
+        # best-effort placeholder; user-configurable macro images/coordinates can be layered later
+        time.sleep(max(0, int(step.get("seconds", 1) or 1)))
+        return
 
 
 def run_recovery_hook_if_enabled(commands_data, command_entry):
@@ -141,8 +196,14 @@ def get_pending_group_ids(commands_data):
         c for c in commands_data
         if c.get("status") == "PENDING" and c.get("claim_group_id")
     ]
+    group_priority = {}
+    for c in grouped:
+        gid = str(c.get("claim_group_id"))
+        p = int(c.get("priority", 0) or 0)
+        group_priority[gid] = max(group_priority.get(gid, 0), p)
     grouped.sort(
         key=lambda c: (
+            -int(group_priority.get(str(c.get("claim_group_id")), 0)),
             c.get("created_at") or "",
             str(c.get("claim_group_id")),
             int(c.get("claim_step", 9999)),
@@ -168,6 +229,20 @@ def process_group(commands_data, claim_group_id: str) -> bool:
     group_cmds.sort(key=lambda c: (int(c.get("claim_step", 9999)), str(c.get("id", ""))))
 
     for command_entry in group_cmds:
+        if is_command_expired(command_entry):
+            command_entry["status"] = "EXPIRED"
+            command_entry["completed_at"] = now_iso()
+            command_entry["error"] = "Command skipped due to max_age_seconds"
+            changed = True
+            continue
+        if bool(command_entry.get("requires_bot_in_game", False)) and not is_bot_in_game():
+            command_entry["status"] = "SKIPPED"
+            command_entry["completed_at"] = now_iso()
+            command_entry["error"] = "Skipped because bot is not confirmed in-game"
+            changed = True
+            print("[EXECUTOR] processing sustain command skipped (bot not in game)")
+            continue
+
         command_text = command_entry.get("command", "")
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
@@ -176,9 +251,18 @@ def process_group(commands_data, claim_group_id: str) -> bool:
 
         try:
             run_recovery_hook_if_enabled(commands_data, command_entry)
-            print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
-            type_command(command_text)
-            time.sleep(get_delay_for_command(command_text))
+            ctype = str(command_entry.get("command_type", "")).lower()
+            if ctype in {"recovery", "recovery_command"}:
+                print("[EXECUTOR] processing recovery command")
+                execute_recovery_step(command_entry)
+            elif ctype in {"sustain", "sustain_command"}:
+                print("[EXECUTOR] processing sustain command")
+                type_command(command_text)
+                time.sleep(get_delay_for_command(command_text))
+            else:
+                print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
+                type_command(command_text)
+                time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
@@ -236,7 +320,7 @@ def main():
     commands_data = load_commands()
     if recover_stale_executing_commands(commands_data):
         save_commands(commands_data)
-        print("[EXECUTOR] recovered stale EXECUTING commands")
+        print("[EXECUTOR] stale command recovered on startup")
 
     loop_delay = max(1, int(load_config().get("executor_loop_delay_seconds", 2)))
 

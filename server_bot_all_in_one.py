@@ -140,6 +140,29 @@ PATREON_TIER_RATES = {
     "vip": 22.5,
     "apex supporter": 30.0,
 }
+BOT_STATE_IN_GAME = "BOT_IN_GAME"
+BOT_STATE_MISSING = "BOT_MISSING"
+BOT_STATE_REJOINING = "BOT_REJOINING"
+BOT_STATE_WAITING_SERVER = "BOT_WAITING_FOR_SERVER"
+BOT_STATE_RECOVERING = "BOT_RECOVERING"
+BOT_STATE_FAILED = "BOT_FAILED_REJOIN"
+
+SERVER_STATE_ONLINE = "SERVER_ONLINE"
+SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
+SERVER_STATE_SUSPECTED_DOWN = "SERVER_SUSPECTED_DOWN"
+SERVER_STATE_DOWN = "SERVER_DOWN"
+SERVER_STATE_RECOVERING = "SERVER_RECOVERING"
+
+bot_runtime_state = {
+    "presence_state": BOT_STATE_MISSING,
+    "server_state": SERVER_STATE_ONLINE,
+    "missing_since": None,
+    "rejoin_attempt": 0,
+    "rejoin_in_progress": False,
+    "next_rejoin_after": 0.0,
+    "last_sustain_at": 0.0,
+    "last_presence_log_at": 0.0,
+}
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
@@ -175,6 +198,12 @@ class ConfigManager:
             return raw
         text = str(raw).strip().lower()
         return text in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def get_section(section_key: str):
+        config = load_config()
+        section = config.get(section_key, {})
+        return section if isinstance(section, dict) else {}
 
 
 def load_json(path: Path, default):
@@ -268,6 +297,7 @@ def load_state():
             "online_since": {},
             "last_minute_tick": {},
             "restart_cycle_state": {},
+            "bot_presence_state": BOT_STATE_MISSING,
         },
     )
 
@@ -277,6 +307,7 @@ def save_state():
         "online_since": online_since,
         "last_minute_tick": last_minute_tick,
         "restart_cycle_state": restart_cycle_state,
+        "bot_presence_state": bot_runtime_state.get("presence_state", BOT_STATE_MISSING),
     }
     save_json(STATE_FILE, state)
 
@@ -1244,6 +1275,131 @@ def build_action_embed(title: str, description: str, player_name: str = "", ener
     return embed
 
 
+def get_bot_presence_config():
+    section = ConfigManager.get_section("bot_presence")
+    return {
+        "player_name": os.getenv("BOT_PLAYER_NAME", str(section.get("player_name", "")).strip()),
+        "steam_id": os.getenv("BOT_STEAM_ID", str(section.get("steam_id", "")).strip()),
+        "missing_grace_seconds": int(section.get("missing_grace_seconds", 60) or 60),
+        "confirm_rejoin_timeout_seconds": int(section.get("confirm_rejoin_timeout_seconds", 120) or 120),
+    }
+
+
+def get_server_recovery_config():
+    section = ConfigManager.get_section("server_recovery")
+    retries = section.get("retry_backoff_seconds", [10, 20, 30, 60, 60, 120])
+    if not isinstance(retries, list) or not retries:
+        retries = [10, 20, 30, 60, 60, 120]
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "max_rejoin_attempts": int(os.getenv("BOT_REJOIN_MAX_ATTEMPTS", section.get("max_rejoin_attempts", 10)) or 10),
+        "retry_backoff_seconds": [max(5, int(x)) for x in retries],
+        "server_back_online_confirm_checks": int(section.get("server_back_online_confirm_checks", 2) or 2),
+    }
+
+
+def get_bot_sustain_config():
+    section = ConfigManager.get_section("bot_sustain")
+    commands = section.get("commands", ["/hunger 100", "/thirst 100", "/health 100"])
+    if not isinstance(commands, list) or not commands:
+        commands = ["/hunger 100", "/thirst 100", "/health 100"]
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 90)) or 90),
+        "commands": [str(x).strip() for x in commands if str(x).strip()],
+    }
+
+
+def get_rejoin_sequence_config():
+    section = ConfigManager.get_section("rejoin_sequence")
+    steps = section.get("steps", [
+        {"type": "focus_window", "window_title_contains": "The Isle"},
+        {"type": "wait_seconds", "seconds": 2},
+        {"type": "join_server_macro"},
+    ])
+    if not isinstance(steps, list):
+        steps = []
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "steps": steps,
+    }
+
+
+def is_bot_present_in_players(players: dict):
+    cfg = get_bot_presence_config()
+    target_name = str(cfg.get("player_name", "")).strip().lower()
+    target_steam = str(cfg.get("steam_id", "")).strip()
+    if target_steam and target_steam in players:
+        return True
+    if target_name:
+        for name in players.values():
+            if str(name).strip().lower() == target_name:
+                return True
+    return False
+
+
+def queue_priority_commands(commands: list[dict]):
+    if not commands:
+        return
+    with ECONOMY_LOCK:
+        existing = load_game_commands()
+        next_id = get_next_command_id(existing)
+        for idx, cmd in enumerate(commands, start=1):
+            cmd.setdefault("id", f"cmd_{next_id + idx - 1:03d}")
+            existing.append(cmd)
+        save_game_commands(existing)
+
+
+def build_rejoin_executor_commands():
+    seq = get_rejoin_sequence_config()
+    steps = seq.get("steps", [])
+    payload = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for i, step in enumerate(steps, start=1):
+        payload.append({
+            "steam_id": "__bot__",
+            "player_name": "SYSTEM",
+            "item": "rejoin",
+            "command": json.dumps(step),
+            "status": "PENDING",
+            "created_at": now_iso,
+            "completed_at": None,
+            "claim_group_id": f"rejoin_{int(time.time())}",
+            "claim_step": i,
+            "claim_final": i == len(steps),
+            "claim_phase": "RECOVERY",
+            "command_type": "recovery",
+            "priority": 100,
+            "requires_bot_in_game": False,
+            "max_age_seconds": 300,
+        })
+    return payload
+
+
+def queue_sustain_commands():
+    cfg = get_bot_sustain_config()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for i, cmd in enumerate(cfg["commands"], start=1):
+        payload.append({
+            "steam_id": "__bot__",
+            "player_name": "SYSTEM",
+            "item": "sustain",
+            "command": cmd,
+            "status": "PENDING",
+            "created_at": now_iso,
+            "completed_at": None,
+            "claim_group_id": f"sustain_{int(time.time())}",
+            "claim_step": i,
+            "claim_final": i == len(cfg["commands"]),
+            "claim_phase": "SUSTAIN",
+            "command_type": "sustain",
+            "priority": 10,
+            "requires_bot_in_game": True,
+            "max_age_seconds": cfg["interval_seconds"] * 2,
+        })
+    queue_priority_commands(payload)
+
 async def get_restarts_channel():
     configured_id = ConfigManager.get_int("restart_channel_id", "RESTART_CHANNEL_ID", 0, minimum=0)
     if configured_id:
@@ -1442,6 +1598,98 @@ async def process_executor_health_updates():
                 discord.Color.green(),
             )
 
+
+def map_server_state():
+    health = server_health_state.get("status", "ONLINE")
+    if health == "ONLINE":
+        return SERVER_STATE_ONLINE
+    if health == "SUSPECTED_DOWN":
+        return SERVER_STATE_SUSPECTED_DOWN
+    return SERVER_STATE_DOWN
+
+
+async def process_bot_presence_and_recovery(players: dict):
+    cfg_presence = get_bot_presence_config()
+    cfg_recovery = get_server_recovery_config()
+    cfg_sustain = get_bot_sustain_config()
+    now = time.time()
+
+    bot_runtime_state["server_state"] = map_server_state()
+    server_is_online = bot_runtime_state["server_state"] == SERVER_STATE_ONLINE
+    if not server_is_online:
+        bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
+        if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 30:
+            print("[BOT PRESENCE] grace period active")
+            bot_runtime_state["last_presence_log_at"] = now
+        return
+
+    present = is_bot_present_in_players(players)
+    if present:
+        if bot_runtime_state.get("presence_state") != BOT_STATE_IN_GAME:
+            bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+            bot_runtime_state["missing_since"] = None
+            bot_runtime_state["rejoin_attempt"] = 0
+            bot_runtime_state["rejoin_in_progress"] = False
+            await send_restart_incident(
+                "Bot Rejoined",
+                "The in-game bot account has rejoined successfully and sustain mode is active.",
+                discord.Color.green(),
+            )
+            print("[BOT PRESENCE] bot account rejoined successfully")
+        else:
+            if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 120:
+                print("[BOT PRESENCE] bot account detected in player list")
+                bot_runtime_state["last_presence_log_at"] = now
+    else:
+        if not bot_runtime_state.get("missing_since"):
+            bot_runtime_state["missing_since"] = now
+            print("[BOT PRESENCE] bot account missing from player list")
+            await send_restart_incident(
+                "Bot Disconnected",
+                "The in-game bot account is no longer detected. Recovery checks have started.",
+                discord.Color.orange(),
+            )
+        missing_for = now - float(bot_runtime_state.get("missing_since", now))
+        if missing_for < cfg_presence["missing_grace_seconds"]:
+            print("[BOT PRESENCE] grace period active")
+            return
+
+        bot_runtime_state["presence_state"] = BOT_STATE_MISSING
+        if cfg_recovery["enabled"] and not bot_runtime_state.get("rejoin_in_progress") and now >= float(bot_runtime_state.get("next_rejoin_after", 0.0)):
+            attempts = int(bot_runtime_state.get("rejoin_attempt", 0))
+            if attempts >= cfg_recovery["max_rejoin_attempts"]:
+                bot_runtime_state["presence_state"] = BOT_STATE_FAILED
+                await send_restart_incident(
+                    "Rejoin Failed",
+                    "Automatic rejoin failed after all configured attempts. Manual intervention may be required.",
+                    discord.Color.red(),
+                )
+                print("[REJOIN] failed after max retries")
+                return
+            bot_runtime_state["rejoin_in_progress"] = True
+            bot_runtime_state["presence_state"] = BOT_STATE_REJOINING
+            bot_runtime_state["rejoin_attempt"] = attempts + 1
+            attempt_no = bot_runtime_state["rejoin_attempt"]
+            print(f"[REJOIN] attempt {attempt_no} started")
+            await send_restart_incident("Rejoin Attempt", "Attempting to rejoin the server now.", discord.Color.blurple())
+            queue_priority_commands(build_rejoin_executor_commands())
+            retries = cfg_recovery["retry_backoff_seconds"]
+            backoff = retries[min(attempt_no - 1, len(retries) - 1)]
+            bot_runtime_state["next_rejoin_after"] = now + backoff
+            bot_runtime_state["rejoin_in_progress"] = False
+            print("[REJOIN] waiting for playerlist confirmation")
+
+    if bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME and cfg_sustain["enabled"]:
+        if now - float(bot_runtime_state.get("last_sustain_at", 0.0)) >= cfg_sustain["interval_seconds"]:
+            queue_sustain_commands()
+            bot_runtime_state["last_sustain_at"] = now
+            for cmd in cfg_sustain["commands"]:
+                print(f"[BOT SUSTAIN] sending {cmd}")
+    elif cfg_sustain["enabled"]:
+        if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 60:
+            print("[BOT SUSTAIN] skipped because bot not confirmed in-game")
+            bot_runtime_state["last_presence_log_at"] = now
+
 def get_players_from_rcon():
     raw = run_rcon("list")
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -1470,6 +1718,7 @@ def restore_state():
     saved_online_since = state.get("online_since", {})
     saved_last_tick = state.get("last_minute_tick", {})
     saved_restart_cycle = state.get("restart_cycle_state", {})
+    saved_bot_presence = state.get("bot_presence_state")
     now_ts = int(time.time())
     catchup_cap_minutes = get_max_reward_catchup_minutes()
     catchup_cap_seconds = catchup_cap_minutes * 60
@@ -1522,6 +1771,8 @@ def restore_state():
 
     if isinstance(saved_restart_cycle, dict):
         restart_cycle_state.update(saved_restart_cycle)
+    if isinstance(saved_bot_presence, str) and saved_bot_presence:
+        bot_runtime_state["presence_state"] = saved_bot_presence
 
 
 def update_players(players):
@@ -2052,6 +2303,7 @@ async def tracking_loop():
         await process_restart_discord_updates()
         await process_server_health_updates()
         await process_executor_health_updates()
+        await process_bot_presence_and_recovery(players)
         print_live_status(players)
     except Exception as e:
         print(f"[ERROR] tracking loop failed: {e}")
@@ -2077,6 +2329,19 @@ async def on_ready():
     print(f"[BOT STARTED] Logged in as {bot.user}")
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
+    startup_players = await asyncio.to_thread(get_players_from_rcon)
+    startup_server = map_server_state()
+    startup_presence = is_bot_present_in_players(startup_players)
+    print(f"[STARTUP] server status={startup_server}")
+    print(f"[STARTUP] bot presence status={'BOT_IN_GAME' if startup_presence else 'BOT_MISSING'}")
+    if startup_presence:
+        bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+        print("[STARTUP] sustain loop enabled")
+    elif startup_server == SERVER_STATE_ONLINE:
+        bot_runtime_state["presence_state"] = BOT_STATE_MISSING
+        print("[STARTUP] scheduling rejoin")
+    else:
+        bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
 
     if not tracking_loop.is_running():
         tracking_loop.change_interval(seconds=get_scan_interval_seconds())

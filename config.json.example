@@ -37,5 +37,30 @@
   },
   "executor_enable_recovery_hook": false,
   "executor_recovery_macro_delay": 2,
-  "executor_recovery_macro": []
+  "executor_recovery_macro": [],
+  "bot_presence": {
+    "player_name": "YOUR_BOT_NAME",
+    "steam_id": "",
+    "missing_grace_seconds": 60,
+    "confirm_rejoin_timeout_seconds": 120
+  },
+  "server_recovery": {
+    "enabled": true,
+    "max_rejoin_attempts": 10,
+    "retry_backoff_seconds": [10, 20, 30, 60, 60, 120],
+    "server_back_online_confirm_checks": 2
+  },
+  "bot_sustain": {
+    "enabled": true,
+    "interval_seconds": 90,
+    "commands": ["/hunger 100", "/thirst 100", "/health 100"]
+  },
+  "rejoin_sequence": {
+    "enabled": true,
+    "steps": [
+      {"type": "focus_window", "window_title_contains": "The Isle"},
+      {"type": "wait_seconds", "seconds": 2},
+      {"type": "join_server_macro"}
+    ]
+  }
 }
