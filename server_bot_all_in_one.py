@@ -13,10 +13,11 @@ import stat
 import threading
 import tempfile
 from zoneinfo import ZoneInfo
+from typing import Any
 
 import paramiko
 
-TOKEN = "MTQ4NjQ2NTQ4ODczNjQ4NTQ0Ng.GSiZhh.u074voiptO6mC4zIuF6lsD2U59V1APSCrrLugg"
+TOKEN = ""
 
 DATA_FILE = Path("player_data.json")
 STATE_FILE = Path("player_state.json")
@@ -90,7 +91,7 @@ RCON_SCRIPT = r"C:\Users\joshu\Downloads\The-Isle-Evrima-Server-Tools-main\TheIs
 RCONCLI_PATH = r"C:\Users\joshu\Documents\EvrimaBot\RconCli\bin\Release\net8.0\RconCli.exe"
 RCON_IP = "68.168.208.54"
 RCON_PORT = "11218"
-RCON_PASSWORD = "qFHrZpel6qwF"
+RCON_PASSWORD = ""
 ANNOUNCEMENT_INTERVAL_SECONDS = 600
 
 TOKEN = os.getenv("DISCORD_TOKEN", TOKEN)
@@ -123,11 +124,48 @@ DEFAULT_RESTART_TIMES = ["00:00", "06:00", "12:00", "18:00"]
 RESTART_WARN_MINUTES = [3, 2, 1]
 LONDON_TZ = ZoneInfo("Europe/London")
 restart_cycle_state = {}
+server_health_state = {
+    "status": "ONLINE",
+    "fail_count": 0,
+    "success_count": 0,
+    "last_status_at": None,
+    "last_health_poll": 0.0,
+}
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
 GAME_COMMANDS_LOCK = threading.RLock()
 ECONOMY_LOCK = threading.RLock()
+
+
+class ConfigManager:
+    @staticmethod
+    def get(config_key: str, env_name: str | None = None, default: Any = None):
+        if env_name:
+            env_value = os.getenv(env_name)
+            if env_value not in (None, ""):
+                return env_value
+        config = load_config()
+        return config.get(config_key, default)
+
+    @staticmethod
+    def get_int(config_key: str, env_name: str | None = None, default: int = 0, minimum: int | None = None):
+        raw = ConfigManager.get(config_key, env_name, default)
+        try:
+            value = int(raw)
+        except Exception:
+            value = int(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    @staticmethod
+    def get_bool(config_key: str, env_name: str | None = None, default: bool = False):
+        raw = ConfigManager.get(config_key, env_name, default)
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        return text in {"1", "true", "yes", "on"}
 
 
 def load_json(path: Path, default):
@@ -229,6 +267,12 @@ def get_env_or_config(env_name: str, config_key: str, default=None):
     config = load_config()
     cfg_value = config.get(config_key, default)
     return cfg_value
+
+
+def hydrate_runtime_secrets():
+    global TOKEN, RCON_PASSWORD
+    TOKEN = str(ConfigManager.get("discord_token", "DISCORD_TOKEN", TOKEN or "") or "")
+    RCON_PASSWORD = str(ConfigManager.get("rcon_password", "RCON_PASSWORD", RCON_PASSWORD or "") or "")
 
 
 def get_remote_log_config():
@@ -756,21 +800,50 @@ def clean_claim_note_for_user(note: str):
     return text
 
 
-def render_claim_progress_text(purchase):
+def mask_steam_id(steam_id: str):
+    value = str(steam_id or "")
+    if len(value) < 8:
+        return value
+    return f"{value[:4]}••••{value[-4:]}"
+
+
+def render_progress_bar(pct: int | None):
+    if pct is None:
+        return "██████░░░░ ~"
+    pct = max(0, min(100, int(pct)))
+    filled = int(round(pct / 10))
+    return f"{'█' * filled}{'░' * (10 - filled)} {pct}%"
+
+
+def build_claim_progress_embed(purchase):
     status = purchase.get("status")
     label, pct = get_claim_status_display(status)
     item = str(purchase.get("item", "dino")).upper()
+    result = clean_claim_note_for_user(
+        purchase.get("failure_note") or purchase.get("delivery_note") or label
+    ) or label
+    mention = ""
+    if purchase.get("progress_user_id"):
+        mention = f"<@{purchase.get('progress_user_id')}>"
 
     if status == "DELIVERED":
-        return f"🧬 {item}\nGrowth confirmed — 100% complete."
-    if status in {"WRONG_DINO", "WRONG_DINO_REFUNDED"}:
-        return f"🧬 {item}\nWrong dinosaur detected — points refunded."
-    if status == "FAILED":
-        note = purchase.get("failure_note") or purchase.get("delivery_note") or "Verification timed out — please try again."
-        return f"🧬 {item}\n{note}"
-    if pct is None:
-        return f"🧬 {item}\n{label}."
-    return f"🧬 {item}\n{label} — {pct}% complete."
+        color = discord.Color.green()
+        pct = 100
+    elif status in {"FAILED", "WRONG_DINO", "WRONG_DINO_REFUNDED", "CANCELLED_TIMEOUT"}:
+        color = discord.Color.red()
+    else:
+        color = discord.Color.blurple()
+
+    embed = discord.Embed(title="Claim Status", color=color)
+    embed.add_field(name="Dino", value=item, inline=True)
+    embed.add_field(name="Stage", value=label, inline=True)
+    embed.add_field(name="Progress", value=render_progress_bar(pct), inline=False)
+    embed.add_field(name="Result", value=result[:1000], inline=False)
+    if mention:
+        embed.add_field(name="Player", value=mention, inline=True)
+    embed.add_field(name="Steam", value=mask_steam_id(purchase.get("steam_id", "")), inline=True)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
 
 
 async def _update_claim_progress_message_async(purchase_snapshot: dict):
@@ -779,18 +852,18 @@ async def _update_claim_progress_message_async(purchase_snapshot: dict):
     if not channel_id:
         return
 
-    text = render_claim_progress_text(purchase_snapshot)
+    embed = build_claim_progress_embed(purchase_snapshot)
     try:
         channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
         if message_id:
             try:
                 message = await channel.fetch_message(int(message_id))
-                await message.edit(content=text)
+                await message.edit(content=None, embed=embed)
                 return
             except Exception:
                 pass
 
-        sent = await channel.send(text)
+        sent = await channel.send(embed=embed)
         with ECONOMY_LOCK:
             purchases = load_purchases()
             for p in purchases:
@@ -1070,25 +1143,42 @@ def format_restart_countdown(seconds_until: int):
     return f"⏳ Server restart in {seconds_until}s."
 
 
+def build_restart_embed(title: str, description: str, color: discord.Color | None = None):
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color or discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    return embed
+
+
 async def get_restarts_channel():
+    configured_id = ConfigManager.get_int("restart_channel_id", "RESTART_CHANNEL_ID", 0, minimum=0)
+    if configured_id:
+        channel = bot.get_channel(configured_id)
+        if channel:
+            return channel
+
+    channel_name = str(ConfigManager.get("restart_channel_name", "RESTART_CHANNEL_NAME", "restarts") or "restarts")
     for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name="restarts")
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
         if channel:
             return channel
     return None
 
 
-async def _send_or_edit_restart_message(text: str):
+async def _send_or_edit_restart_message(text: str, title: str = "Server Status", color: discord.Color | None = None):
     channel = await get_restarts_channel()
     if not channel:
         return
 
+    embed = build_restart_embed(title, text, color)
     message_id = restart_cycle_state.get("progress_message_id")
     if message_id:
         try:
             msg = await channel.fetch_message(int(message_id))
-            if msg.content != text:
-                await msg.edit(content=text)
+            await msg.edit(content=None, embed=embed)
             restart_cycle_state["progress_channel_id"] = int(channel.id)
             restart_cycle_state["last_countdown_text"] = text
             save_state()
@@ -1097,7 +1187,7 @@ async def _send_or_edit_restart_message(text: str):
             restart_cycle_state["progress_message_id"] = None
 
     try:
-        sent = await channel.send(text)
+        sent = await channel.send(embed=embed)
         restart_cycle_state["progress_message_id"] = int(sent.id)
         restart_cycle_state["progress_channel_id"] = int(channel.id)
         restart_cycle_state["last_countdown_text"] = text
@@ -1131,11 +1221,15 @@ async def process_restart_discord_updates():
         text = format_restart_countdown(seconds_until)
         last_text = restart_cycle_state.get("last_countdown_text")
         if text != last_text:
-            await _send_or_edit_restart_message(text)
+            await _send_or_edit_restart_message(text, "Server Restart Incoming", discord.Color.orange())
         return
 
     if not restart_cycle_state.get("sent_restart_now"):
-        await _send_or_edit_restart_message("🔄 Server restarting now.")
+        await _send_or_edit_restart_message(
+            "The server is restarting now. Recovery monitoring has started.",
+            "Server Restarting",
+            discord.Color.dark_orange(),
+        )
         restart_cycle_state["sent_restart_now"] = True
         save_state()
         return
@@ -1143,11 +1237,89 @@ async def process_restart_discord_updates():
     if not restart_cycle_state.get("sent_back_up"):
         is_up = await asyncio.to_thread(detect_server_back_up)
         if is_up:
-            await _send_or_edit_restart_message("✅ Server is back up.")
+            await _send_or_edit_restart_message(
+                "Server is back online and systems are reconnecting.",
+                "Server Online",
+                discord.Color.green(),
+            )
             restart_cycle_state["sent_back_up"] = True
             restart_cycle_state["is_active"] = False
             save_state()
 
+
+async def send_restart_incident(title: str, description: str, color: discord.Color):
+    channel = await get_restarts_channel()
+    if not channel:
+        return
+    try:
+        await channel.send(embed=build_restart_embed(title, description, color))
+    except Exception:
+        return
+
+
+def _classify_health_status():
+    rcon_ok = detect_server_back_up()
+    lines, sftp_err = read_remote_log_tail(2048)
+    sftp_ok = sftp_err is None and isinstance(lines, list)
+
+    if rcon_ok and sftp_ok:
+        return "ONLINE"
+    if rcon_ok or sftp_ok:
+        return "SUSPECTED_DOWN"
+    return "DOWN"
+
+
+async def process_server_health_updates():
+    poll_interval = ConfigManager.get_int("health_poll_interval_seconds", "HEALTH_POLL_INTERVAL_SECONDS", 10, minimum=3)
+    now_ts = time.time()
+    if now_ts - float(server_health_state.get("last_health_poll", 0.0)) < poll_interval:
+        return
+    server_health_state["last_health_poll"] = now_ts
+
+    health = await asyncio.to_thread(_classify_health_status)
+    previous = server_health_state.get("status", "ONLINE")
+
+    if health == "ONLINE":
+        server_health_state["success_count"] = int(server_health_state.get("success_count", 0)) + 1
+        server_health_state["fail_count"] = 0
+    else:
+        server_health_state["fail_count"] = int(server_health_state.get("fail_count", 0)) + 1
+        server_health_state["success_count"] = 0
+
+    suspect_threshold = ConfigManager.get_int("crash_suspect_threshold", "CRASH_SUSPECT_THRESHOLD", 2, minimum=1)
+    down_threshold = ConfigManager.get_int("crash_confirm_threshold", "CRASH_CONFIRM_THRESHOLD", 4, minimum=2)
+
+    new_status = previous
+    fail_count = int(server_health_state.get("fail_count", 0))
+    success_count = int(server_health_state.get("success_count", 0))
+    if fail_count >= down_threshold:
+        new_status = "DOWN"
+    elif fail_count >= suspect_threshold:
+        new_status = "SUSPECTED_DOWN"
+    elif success_count >= 2:
+        new_status = "ONLINE"
+
+    if new_status != previous:
+        server_health_state["status"] = new_status
+        server_health_state["last_status_at"] = datetime.now(timezone.utc).isoformat()
+        if new_status == "SUSPECTED_DOWN":
+            await send_restart_incident(
+                "Server Issue Detected",
+                "Connection checks are failing. Monitoring closely.",
+                discord.Color.gold(),
+            )
+        elif new_status == "DOWN":
+            await send_restart_incident(
+                "Server Offline",
+                "Server crash/offline confirmed. Auto recovery is in progress.",
+                discord.Color.red(),
+            )
+        elif new_status == "ONLINE":
+            await send_restart_incident(
+                "Recovery Complete",
+                "Bot systems reconnected and monitoring has resumed.",
+                discord.Color.green(),
+            )
 
 def get_players_from_rcon():
     raw = run_rcon("list")
@@ -1392,17 +1564,31 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
     item = str(purchase.get("item", "")).lower().strip()
     claim_group_id = purchase.get("claim_group_id")
 
+    precheck_default = ["/health {steam_id} 100"]
+    pre_grow_default = [
+        "/diet1 {steam_id} 100",
+        "/diet2 {steam_id} 100",
+        "/diet3 {steam_id} 100",
+        "/health {steam_id} 100",
+    ]
+    claim_default = [
+        "/growth {steam_id} 65",
+        "/diet1 {steam_id} 100",
+        "/diet2 {steam_id} 100",
+        "/diet3 {steam_id} 100",
+        "/hunger {steam_id} 100",
+        "/health {steam_id} 100",
+    ]
+
     if phase == "PRECHECK":
-        sequence = [f"/health {steam_id} 100"]
+        raw_sequence = ConfigManager.get("claim_precheck_commands", "CLAIM_PRECHECK_COMMANDS", precheck_default)
+    elif phase == "RECOVERY":
+        raw_sequence = ConfigManager.get("claim_recovery_commands", "CLAIM_RECOVERY_COMMANDS", pre_grow_default)
     else:
-        sequence = [
-            f"/growth {steam_id} 65",
-            f"/diet1 {steam_id} 100",
-            f"/diet2 {steam_id} 100",
-            f"/diet3 {steam_id} 100",
-            f"/hunger {steam_id} 100",
-            f"/health {steam_id} 100",
-        ]
+        raw_sequence = ConfigManager.get("claim_commands", "CLAIM_COMMANDS", claim_default)
+    if not isinstance(raw_sequence, list) or not raw_sequence:
+        raw_sequence = precheck_default if phase == "PRECHECK" else claim_default
+    sequence = [str(cmd).format(steam_id=steam_id) for cmd in raw_sequence]
 
     for idx, command_text in enumerate(sequence, start=1):
         game_commands.append({
@@ -1418,6 +1604,7 @@ def queue_claim_phase_commands(purchase, player_name: str, phase: str):
             "claim_step": idx,
             "claim_final": idx == len(sequence),
             "claim_phase": phase,
+            "command_type": "claim_command",
         })
 
     save_game_commands(game_commands)
@@ -1499,7 +1686,9 @@ def process_claim_orchestration():
                 changed_purchases = True
 
                 player_name = purchase.get("player") or "Unknown"
-                claim_sequence = queue_claim_phase_commands(purchase, player_name, "CLAIM")
+                if ConfigManager.get_bool("claim_use_recovery_chain", "CLAIM_USE_RECOVERY_CHAIN", True):
+                    queue_claim_phase_commands(purchase, player_name, "RECOVERY")
+                queue_claim_phase_commands(purchase, player_name, "CLAIM")
                 set_purchase_status(purchase, "CLAIM_SEQUENCE_QUEUED")
                 purchase["delivery_note"] = "Growth queued — 75% complete."
                 changed_purchases = True
@@ -1545,6 +1734,15 @@ def process_claim_orchestration():
 
                 growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
                 if not growth_ok:
+                    max_retries = ConfigManager.get_int("claim_retry_limit", "CLAIM_RETRY_LIMIT", 1, minimum=0)
+                    retries_used = int(purchase.get("retry_count", 0))
+                    if retries_used < max_retries:
+                        purchase["retry_count"] = retries_used + 1
+                        purchase["retry_reason"] = growth_note
+                        purchase["status"] = "PRECHECK_PASSED"
+                        purchase["delivery_note"] = f"Retrying claim ({purchase['retry_count']}/{max_retries})"
+                        changed_purchases = True
+                        continue
                     fail_purchase_with_refund(
                         purchase,
                         "FAILED",
@@ -1670,6 +1868,7 @@ async def tracking_loop():
         await asyncio.to_thread(enforce_claim_watchdog_timeout)
         await asyncio.to_thread(process_restart_announcements)
         await process_restart_discord_updates()
+        await process_server_health_updates()
         print_live_status(players)
     except Exception as e:
         print(f"[ERROR] tracking loop failed: {e}")
@@ -1691,6 +1890,7 @@ async def announcement_loop():
 @bot.event
 async def on_ready():
     global MAIN_LOOP
+    hydrate_runtime_secrets()
     print(f"[BOT STARTED] Logged in as {bot.user}")
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
@@ -1706,6 +1906,11 @@ async def on_ready():
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
+    await send_restart_incident(
+        "Recovery Complete",
+        "Bot systems reconnected and monitoring has resumed.",
+        discord.Color.green(),
+    )
 
 
 @announcement_loop.before_loop
@@ -2082,4 +2287,5 @@ async def leaderboard(ctx):
 
 
 if __name__ == "__main__":
+    hydrate_runtime_secrets()
     bot.run(TOKEN)
