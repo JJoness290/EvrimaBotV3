@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from typing import Any
 
 import paramiko
+import pyautogui
 
 TOKEN = ""
 
@@ -1343,16 +1344,102 @@ def get_ui_control_config():
     }
 
 
+def _execute_rejoin_ui_step(step: dict):
+    step_type = str(step.get("type", "")).strip().lower()
+    if step_type == "focus_window":
+        print("[REJOIN UI] focusing game window")
+        focus_click = step.get("focus_click", {})
+        try:
+            if isinstance(focus_click, dict) and "x" in focus_click and "y" in focus_click:
+                pyautogui.click(int(focus_click["x"]), int(focus_click["y"]))
+                print("[REJOIN UI] game window focused successfully")
+            else:
+                pyautogui.press("alt")
+                print("[REJOIN UI] game window focused successfully")
+            return True
+        except Exception:
+            print("[REJOIN UI] game window focused failed")
+            return False
+    if step_type == "press_key":
+        key = str(step.get("key", "esc"))
+        print(f"[REJOIN UI] pressing key {key}")
+        pyautogui.press(key)
+        return True
+    if step_type == "hotkey":
+        keys = step.get("keys", [])
+        if isinstance(keys, list) and keys:
+            print(f"[REJOIN UI] pressing hotkey {'+'.join([str(k) for k in keys])}")
+            pyautogui.hotkey(*[str(k) for k in keys])
+        return True
+    if step_type == "click_position":
+        x = int(step.get("x", 0))
+        y = int(step.get("y", 0))
+        print(f"[REJOIN UI] clicking configured position ({x}, {y})")
+        pyautogui.click(x, y)
+        return True
+    if step_type == "type_text":
+        text = str(step.get("text", ""))
+        print(f"[REJOIN UI] typing text {text}")
+        pyautogui.write(text)
+        return True
+    if step_type == "wait_seconds":
+        seconds = float(step.get("seconds", 1))
+        print(f"[REJOIN UI] waiting {seconds} seconds")
+        time.sleep(max(0.0, seconds))
+        return True
+    if step_type == "click_image":
+        image_path = str(step.get("image", "")).strip()
+        confidence = float(step.get("confidence", 0.8) or 0.8)
+        print(f"[REJOIN UI] click_image {image_path}")
+        if not image_path:
+            return False
+        pos = pyautogui.locateCenterOnScreen(image_path, confidence=confidence)
+        if pos:
+            pyautogui.click(pos.x, pos.y)
+            return True
+        return False
+    if step_type == "join_server_macro":
+        hotkey = step.get("hotkey", ["f1"])
+        if isinstance(hotkey, list) and hotkey:
+            print(f"[REJOIN UI] pressing join macro {'+'.join([str(k) for k in hotkey])}")
+            pyautogui.hotkey(*[str(k) for k in hotkey])
+            return True
+        return False
+    return True
+
+
+def execute_rejoin_sequence():
+    seq = get_rejoin_sequence_config()
+    steps = seq.get("steps", [])
+    if not steps:
+        print("[REJOIN UI] no rejoin sequence configured")
+        return False
+    try:
+        for step in steps:
+            ok = _execute_rejoin_ui_step(step if isinstance(step, dict) else {})
+            if not ok:
+                raise RuntimeError(f"Step failed: {step}")
+        print("[REJOIN UI] join sequence complete")
+        return True
+    except Exception as e:
+        print(f"[REJOIN UI] join sequence failed: {e}")
+        return False
+
+
 def is_bot_present_in_players(players: dict):
     cfg = get_bot_presence_config()
     target_name = str(cfg.get("player_name", "")).strip().lower()
     target_steam = str(cfg.get("steam_id", "")).strip()
+    print("[BOT PRESENCE] checking for configured bot player")
     if target_steam and target_steam in players:
+        print(f"[BOT PRESENCE] matched by steam id {target_steam}")
         return True
     if target_name:
-        for name in players.values():
+        for steam_id, name in players.items():
             if str(name).strip().lower() == target_name:
+                print(f"[BOT PRESENCE] matched by player name {name} steam={steam_id}")
                 return True
+    print("[BOT PRESENCE] bot not found in current playerlist")
     return False
 
 
@@ -1721,7 +1808,9 @@ async def process_bot_presence_and_recovery(players: dict):
             attempt_no = bot_runtime_state["rejoin_attempt"]
             print(f"[REJOIN] attempt {attempt_no} started")
             await send_restart_incident("Rejoin Attempt", "Attempting to rejoin the server now.", discord.Color.blurple())
-            queue_priority_commands(build_rejoin_executor_commands())
+            ui_ok = await asyncio.to_thread(execute_rejoin_sequence)
+            if not ui_ok:
+                queue_priority_commands(build_rejoin_executor_commands())
             retries = cfg_recovery["retry_backoff_seconds"]
             backoff = retries[min(attempt_no - 1, len(retries) - 1)]
             bot_runtime_state["next_rejoin_after"] = now + backoff
@@ -1729,6 +1818,9 @@ async def process_bot_presence_and_recovery(players: dict):
             print("[REJOIN] waiting for playerlist confirmation")
 
     if bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME and cfg_sustain["enabled"]:
+        print("[REJOIN] confirmed via playerlist")
+        print("[REJOIN] recovery state cleared")
+        print("[BOT SUSTAIN] enabled after bot presence confirmed")
         if now - float(bot_runtime_state.get("last_sustain_at", 0.0)) >= cfg_sustain["interval_seconds"]:
             queue_sustain_commands()
             bot_runtime_state["last_sustain_at"] = now
@@ -1833,25 +1925,57 @@ def restore_state():
         bot_runtime_state["presence_state"] = saved_bot_presence
 
 
+def ensure_player_record(data: dict, steam_id: str, name: str):
+    if steam_id not in data:
+        data[steam_id] = {
+            "name": name,
+            "steam_id": steam_id,
+            "total_minutes": 0,
+            "current_session_minutes": 0,
+            "energy": get_starting_energy(),
+            "energy_fraction": 0.0,
+            "sessions": 0,
+        }
+        print(f"[PLAYER INIT] created new player steam={steam_id} with starting_energy={get_starting_energy()}")
+        return "created"
+
+    player = data[steam_id]
+    original_energy = player.get("energy")
+    original_total = player.get("total_minutes")
+    merged = False
+    defaults = {
+        "name": name,
+        "steam_id": steam_id,
+        "total_minutes": 0,
+        "current_session_minutes": 0,
+        "energy": get_starting_energy(),
+        "energy_fraction": 0.0,
+        "sessions": 0,
+    }
+    for k, v in defaults.items():
+        if k not in player:
+            player[k] = v
+            merged = True
+    player["name"] = name
+    player["steam_id"] = steam_id
+    if merged:
+        print(f"[PLAYER INIT] merged missing fields only for steam={steam_id}")
+    print(f"[PLAYER INIT] existing player preserved steam={steam_id} energy={original_energy} total_minutes={original_total}")
+    return "existing"
+
+
 def update_players(players):
     data = load_json(DATA_FILE, {})
     now = int(time.time())
     current_ids = set(players.keys())
+    if not players:
+        print("[TRACKING] empty playerlist detected after restart/offline event")
+        print("[TRACKING] preserving stored player data")
 
     for steam_id, name in players.items():
-        if steam_id not in data:
-            data[steam_id] = {
-                "name": name,
-                "steam_id": steam_id,
-                "total_minutes": 0,
-                "current_session_minutes": 0,
-                "energy": get_starting_energy(),
-                "energy_fraction": 0.0,
-                "sessions": 0,
-            }
-
-        data[steam_id]["name"] = name
-        data[steam_id]["steam_id"] = steam_id
+        status = ensure_player_record(data, steam_id, name)
+        if status == "existing":
+            print(f"[TRACKING] restored known player steam={steam_id}")
 
         if steam_id not in online_since:
             online_since[steam_id] = now
