@@ -161,6 +161,7 @@ bot_runtime_state = {
     "rejoin_attempt": 0,
     "rejoin_in_progress": False,
     "next_rejoin_after": 0.0,
+    "rejoin_started_at": 0.0,
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
 }
@@ -1316,16 +1317,13 @@ def get_rejoin_sequence_config():
     section = ConfigManager.get_section("rejoin_sequence")
     steps = section.get("steps", [
         {"type": "focus_window", "window_title_contains": "The Isle"},
-        {"type": "press_key", "key": "esc"},
-        {"type": "wait_seconds", "seconds": 1},
-        {"type": "hotkey", "keys": ["f1"]},
-        {"type": "wait_seconds", "seconds": 5},
-        {"type": "verify_in_game_presence"},
+        {"type": "wait_seconds", "seconds": 2},
     ])
     if not isinstance(steps, list):
         steps = []
     return {
         "enabled": bool(section.get("enabled", True)),
+        "post_step_delay_seconds": float(section.get("post_step_delay_seconds", 0.5) or 0.0),
         "steps": steps,
     }
 
@@ -1374,7 +1372,24 @@ def _execute_rejoin_ui_step(step: dict):
     if step_type == "click_position":
         x = int(step.get("x", 0))
         y = int(step.get("y", 0))
-        print(f"[REJOIN UI] clicking configured position ({x}, {y})")
+        label = str(step.get("label", "")).strip() or "unnamed"
+        print(f"[REJOIN UI] click_position label={label} x={x} y={y}")
+        pyautogui.click(x, y)
+        return True
+    if step_type == "double_click_position":
+        x = int(step.get("x", 0))
+        y = int(step.get("y", 0))
+        label = str(step.get("label", "")).strip() or "unnamed"
+        print(f"[REJOIN UI] double_click_position label={label} x={x} y={y}")
+        pyautogui.doubleClick(x, y)
+        return True
+    if step_type == "move_and_click_position":
+        x = int(step.get("x", 0))
+        y = int(step.get("y", 0))
+        duration = float(step.get("move_duration", 0.2) or 0.2)
+        label = str(step.get("label", "")).strip() or "unnamed"
+        print(f"[REJOIN UI] move_and_click_position label={label} x={x} y={y}")
+        pyautogui.moveTo(x, y, duration=max(0.0, duration))
         pyautogui.click(x, y)
         return True
     if step_type == "type_text":
@@ -1393,11 +1408,33 @@ def _execute_rejoin_ui_step(step: dict):
         print(f"[REJOIN UI] click_image {image_path}")
         if not image_path:
             return False
-        pos = pyautogui.locateCenterOnScreen(image_path, confidence=confidence)
-        if pos:
-            pyautogui.click(pos.x, pos.y)
-            return True
+        timeout_seconds = float(step.get("timeout_seconds", 5) or 5)
+        deadline = time.time() + max(0.1, timeout_seconds)
+        while time.time() < deadline:
+            try:
+                pos = pyautogui.locateCenterOnScreen(image_path, confidence=confidence)
+            except Exception:
+                pos = None
+            if pos:
+                print(f"[REJOIN UI] image matched at x={int(pos.x)} y={int(pos.y)}")
+                pyautogui.click(pos.x, pos.y)
+                return True
+            time.sleep(0.25)
+        print("[REJOIN UI] image not found within timeout")
         return False
+    if step_type == "press_sequence":
+        keys = step.get("keys", [])
+        delay = float(step.get("delay_between_keys", 0.2) or 0.2)
+        if not isinstance(keys, list):
+            return False
+        for key in keys:
+            k = str(key).strip()
+            if not k:
+                continue
+            print(f"[REJOIN UI] pressing key {k}")
+            pyautogui.press(k)
+            time.sleep(max(0.0, delay))
+        return True
     if step_type == "join_server_macro":
         hotkey = step.get("hotkey", ["f1"])
         if isinstance(hotkey, list) and hotkey:
@@ -1405,20 +1442,28 @@ def _execute_rejoin_ui_step(step: dict):
             pyautogui.hotkey(*[str(k) for k in hotkey])
             return True
         return False
+    if step_type == "verify_in_game_presence":
+        print("[REJOIN UI] verify_in_game_presence checkpoint")
+        return True
     return True
 
 
 def execute_rejoin_sequence():
     seq = get_rejoin_sequence_config()
     steps = seq.get("steps", [])
-    if not steps:
-        print("[REJOIN UI] no rejoin sequence configured")
+    valid_steps = [s for s in steps if isinstance(s, dict) and str(s.get("type", "")).strip()]
+    if not valid_steps:
+        print("[REJOIN UI] no valid rejoin sequence configured")
+        print("[REJOIN UI] cannot attempt automatic join without configured steps")
         return False
     try:
-        for step in steps:
+        for step in valid_steps:
             ok = _execute_rejoin_ui_step(step if isinstance(step, dict) else {})
             if not ok:
                 raise RuntimeError(f"Step failed: {step}")
+            post_delay = float(seq.get("post_step_delay_seconds", 0.0) or 0.0)
+            if post_delay > 0:
+                time.sleep(post_delay)
         print("[REJOIN UI] join sequence complete")
         return True
     except Exception as e:
@@ -1761,11 +1806,14 @@ async def process_bot_presence_and_recovery(players: dict):
 
     present = is_bot_present_in_players(players)
     if present:
+        if bot_runtime_state.get("rejoin_started_at"):
+            print("[REJOIN] bot detected in playerlist, success")
         if bot_runtime_state.get("presence_state") != BOT_STATE_IN_GAME:
             bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
             bot_runtime_state["missing_since"] = None
             bot_runtime_state["rejoin_attempt"] = 0
             bot_runtime_state["rejoin_in_progress"] = False
+            bot_runtime_state["rejoin_started_at"] = 0.0
             await send_restart_incident(
                 "Bot Rejoined",
                 "The in-game bot account has rejoined successfully and sustain mode is active.",
@@ -1805,6 +1853,7 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["rejoin_in_progress"] = True
             bot_runtime_state["presence_state"] = BOT_STATE_REJOINING
             bot_runtime_state["rejoin_attempt"] = attempts + 1
+            bot_runtime_state["rejoin_started_at"] = now
             attempt_no = bot_runtime_state["rejoin_attempt"]
             print(f"[REJOIN] attempt {attempt_no} started")
             await send_restart_incident("Rejoin Attempt", "Attempting to rejoin the server now.", discord.Color.blurple())
@@ -1816,6 +1865,13 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["next_rejoin_after"] = now + backoff
             bot_runtime_state["rejoin_in_progress"] = False
             print("[REJOIN] waiting for playerlist confirmation")
+            print(f"[REJOIN] scheduling retry in {backoff} seconds")
+
+    if bot_runtime_state.get("presence_state") == BOT_STATE_REJOINING and not present:
+        started_at = float(bot_runtime_state.get("rejoin_started_at", 0.0) or 0.0)
+        if started_at > 0 and (now - started_at) >= float(cfg_presence.get("confirm_rejoin_timeout_seconds", 120)):
+            print("[REJOIN] confirmation timed out")
+            bot_runtime_state["rejoin_started_at"] = 0.0
 
     if bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME and cfg_sustain["enabled"]:
         print("[REJOIN] confirmed via playerlist")
@@ -2968,6 +3024,14 @@ async def checktier(ctx):
         discord.Color.green(),
     )
     await ctx.send(embed=embed)
+
+
+@bot.command()
+async def mousepos(ctx):
+    pos = pyautogui.position()
+    msg = f"[CALIBRATE] x={int(pos.x)} y={int(pos.y)}"
+    print(msg)
+    await ctx.send(msg)
 
 
 if __name__ == "__main__":

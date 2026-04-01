@@ -57,13 +57,10 @@
   },
   "rejoin_sequence": {
     "enabled": true,
+    "post_step_delay_seconds": 0.5,
     "steps": [
       {"type": "focus_window", "window_title_contains": "The Isle"},
-      {"type": "press_key", "key": "esc"},
-      {"type": "wait_seconds", "seconds": 1},
-      {"type": "hotkey", "keys": ["f1"]},
-      {"type": "wait_seconds", "seconds": 5},
-      {"type": "verify_in_game_presence"}
+      {"type": "wait_seconds", "seconds": 2}
     ]
   },
   "ui_control": {
