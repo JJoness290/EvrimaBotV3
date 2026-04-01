@@ -55,33 +55,26 @@
     "interval_seconds": 90,
     "commands": ["/hunger 100", "/thirst 100", "/health 100"]
   },
-  "rejoin_sequence": {
+  "coordinate_join_macro": {
     "enabled": true,
-    "mode": "image",
     "post_step_delay_seconds": 0.5,
     "steps": [
       {"type": "focus_window", "window_title_contains": "The Isle"},
       {"type": "wait_seconds", "seconds": 2},
-      {"type": "click_image", "path": "assets/ui/play.png", "timeout_seconds": 15},
-      {"type": "wait_for_image", "path": "assets/ui/session_filter.png", "timeout_seconds": 30},
-      {"type": "click_image", "path": "assets/ui/session_filter.png", "timeout_seconds": 10},
-      {"type": "click_image", "path": "assets/ui/unofficial.png", "timeout_seconds": 10},
-      {"type": "click_image", "path": "assets/ui/search_box.png", "timeout_seconds": 10},
+      {"type": "click_position", "x": 126, "y": 395, "label": "play_button"},
+      {"type": "wait_seconds", "seconds": 8},
+      {"type": "click_position", "x": 1443, "y": 360, "label": "session_filter"},
+      {"type": "wait_seconds", "seconds": 1},
+      {"type": "click_position", "x": 1437, "y": 445, "label": "unofficial_option"},
+      {"type": "wait_seconds", "seconds": 1},
+      {"type": "click_position", "x": 1388, "y": 164, "label": "search_box"},
       {"type": "type_text", "text": "primal abyss"},
       {"type": "wait_seconds", "seconds": 3},
-      {"type": "click_image", "path": "assets/ui/primal_server_row.png", "timeout_seconds": 15},
-      {"type": "click_image", "path": "assets/ui/connect_button.png", "timeout_seconds": 10},
+      {"type": "click_position", "x": 534, "y": 129, "label": "server_row"},
+      {"type": "wait_seconds", "seconds": 1},
+      {"type": "click_position", "x": 1395, "y": 757, "label": "connect_button"},
       {"type": "wait_seconds", "seconds": 25}
     ]
-  },
-  "rejoin_coordinates": {
-    "play_button": {"x": 100, "y": 395},
-    "session_filter": {"x": 1442, "y": 360},
-    "unofficial_option": {"x": 1438, "y": 446},
-    "search_box": {"x": 1378, "y": 163},
-    "primal_server_row": {"x": 661, "y": 128},
-    "connect_button": {"x": 1399, "y": 755},
-    "focus_game": {"x": 960, "y": 540}
   },
   "ui_control": {
     "use_admin_panel": true,

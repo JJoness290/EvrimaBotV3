@@ -1314,67 +1314,31 @@ def get_bot_sustain_config():
 
 
 def get_rejoin_sequence_config():
-    section = ConfigManager.get_section("rejoin_sequence")
+    section = ConfigManager.get_section("coordinate_join_macro")
     steps = section.get("steps", [
         {"type": "focus_window", "window_title_contains": "The Isle"},
         {"type": "wait_seconds", "seconds": 2},
-        {"type": "click_image", "path": "assets/ui/play.png", "timeout_seconds": 15},
-        {"type": "wait_for_image", "path": "assets/ui/session_filter.png", "timeout_seconds": 30},
-        {"type": "click_image", "path": "assets/ui/session_filter.png", "timeout_seconds": 10},
-        {"type": "click_image", "path": "assets/ui/unofficial.png", "timeout_seconds": 10},
-        {"type": "click_image", "path": "assets/ui/search_box.png", "timeout_seconds": 10},
+        {"type": "click_position", "x": 126, "y": 395, "label": "play_button"},
+        {"type": "wait_seconds", "seconds": 8},
+        {"type": "click_position", "x": 1443, "y": 360, "label": "session_filter"},
+        {"type": "wait_seconds", "seconds": 1},
+        {"type": "click_position", "x": 1437, "y": 445, "label": "unofficial_option"},
+        {"type": "wait_seconds", "seconds": 1},
+        {"type": "click_position", "x": 1388, "y": 164, "label": "search_box"},
         {"type": "type_text", "text": "primal abyss"},
         {"type": "wait_seconds", "seconds": 3},
-        {"type": "click_image", "path": "assets/ui/primal_server_row.png", "timeout_seconds": 15},
-        {"type": "click_image", "path": "assets/ui/connect_button.png", "timeout_seconds": 10},
+        {"type": "click_position", "x": 534, "y": 129, "label": "server_row"},
+        {"type": "wait_seconds", "seconds": 1},
+        {"type": "click_position", "x": 1395, "y": 757, "label": "connect_button"},
         {"type": "wait_seconds", "seconds": 25},
     ])
     if not isinstance(steps, list):
         steps = []
     return {
         "enabled": bool(section.get("enabled", True)),
-        "mode": str(section.get("mode", "image")).strip().lower(),
         "post_step_delay_seconds": float(section.get("post_step_delay_seconds", 0.5) or 0.0),
         "steps": steps,
     }
-
-
-def get_rejoin_coordinates():
-    section = ConfigManager.get_section("rejoin_coordinates")
-    return section if isinstance(section, dict) else {}
-
-
-def _resolve_coord(label: str, fallback_x=None, fallback_y=None):
-    coords = get_rejoin_coordinates()
-    slot = coords.get(label, {}) if isinstance(coords.get(label, {}), dict) else {}
-    if "x" in slot and "y" in slot:
-        return int(slot["x"]), int(slot["y"])
-    if fallback_x is not None and fallback_y is not None:
-        return int(fallback_x), int(fallback_y)
-    return None, None
-
-
-def _image_basename_key(path_value: str):
-    name = str(path_value or "").replace("\\", "/").split("/")[-1]
-    if "." in name:
-        name = name.rsplit(".", 1)[0]
-    return name.strip().lower()
-
-
-def _find_image_on_screen(path_value: str, timeout_seconds: float, confidence: float):
-    print(f"[REJOIN UI] waiting for image {path_value}")
-    deadline = time.time() + max(0.1, float(timeout_seconds))
-    while time.time() < deadline:
-        try:
-            pos = pyautogui.locateCenterOnScreen(path_value, confidence=confidence)
-        except Exception:
-            pos = None
-        if pos:
-            print(f"[REJOIN UI] image found {path_value} at x={int(pos.x)} y={int(pos.y)}")
-            return pos
-        time.sleep(0.25)
-    print(f"[REJOIN UI] image not found within timeout: {path_value}")
-    return None
 
 
 def get_ui_control_config():
@@ -1392,12 +1356,10 @@ def get_ui_control_config():
 
 
 def _execute_rejoin_ui_step(step: dict):
-    seq_cfg = get_rejoin_sequence_config()
-    mode = str(seq_cfg.get("mode", "image")).lower()
     step_type = str(step.get("type", "")).strip().lower()
     if step_type == "focus_window":
-        print("[REJOIN UI] focusing game window")
-        focus_click = step.get("focus_click", {}) or get_rejoin_coordinates().get("focus_game", {})
+        print("[MACRO] focusing game window")
+        focus_click = step.get("focus_click", {})
         try:
             if isinstance(focus_click, dict) and "x" in focus_click and "y" in focus_click:
                 pyautogui.click(int(focus_click["x"]), int(focus_click["y"]))
@@ -1422,33 +1384,25 @@ def _execute_rejoin_ui_step(step: dict):
         return True
     if step_type == "click_position":
         label = str(step.get("label", "")).strip() or "unnamed"
-        x, y = _resolve_coord(label, step.get("x"), step.get("y"))
-        if x is None or y is None:
+        if "x" not in step or "y" not in step:
             return False
-        print(f"[REJOIN UI] click_position label={label} x={x} y={y}")
+        x = int(step.get("x"))
+        y = int(step.get("y"))
+        print(f"[MACRO] clicking {label} x={x} y={y}")
         pyautogui.click(x, y)
         return True
     if step_type == "double_click_position":
         label = str(step.get("label", "")).strip() or "unnamed"
-        x, y = _resolve_coord(label, step.get("x"), step.get("y"))
-        if x is None or y is None:
+        if "x" not in step or "y" not in step:
             return False
-        print(f"[REJOIN UI] double_click_position label={label} x={x} y={y}")
+        x = int(step.get("x"))
+        y = int(step.get("y"))
+        print(f"[MACRO] clicking {label} x={x} y={y}")
         pyautogui.doubleClick(x, y)
-        return True
-    if step_type == "move_and_click_position":
-        duration = float(step.get("move_duration", 0.2) or 0.2)
-        label = str(step.get("label", "")).strip() or "unnamed"
-        x, y = _resolve_coord(label, step.get("x"), step.get("y"))
-        if x is None or y is None:
-            return False
-        print(f"[REJOIN UI] move_and_click_position label={label} x={x} y={y}")
-        pyautogui.moveTo(x, y, duration=max(0.0, duration))
-        pyautogui.click(x, y)
         return True
     if step_type == "type_text":
         text = str(step.get("text", ""))
-        print(f"[REJOIN UI] typing text {text}")
+        print(f"[MACRO] typing {text}")
         pyautogui.write(text)
         return True
     if step_type == "wait_seconds":
@@ -1456,67 +1410,14 @@ def _execute_rejoin_ui_step(step: dict):
         print(f"[REJOIN UI] waiting {seconds} seconds")
         time.sleep(max(0.0, seconds))
         return True
-    if step_type == "click_image":
-        image_path = str(step.get("path") or step.get("image") or "").strip()
-        confidence = float(step.get("confidence", 0.8) or 0.8)
-        label = str(step.get("label", "")).strip() or _image_basename_key(image_path)
-        timeout_seconds = float(step.get("timeout_seconds", 5) or 5)
-        if mode == "coordinates":
-            x, y = _resolve_coord(label, step.get("x"), step.get("y"))
-            if x is None or y is None:
-                return False
-            print(f"[REJOIN UI] click_position label={label} x={x} y={y}")
-            pyautogui.click(x, y)
-            return True
-        pos = _find_image_on_screen(image_path, timeout_seconds, confidence) if image_path else None
-        if not pos:
-            x, y = _resolve_coord(label, step.get("x"), step.get("y"))
-            if x is None or y is None:
-                return False
-            print(f"[REJOIN UI] image fallback click_position label={label} x={x} y={y}")
-            pyautogui.click(x, y)
-            return True
-        print(f"[REJOIN UI] clicking image {image_path}")
-        pyautogui.click(pos.x, pos.y)
-        return True
-    if step_type == "wait_for_image":
-        image_path = str(step.get("path") or step.get("image") or "").strip()
-        timeout_seconds = float(step.get("timeout_seconds", 10) or 10)
-        confidence = float(step.get("confidence", 0.8) or 0.8)
-        if mode == "coordinates":
-            return True
-        return _find_image_on_screen(image_path, timeout_seconds, confidence) is not None
-    if step_type == "press_sequence":
-        keys = step.get("keys", [])
-        delay = float(step.get("delay_between_keys", 0.2) or 0.2)
-        if not isinstance(keys, list):
-            return False
-        for key in keys:
-            k = str(key).strip()
-            if not k:
-                continue
-            print(f"[REJOIN UI] pressing key {k}")
-            pyautogui.press(k)
-            time.sleep(max(0.0, delay))
-        return True
-    if step_type == "join_server_macro":
-        hotkey = step.get("hotkey", ["f1"])
-        if isinstance(hotkey, list) and hotkey:
-            print(f"[REJOIN UI] pressing join macro {'+'.join([str(k) for k in hotkey])}")
-            pyautogui.hotkey(*[str(k) for k in hotkey])
-            return True
-        return False
-    if step_type == "verify_in_game_presence":
-        print("[REJOIN UI] verify_in_game_presence checkpoint")
-        return True
-    return True
+    return False
 
 
 def execute_rejoin_sequence():
     seq = get_rejoin_sequence_config()
     steps = seq.get("steps", [])
     valid_steps = [s for s in steps if isinstance(s, dict) and str(s.get("type", "")).strip()]
-    if not valid_steps:
+    if not seq.get("enabled", True) or not valid_steps:
         print("[REJOIN UI] no valid rejoin sequence configured")
         print("[REJOIN UI] cannot attempt automatic join without configured steps")
         return False
