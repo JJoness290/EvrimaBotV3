@@ -165,6 +165,16 @@ bot_runtime_state = {
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
 }
+admin_runtime_state = {
+    "outage_active": False,
+    "outage_started_at": None,
+    "outage_issue_count": 0,
+    "manual_issues": [],
+    "last_alert_sent_at": None,
+    "offline_reminder_sent_at": 0.0,
+    "last_seen_in_game_at": None,
+    "last_dashboard_refresh_at": 0.0,
+}
 
 PLAYER_DATA_LOCK = threading.RLock()
 PURCHASES_LOCK = threading.RLock()
@@ -1355,6 +1365,52 @@ def get_ui_control_config():
     }
 
 
+def get_admin_dashboard_config():
+    section = ConfigManager.get_section("admin_dashboard")
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "channel_id": int(section.get("channel_id", 0) or 0),
+        "refresh_interval_seconds": int(section.get("refresh_interval_seconds", 60) or 60),
+    }
+
+
+def get_admin_alerts_config():
+    section = ConfigManager.get_section("admin_alerts")
+    return {
+        "enabled": bool(section.get("enabled", True)),
+        "channel_id": int(section.get("channel_id", 0) or 0),
+        "ping_role_id": int(section.get("ping_role_id", 0) or 0),
+        "ping_user_ids": section.get("ping_user_ids", []) if isinstance(section.get("ping_user_ids", []), list) else [],
+        "send_immediate_offline_alert": bool(section.get("send_immediate_offline_alert", True)),
+        "send_recovery_alert": bool(section.get("send_recovery_alert", True)),
+    }
+
+
+def is_admin_bot_online():
+    return bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME
+
+
+def _format_duration(seconds_value: float | int | None):
+    if not seconds_value:
+        return "0m"
+    secs = int(max(0, seconds_value))
+    h, rem = divmod(secs, 3600)
+    m, _ = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _fmt_ts(ts_value):
+    if not ts_value:
+        return "—"
+    if isinstance(ts_value, str):
+        return ts_value
+    try:
+        return datetime.fromtimestamp(float(ts_value), tz=timezone.utc).isoformat()
+    except Exception:
+        return str(ts_value)
+
 def _execute_rejoin_ui_step(step: dict):
     def _calc_click(step_obj: dict):
         base_x = int(step_obj.get("x", 0))
@@ -1685,6 +1741,162 @@ async def send_restart_incident(title: str, description: str, color: discord.Col
         return
 
 
+async def get_admin_alert_channel():
+    cfg = get_admin_alerts_config()
+    if cfg["channel_id"]:
+        ch = bot.get_channel(cfg["channel_id"])
+        if ch:
+            return ch
+    return await get_restarts_channel()
+
+
+async def send_admin_transition_alert(is_offline: bool):
+    cfg = get_admin_alerts_config()
+    if not cfg["enabled"]:
+        return
+    if is_offline and not cfg["send_immediate_offline_alert"]:
+        return
+    if (not is_offline) and not cfg["send_recovery_alert"]:
+        return
+    channel = await get_admin_alert_channel()
+    if not channel:
+        return
+    if is_offline and admin_runtime_state.get("last_alert_type") == "offline":
+        print("[ALERT] skipped duplicate offline alert")
+        return
+    if (not is_offline) and admin_runtime_state.get("last_alert_type") == "recovery":
+        return
+
+    mentions = []
+    if cfg["ping_role_id"]:
+        mentions.append(f"<@&{cfg['ping_role_id']}>")
+    for uid in cfg["ping_user_ids"]:
+        try:
+            mentions.append(f"<@{int(uid)}>")
+        except Exception:
+            continue
+    mention_text = " ".join(mentions).strip()
+
+    if is_offline:
+        embed = discord.Embed(
+            title="Admin Bot Went Offline",
+            description=(
+                "The in-game admin bot has just gone offline.\n\n"
+                "Purchases and claims are now temporarily disabled.\n"
+                "Players are being told to open a ticket."
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await channel.send(content=mention_text or None, embed=embed)
+        admin_runtime_state["last_alert_type"] = "offline"
+        admin_runtime_state["last_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
+        print("[ALERT] immediate offline alert sent")
+    else:
+        embed = discord.Embed(
+            title="Admin Bot Restored",
+            description="The in-game admin bot is back online.\n\nPurchases and claims are enabled again.",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await channel.send(content=mention_text or None, embed=embed)
+        admin_runtime_state["last_alert_type"] = "recovery"
+        admin_runtime_state["last_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
+        print("[ALERT] recovery alert sent")
+
+
+def record_manual_issue(ctx, command_name: str, item: str = ""):
+    if is_admin_bot_online():
+        return
+    issue = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_id": int(ctx.author.id),
+        "username": ctx.author.display_name,
+        "command": command_name,
+        "item": item,
+    }
+    admin_runtime_state["manual_issues"].append(issue)
+    if len(admin_runtime_state["manual_issues"]) > 100:
+        admin_runtime_state["manual_issues"] = admin_runtime_state["manual_issues"][-100:]
+    admin_runtime_state["outage_issue_count"] = int(admin_runtime_state.get("outage_issue_count", 0)) + 1
+    print(f"[MANUAL ISSUE] recorded blocked {command_name} for user {ctx.author.id}")
+
+
+async def get_admin_dashboard_channel():
+    cfg = get_admin_dashboard_config()
+    if cfg["channel_id"]:
+        ch = bot.get_channel(cfg["channel_id"])
+        if ch:
+            return ch
+    return await get_restarts_channel()
+
+
+def build_admin_dashboard_embed():
+    online = is_admin_bot_online()
+    now = time.time()
+    offline_duration = "—"
+    if not online:
+        started = admin_runtime_state.get("outage_started_at")
+        if started:
+            offline_duration = _format_duration(now - float(started))
+
+    issues = []
+    if not online:
+        issues.append("admin bot offline")
+    if admin_runtime_state.get("outage_issue_count", 0) > 0:
+        issues.append("support notifications sent")
+    issues_text = ", ".join(issues) if issues else "none"
+
+    embed = discord.Embed(
+        title="Primal Abyss Admin Bot Dashboard",
+        color=discord.Color.green() if online else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Admin Bot", value="ONLINE ✅" if online else "OFFLINE ❌", inline=True)
+    embed.add_field(name="Purchases", value="enabled ✅" if online else "disabled ❌", inline=True)
+    embed.add_field(name="Claims", value="enabled ✅" if online else "disabled ❌", inline=True)
+    embed.add_field(name="Offline Duration", value=offline_duration, inline=True)
+    embed.add_field(name="Last Seen", value=_fmt_ts(admin_runtime_state.get("last_seen_in_game_at")), inline=True)
+    embed.add_field(name="Last Sustain", value=_fmt_ts(bot_runtime_state.get("last_sustain_at")), inline=True)
+    embed.add_field(name="Pending Manual Issues", value=str(int(admin_runtime_state.get("outage_issue_count", 0))), inline=True)
+    embed.add_field(name="Current Issues", value=issues_text, inline=False)
+    embed.add_field(name="Last Alert Sent", value=_fmt_ts(admin_runtime_state.get("last_alert_sent_at")), inline=True)
+    latest = admin_runtime_state.get("manual_issues", [])[-1]["timestamp"] if admin_runtime_state.get("manual_issues") else "—"
+    embed.add_field(name="Latest Blocked Request", value=latest, inline=True)
+    return embed
+
+
+async def refresh_admin_dashboard(force: bool = False):
+    cfg = get_admin_dashboard_config()
+    if not cfg["enabled"]:
+        return
+    now = time.time()
+    if (not force) and (now - float(admin_runtime_state.get("last_dashboard_refresh_at", 0.0)) < cfg["refresh_interval_seconds"]):
+        return
+    channel = await get_admin_dashboard_channel()
+    if not channel:
+        return
+
+    embed = build_admin_dashboard_embed()
+    message_id = restart_cycle_state.get("admin_dashboard_message_id")
+    if message_id:
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(embed=embed, content=None)
+            admin_runtime_state["last_dashboard_refresh_at"] = now
+            print("[DASHBOARD] updated")
+            return
+        except Exception:
+            restart_cycle_state["admin_dashboard_message_id"] = None
+            save_state()
+            print("[DASHBOARD] recreated after missing message")
+    sent = await channel.send(embed=embed)
+    restart_cycle_state["admin_dashboard_message_id"] = int(sent.id)
+    restart_cycle_state["admin_dashboard_channel_id"] = int(channel.id)
+    save_state()
+    admin_runtime_state["last_dashboard_refresh_at"] = now
+    print("[DASHBOARD] created admin dashboard message")
+
 def _classify_health_status():
     rcon_ok = detect_server_back_up()
     lines, sftp_err = read_remote_log_tail(2048)
@@ -1806,6 +2018,12 @@ async def process_bot_presence_and_recovery(players: dict):
 
     present = is_bot_present_in_players(players)
     if present:
+        admin_runtime_state["last_seen_in_game_at"] = datetime.now(timezone.utc).isoformat()
+        if admin_runtime_state.get("outage_active"):
+            admin_runtime_state["outage_active"] = False
+            admin_runtime_state["outage_started_at"] = None
+            admin_runtime_state["offline_reminder_sent_at"] = 0.0
+            await send_admin_transition_alert(False)
         if bot_runtime_state.get("rejoin_started_at"):
             print("[REJOIN] bot detected in playerlist, success")
         if bot_runtime_state.get("presence_state") != BOT_STATE_IN_GAME:
@@ -1825,6 +2043,21 @@ async def process_bot_presence_and_recovery(players: dict):
                 print("[BOT PRESENCE] bot account detected in player list")
                 bot_runtime_state["last_presence_log_at"] = now
     else:
+        if not admin_runtime_state.get("outage_active"):
+            admin_runtime_state["outage_active"] = True
+            admin_runtime_state["outage_started_at"] = time.time()
+            admin_runtime_state["outage_issue_count"] = 0
+            admin_runtime_state["manual_issues"] = []
+            await send_admin_transition_alert(True)
+        else:
+            now_ts = time.time()
+            if now_ts - float(admin_runtime_state.get("offline_reminder_sent_at", 0.0)) >= 300:
+                await send_restart_incident(
+                    "Admin Bot Offline",
+                    "Admin bot is still offline after 5 minutes. Purchases/claims remain disabled.",
+                    discord.Color.red(),
+                )
+                admin_runtime_state["offline_reminder_sent_at"] = now_ts
         if not bot_runtime_state.get("missing_since"):
             bot_runtime_state["missing_since"] = now
             print("[BOT PRESENCE] bot account missing from player list")
@@ -1895,6 +2128,7 @@ async def process_bot_presence_and_recovery(players: dict):
         if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 60:
             print("[BOT SUSTAIN] skipped because bot not confirmed in-game")
             bot_runtime_state["last_presence_log_at"] = now
+    await refresh_admin_dashboard()
 
 def get_players_from_rcon():
     raw = run_rcon("list")
@@ -2597,6 +2831,7 @@ async def on_ready():
         "Bot systems reconnected and monitoring has resumed.",
         discord.Color.green(),
     )
+    await refresh_admin_dashboard(force=True)
 
 
 @announcement_loop.before_loop
@@ -2761,6 +2996,10 @@ async def shop(ctx):
 @bot.command()
 async def buy(ctx, item: str):
     expire_old_purchases()
+    if not is_admin_bot_online():
+        record_manual_issue(ctx, "!buy", item)
+        await ctx.send("⚠️ Purchases are temporarily disabled while the admin bot is offline. Please open a support ticket.")
+        return
 
     item = item.lower().strip()
     price, category = find_shop_price(item)
@@ -2837,6 +3076,10 @@ async def buy(ctx, item: str):
 @bot.command()
 async def claim(ctx):
     expire_old_purchases()
+    if not is_admin_bot_online():
+        record_manual_issue(ctx, "!claim", "")
+        await ctx.send("⚠️ Claims are temporarily disabled while the admin bot is offline. Please open a support ticket.")
+        return
 
     player, steam_id = get_player(ctx)
 
@@ -3032,6 +3275,33 @@ async def mousepos(ctx):
     msg = f"[CALIBRATE] x={int(pos.x)} y={int(pos.y)}"
     print(msg)
     await ctx.send(msg)
+
+
+@bot.command()
+async def botstatus(ctx):
+    if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
+        await ctx.send("❌ Admin only.")
+        return
+    await refresh_admin_dashboard(force=True)
+    await ctx.send(embed=build_admin_dashboard_embed())
+
+
+@bot.command()
+async def botissues(ctx):
+    if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
+        await ctx.send("❌ Admin only.")
+        return
+    issues = admin_runtime_state.get("manual_issues", [])
+    if not issues:
+        await ctx.send("No blocked requests recorded in the current outage.")
+        return
+    lines = ["Recent blocked requests:"]
+    for issue in issues[-10:]:
+        lines.append(
+            f"- {issue.get('timestamp')} | {issue.get('command')} | "
+            f"{issue.get('username')} ({issue.get('user_id')}) {issue.get('item')}"
+        )
+    await ctx.send("\n".join(lines))
 
 
 if __name__ == "__main__":

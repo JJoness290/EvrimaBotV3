@@ -145,5 +145,18 @@
       "thirst": {"x": 0, "y": 0},
       "health": {"x": 0, "y": 0}
     }
+  },
+  "admin_dashboard": {
+    "enabled": true,
+    "channel_id": 0,
+    "refresh_interval_seconds": 60
+  },
+  "admin_alerts": {
+    "enabled": true,
+    "channel_id": 0,
+    "ping_role_id": 0,
+    "ping_user_ids": [],
+    "send_immediate_offline_alert": true,
+    "send_recovery_alert": true
   }
 }
