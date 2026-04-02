@@ -1356,6 +1356,15 @@ def get_ui_control_config():
 
 
 def _execute_rejoin_ui_step(step: dict):
+    def _calc_click(step_obj: dict):
+        base_x = int(step_obj.get("x", 0))
+        base_y = int(step_obj.get("y", 0))
+        offset_x = int(step_obj.get("offset_x", 0) or 0)
+        offset_y = int(step_obj.get("offset_y", 0) or 0)
+        final_x = base_x + offset_x
+        final_y = base_y + offset_y
+        return base_x, base_y, offset_x, offset_y, final_x, final_y
+
     step_type = str(step.get("type", "")).strip().lower()
     if step_type == "focus_window":
         print("[MACRO] focusing game window")
@@ -1386,19 +1395,45 @@ def _execute_rejoin_ui_step(step: dict):
         label = str(step.get("label", "")).strip() or "unnamed"
         if "x" not in step or "y" not in step:
             return False
-        x = int(step.get("x"))
-        y = int(step.get("y"))
-        print(f"[MACRO] clicking {label} x={x} y={y}")
+        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
+        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
+        pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
+        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
+        print(f"[MACRO] clicking {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
+        if pre_delay > 0:
+            time.sleep(pre_delay)
         pyautogui.click(x, y)
+        if post_delay > 0:
+            time.sleep(post_delay)
         return True
     if step_type == "double_click_position":
         label = str(step.get("label", "")).strip() or "unnamed"
         if "x" not in step or "y" not in step:
             return False
-        x = int(step.get("x"))
-        y = int(step.get("y"))
-        print(f"[MACRO] clicking {label} x={x} y={y}")
+        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
+        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
+        pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
+        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
+        print(f"[MACRO] clicking {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
+        if pre_delay > 0:
+            time.sleep(pre_delay)
         pyautogui.doubleClick(x, y)
+        if post_delay > 0:
+            time.sleep(post_delay)
+        return True
+    if step_type == "move_only_position":
+        label = str(step.get("label", "")).strip() or "unnamed"
+        if "x" not in step or "y" not in step:
+            return False
+        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
+        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
+        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
+        print(f"[MACRO] moving {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
+        if post_delay > 0:
+            time.sleep(post_delay)
         return True
     if step_type == "type_text":
         text = str(step.get("text", ""))

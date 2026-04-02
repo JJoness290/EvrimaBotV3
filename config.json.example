@@ -61,18 +61,74 @@
     "steps": [
       {"type": "focus_window", "window_title_contains": "The Isle"},
       {"type": "wait_seconds", "seconds": 2},
-      {"type": "click_position", "x": 126, "y": 395, "label": "play_button"},
+      {
+        "type": "click_position",
+        "x": 126,
+        "y": 395,
+        "offset_x": 0,
+        "offset_y": 18,
+        "move_duration_seconds": 0.15,
+        "pre_click_delay_seconds": 0.1,
+        "post_click_delay_seconds": 0.5,
+        "label": "play_button"
+      },
       {"type": "wait_seconds", "seconds": 8},
-      {"type": "click_position", "x": 1443, "y": 360, "label": "session_filter"},
+      {
+        "type": "click_position",
+        "x": 1443,
+        "y": 360,
+        "offset_x": 0,
+        "offset_y": 0,
+        "move_duration_seconds": 0.15,
+        "pre_click_delay_seconds": 0.05,
+        "post_click_delay_seconds": 0.3,
+        "label": "session_filter"
+      },
       {"type": "wait_seconds", "seconds": 1},
-      {"type": "click_position", "x": 1437, "y": 445, "label": "unofficial_option"},
+      {
+        "type": "click_position",
+        "x": 1437,
+        "y": 445,
+        "offset_x": 0,
+        "offset_y": 0,
+        "move_duration_seconds": 0.15,
+        "post_click_delay_seconds": 0.3,
+        "label": "unofficial_option"
+      },
       {"type": "wait_seconds", "seconds": 1},
-      {"type": "click_position", "x": 1388, "y": 164, "label": "search_box"},
+      {
+        "type": "click_position",
+        "x": 1388,
+        "y": 164,
+        "offset_x": 0,
+        "offset_y": 0,
+        "move_duration_seconds": 0.15,
+        "post_click_delay_seconds": 0.2,
+        "label": "search_box"
+      },
       {"type": "type_text", "text": "primal abyss"},
       {"type": "wait_seconds", "seconds": 3},
-      {"type": "click_position", "x": 534, "y": 129, "label": "server_row"},
+      {
+        "type": "click_position",
+        "x": 534,
+        "y": 129,
+        "offset_x": 0,
+        "offset_y": 0,
+        "move_duration_seconds": 0.15,
+        "post_click_delay_seconds": 0.2,
+        "label": "server_row"
+      },
       {"type": "wait_seconds", "seconds": 1},
-      {"type": "click_position", "x": 1395, "y": 757, "label": "connect_button"},
+      {
+        "type": "click_position",
+        "x": 1395,
+        "y": 757,
+        "offset_x": 0,
+        "offset_y": 0,
+        "move_duration_seconds": 0.15,
+        "post_click_delay_seconds": 0.5,
+        "label": "connect_button"
+      },
       {"type": "wait_seconds", "seconds": 25}
     ]
   },
