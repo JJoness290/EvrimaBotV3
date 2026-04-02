@@ -137,94 +137,6 @@ def is_command_expired(command_entry: dict):
     return age > max_age_seconds
 
 
-def execute_recovery_step(command_entry: dict):
-    try:
-        step = json.loads(str(command_entry.get("command", "{}")))
-    except Exception:
-        step = {"type": "type_text", "text": command_entry.get("command", "")}
-    step_type = str(step.get("type", "")).strip().lower()
-    if step_type == "open_admin_panel":
-        key = str(step.get("key", "insert")).strip().lower() or "insert"
-        print("[BOT UI] opening admin panel")
-        pyautogui.press(key)
-        time.sleep(1.0)
-        return
-    if step_type == "close_admin_panel":
-        key = str(step.get("key", "insert")).strip().lower() or "insert"
-        pyautogui.press(key)
-        return
-    if step_type == "select_self_player":
-        print("[BOT UI] selecting player")
-        row = step.get("player_row", {}) if isinstance(step.get("player_row"), dict) else {}
-        if "x" in row and "y" in row:
-            pyautogui.click(int(row["x"]), int(row["y"]))
-            time.sleep(0.25)
-        return
-    if step_type == "set_stat":
-        stat_name = str(step.get("stat_name", "")).strip().lower()
-        value = str(step.get("value", 100))
-        print(f"[BOT UI] setting {stat_name}={value}")
-        buttons = step.get("buttons", {}) if isinstance(step.get("buttons"), dict) else {}
-        input_box = step.get("input_box", {}) if isinstance(step.get("input_box"), dict) else {}
-        b = buttons.get(stat_name, {})
-        if isinstance(b, dict) and "x" in b and "y" in b:
-            pyautogui.click(int(b["x"]), int(b["y"]))
-            time.sleep(0.2)
-        if "x" in input_box and "y" in input_box:
-            pyautogui.click(int(input_box["x"]), int(input_box["y"]))
-            time.sleep(0.2)
-        pyautogui.hotkey("ctrl", "a")
-        pyautogui.write(value)
-        pyautogui.press("enter")
-        return
-    if step_type == "wait_seconds":
-        time.sleep(max(0, int(step.get("seconds", 1))))
-        return
-    if step_type == "press_key":
-        pyautogui.press(str(step.get("key", "enter")))
-        return
-    if step_type == "hotkey":
-        keys = step.get("keys", [])
-        if isinstance(keys, list) and keys:
-            pyautogui.hotkey(*[str(k) for k in keys])
-        return
-    if step_type == "click_position":
-        pyautogui.click(int(step.get("x", 0)), int(step.get("y", 0)))
-        return
-    if step_type == "type_text":
-        text = str(step.get("text", ""))
-        if text:
-            pyautogui.write(text)
-        return
-    if step_type in {"focus_window", "join_server_macro", "verify_in_game_presence", "click_image"}:
-        # best-effort placeholder; user-configurable macro images/coordinates can be layered later
-        time.sleep(max(0, int(step.get("seconds", 1) or 1)))
-        return
-
-
-def run_recovery_hook_if_enabled(commands_data, command_entry):
-    cfg = load_config()
-    if not cfg.get("executor_enable_recovery_hook", False):
-        return
-    command_type = str(command_entry.get("command_type", "")).lower()
-    if command_type != "recovery_command":
-        return
-
-    hook_sequence = cfg.get("executor_recovery_macro", [])
-    if not isinstance(hook_sequence, list):
-        return
-
-    for text in hook_sequence:
-        command_text = str(text).strip()
-        if not command_text:
-            continue
-        try:
-            type_command(command_text)
-            time.sleep(max(0, int(cfg.get("executor_recovery_macro_delay", 2))))
-        except Exception:
-            continue
-
-
 def get_pending_group_ids(commands_data):
     grouped = [
         c for c in commands_data
@@ -284,18 +196,18 @@ def process_group(commands_data, claim_group_id: str) -> bool:
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
 
         try:
-            run_recovery_hook_if_enabled(commands_data, command_entry)
             ctype = str(command_entry.get("command_type", "")).lower()
             if ctype in {"recovery", "recovery_command"}:
-                print("[EXECUTOR] processing recovery command")
-                execute_recovery_step(command_entry)
+                command_entry["status"] = "SKIPPED"
+                command_entry["completed_at"] = now_iso()
+                command_entry["error"] = "Recovery automation removed"
+                changed = True
+                save_commands(commands_data)
+                continue
             elif ctype in {"sustain", "sustain_command"}:
                 print("[EXECUTOR] processing sustain command")
-                if str(command_text).strip().startswith("{"):
-                    execute_recovery_step(command_entry)
-                else:
-                    type_command(command_text)
-                    time.sleep(get_delay_for_command(command_text))
+                type_command(command_text)
+                time.sleep(get_delay_for_command(command_text))
             else:
                 print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
                 type_command(command_text)

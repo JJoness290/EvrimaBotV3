@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 from typing import Any
 
 import paramiko
-import pyautogui
 
 TOKEN = ""
 
@@ -143,10 +142,7 @@ PATREON_TIER_RATES = {
 }
 BOT_STATE_IN_GAME = "BOT_IN_GAME"
 BOT_STATE_MISSING = "BOT_MISSING"
-BOT_STATE_REJOINING = "BOT_REJOINING"
 BOT_STATE_WAITING_SERVER = "BOT_WAITING_FOR_SERVER"
-BOT_STATE_RECOVERING = "BOT_RECOVERING"
-BOT_STATE_FAILED = "BOT_FAILED_REJOIN"
 
 SERVER_STATE_ONLINE = "SERVER_ONLINE"
 SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
@@ -158,10 +154,6 @@ bot_runtime_state = {
     "presence_state": BOT_STATE_MISSING,
     "server_state": SERVER_STATE_ONLINE,
     "missing_since": None,
-    "rejoin_attempt": 0,
-    "rejoin_in_progress": False,
-    "next_rejoin_after": 0.0,
-    "rejoin_started_at": 0.0,
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
 }
@@ -1293,75 +1285,18 @@ def get_bot_presence_config():
         "player_name": os.getenv("BOT_PLAYER_NAME", str(section.get("player_name", "")).strip()),
         "steam_id": os.getenv("BOT_STEAM_ID", str(section.get("steam_id", "")).strip()),
         "missing_grace_seconds": int(section.get("missing_grace_seconds", 60) or 60),
-        "confirm_rejoin_timeout_seconds": int(section.get("confirm_rejoin_timeout_seconds", 120) or 120),
-    }
-
-
-def get_server_recovery_config():
-    section = ConfigManager.get_section("server_recovery")
-    retries = section.get("retry_backoff_seconds", [10, 20, 30, 60, 60, 120])
-    if not isinstance(retries, list) or not retries:
-        retries = [10, 20, 30, 60, 60, 120]
-    return {
-        "enabled": bool(section.get("enabled", True)),
-        "max_rejoin_attempts": int(os.getenv("BOT_REJOIN_MAX_ATTEMPTS", section.get("max_rejoin_attempts", 10)) or 10),
-        "retry_backoff_seconds": [max(5, int(x)) for x in retries],
-        "server_back_online_confirm_checks": int(section.get("server_back_online_confirm_checks", 2) or 2),
     }
 
 
 def get_bot_sustain_config():
     section = ConfigManager.get_section("bot_sustain")
-    ui_section = ConfigManager.get_section("ui_control")
     commands = section.get("commands", ["/hunger 100", "/thirst 100", "/health 100"])
     if not isinstance(commands, list) or not commands:
         commands = ["/hunger 100", "/thirst 100", "/health 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
-        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", ui_section.get("loop_interval", 90))) or 90),
+        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
         "commands": [str(x).strip() for x in commands if str(x).strip()],
-    }
-
-
-def get_rejoin_sequence_config():
-    section = ConfigManager.get_section("coordinate_join_macro")
-    steps = section.get("steps", [
-        {"type": "focus_window", "window_title_contains": "The Isle"},
-        {"type": "wait_seconds", "seconds": 2},
-        {"type": "click_position", "x": 126, "y": 395, "label": "play_button"},
-        {"type": "wait_seconds", "seconds": 8},
-        {"type": "click_position", "x": 1443, "y": 360, "label": "session_filter"},
-        {"type": "wait_seconds", "seconds": 1},
-        {"type": "click_position", "x": 1437, "y": 445, "label": "unofficial_option"},
-        {"type": "wait_seconds", "seconds": 1},
-        {"type": "click_position", "x": 1388, "y": 164, "label": "search_box"},
-        {"type": "type_text", "text": "primal abyss"},
-        {"type": "wait_seconds", "seconds": 3},
-        {"type": "click_position", "x": 534, "y": 129, "label": "server_row"},
-        {"type": "wait_seconds", "seconds": 1},
-        {"type": "click_position", "x": 1395, "y": 757, "label": "connect_button"},
-        {"type": "wait_seconds", "seconds": 25},
-    ])
-    if not isinstance(steps, list):
-        steps = []
-    return {
-        "enabled": bool(section.get("enabled", True)),
-        "post_step_delay_seconds": float(section.get("post_step_delay_seconds", 0.5) or 0.0),
-        "steps": steps,
-    }
-
-
-def get_ui_control_config():
-    section = ConfigManager.get_section("ui_control")
-    return {
-        "use_admin_panel": bool(section.get("use_admin_panel", True)),
-        "player_name": str(section.get("player_name", get_bot_presence_config().get("player_name", "JJoness290"))),
-        "open_panel_key": str(section.get("open_panel_key", "insert")),
-        "stat_delay": float(section.get("stat_delay", 0.5) or 0.5),
-        "loop_interval": int(section.get("loop_interval", 90) or 90),
-        "buttons": section.get("buttons", {}),
-        "input_box": section.get("input_box", {}),
-        "player_row": section.get("player_row", {}),
     }
 
 
@@ -1411,136 +1346,17 @@ def _fmt_ts(ts_value):
     except Exception:
         return str(ts_value)
 
-def _execute_rejoin_ui_step(step: dict):
-    def _calc_click(step_obj: dict):
-        base_x = int(step_obj.get("x", 0))
-        base_y = int(step_obj.get("y", 0))
-        offset_x = int(step_obj.get("offset_x", 0) or 0)
-        offset_y = int(step_obj.get("offset_y", 0) or 0)
-        final_x = base_x + offset_x
-        final_y = base_y + offset_y
-        return base_x, base_y, offset_x, offset_y, final_x, final_y
-
-    step_type = str(step.get("type", "")).strip().lower()
-    if step_type == "focus_window":
-        print("[MACRO] focusing game window")
-        focus_click = step.get("focus_click", {})
-        try:
-            if isinstance(focus_click, dict) and "x" in focus_click and "y" in focus_click:
-                pyautogui.click(int(focus_click["x"]), int(focus_click["y"]))
-                print("[REJOIN UI] game window focused successfully")
-            else:
-                pyautogui.press("alt")
-                print("[REJOIN UI] game window focused successfully")
-            return True
-        except Exception:
-            print("[REJOIN UI] game window focused failed")
-            return False
-    if step_type == "press_key":
-        key = str(step.get("key", "esc"))
-        print(f"[REJOIN UI] pressing key {key}")
-        pyautogui.press(key)
-        return True
-    if step_type == "hotkey":
-        keys = step.get("keys", [])
-        if isinstance(keys, list) and keys:
-            print(f"[REJOIN UI] pressing hotkey {'+'.join([str(k) for k in keys])}")
-            pyautogui.hotkey(*[str(k) for k in keys])
-        return True
-    if step_type == "click_position":
-        label = str(step.get("label", "")).strip() or "unnamed"
-        if "x" not in step or "y" not in step:
-            return False
-        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
-        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
-        pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
-        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
-        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
-        if pre_delay > 0:
-            time.sleep(pre_delay)
-        pyautogui.click(x, y)
-        if post_delay > 0:
-            time.sleep(post_delay)
-        return True
-    if step_type == "double_click_position":
-        label = str(step.get("label", "")).strip() or "unnamed"
-        if "x" not in step or "y" not in step:
-            return False
-        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
-        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
-        pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
-        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
-        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
-        if pre_delay > 0:
-            time.sleep(pre_delay)
-        pyautogui.doubleClick(x, y)
-        if post_delay > 0:
-            time.sleep(post_delay)
-        return True
-    if step_type == "move_only_position":
-        label = str(step.get("label", "")).strip() or "unnamed"
-        if "x" not in step or "y" not in step:
-            return False
-        base_x, base_y, off_x, off_y, x, y = _calc_click(step)
-        move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
-        post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
-        pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
-        if post_delay > 0:
-            time.sleep(post_delay)
-        return True
-    if step_type == "type_text":
-        text = str(step.get("text", ""))
-        print(f"[MACRO] typing {text}")
-        pyautogui.write(text)
-        return True
-    if step_type == "wait_seconds":
-        seconds = float(step.get("seconds", 1))
-        print(f"[REJOIN UI] waiting {seconds} seconds")
-        time.sleep(max(0.0, seconds))
-        return True
-    return False
-
-
-def execute_rejoin_sequence():
-    seq = get_rejoin_sequence_config()
-    steps = seq.get("steps", [])
-    valid_steps = [s for s in steps if isinstance(s, dict) and str(s.get("type", "")).strip()]
-    if not seq.get("enabled", True) or not valid_steps:
-        print("[REJOIN UI] no valid rejoin sequence configured")
-        print("[REJOIN UI] cannot attempt automatic join without configured steps")
-        return False
-    try:
-        for step in valid_steps:
-            ok = _execute_rejoin_ui_step(step if isinstance(step, dict) else {})
-            if not ok:
-                raise RuntimeError(f"Step failed: {step}")
-            post_delay = float(seq.get("post_step_delay_seconds", 0.0) or 0.0)
-            if post_delay > 0:
-                time.sleep(post_delay)
-        print("[REJOIN UI] join sequence complete")
-        return True
-    except Exception as e:
-        print(f"[REJOIN UI] join sequence failed: {e}")
-        return False
-
 
 def is_bot_present_in_players(players: dict):
     cfg = get_bot_presence_config()
     target_name = str(cfg.get("player_name", "")).strip().lower()
     target_steam = str(cfg.get("steam_id", "")).strip()
-    print("[BOT PRESENCE] checking for configured bot player")
     if target_steam and target_steam in players:
-        print(f"[BOT PRESENCE] matched by steam id {target_steam}")
         return True
     if target_name:
         for steam_id, name in players.items():
             if str(name).strip().lower() == target_name:
-                print(f"[BOT PRESENCE] matched by player name {name} steam={steam_id}")
                 return True
-    print("[BOT PRESENCE] bot not found in current playerlist")
     return False
 
 
@@ -1556,85 +1372,28 @@ def queue_priority_commands(commands: list[dict]):
         save_game_commands(existing)
 
 
-def build_rejoin_executor_commands():
-    seq = get_rejoin_sequence_config()
-    steps = seq.get("steps", [])
-    payload = []
+def queue_sustain_commands():
+    cfg = get_bot_sustain_config()
     now_iso = datetime.now(timezone.utc).isoformat()
-    for i, step in enumerate(steps, start=1):
+    payload = []
+    for i, cmd in enumerate(cfg["commands"], start=1):
         payload.append({
             "steam_id": "__bot__",
             "player_name": "SYSTEM",
-            "item": "rejoin",
-            "command": json.dumps(step),
+            "item": "sustain",
+            "command": cmd,
             "status": "PENDING",
             "created_at": now_iso,
             "completed_at": None,
-            "claim_group_id": f"rejoin_{int(time.time())}",
+            "claim_group_id": f"sustain_{int(time.time())}",
             "claim_step": i,
-            "claim_final": i == len(steps),
-            "claim_phase": "RECOVERY",
-            "command_type": "recovery",
-            "priority": 100,
-            "requires_bot_in_game": False,
-            "max_age_seconds": 300,
+            "claim_final": i == len(cfg["commands"]),
+            "claim_phase": "SUSTAIN",
+            "command_type": "sustain",
+            "priority": 10,
+            "requires_bot_in_game": True,
+            "max_age_seconds": cfg["interval_seconds"] * 2,
         })
-    return payload
-
-
-def queue_sustain_commands():
-    cfg = get_bot_sustain_config()
-    ui = get_ui_control_config()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload = []
-    if ui["use_admin_panel"]:
-        steps = [
-            {"type": "open_admin_panel", "key": ui["open_panel_key"]},
-            {"type": "select_self_player", "player_name": ui["player_name"], "player_row": ui.get("player_row", {})},
-            {"type": "set_stat", "stat_name": "hunger", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
-            {"type": "wait_seconds", "seconds": ui["stat_delay"]},
-            {"type": "set_stat", "stat_name": "thirst", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
-            {"type": "wait_seconds", "seconds": ui["stat_delay"]},
-            {"type": "set_stat", "stat_name": "health", "value": 100, "buttons": ui.get("buttons", {}), "input_box": ui.get("input_box", {})},
-            {"type": "close_admin_panel", "key": ui["open_panel_key"]},
-        ]
-        for i, step in enumerate(steps, start=1):
-            payload.append({
-                "steam_id": "__bot__",
-                "player_name": "SYSTEM",
-                "item": "sustain",
-                "command": json.dumps(step),
-                "status": "PENDING",
-                "created_at": now_iso,
-                "completed_at": None,
-                "claim_group_id": f"sustain_{int(time.time())}",
-                "claim_step": i,
-                "claim_final": i == len(steps),
-                "claim_phase": "SUSTAIN",
-                "command_type": "sustain",
-                "priority": 10,
-                "requires_bot_in_game": True,
-                "max_age_seconds": cfg["interval_seconds"] * 2,
-            })
-    else:
-        for i, cmd in enumerate(cfg["commands"], start=1):
-            payload.append({
-                "steam_id": "__bot__",
-                "player_name": "SYSTEM",
-                "item": "sustain",
-                "command": cmd,
-                "status": "PENDING",
-                "created_at": now_iso,
-                "completed_at": None,
-                "claim_group_id": f"sustain_{int(time.time())}",
-                "claim_step": i,
-                "claim_final": i == len(cfg["commands"]),
-                "claim_phase": "SUSTAIN",
-                "command_type": "sustain",
-                "priority": 10,
-                "requires_bot_in_game": True,
-                "max_age_seconds": cfg["interval_seconds"] * 2,
-            })
     queue_priority_commands(payload)
 
 async def get_restarts_channel():
@@ -1791,7 +1550,7 @@ async def send_admin_transition_alert(is_offline: bool):
         await channel.send(content=mention_text or None, embed=embed)
         admin_runtime_state["last_alert_type"] = "offline"
         admin_runtime_state["last_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
-        print("[ALERT] immediate offline alert sent")
+        print("[ALERT] offline alert sent")
         await refresh_admin_dashboard(force=True)
     else:
         embed = discord.Embed(
@@ -2005,7 +1764,6 @@ def map_server_state():
 
 async def process_bot_presence_and_recovery(players: dict):
     cfg_presence = get_bot_presence_config()
-    cfg_recovery = get_server_recovery_config()
     cfg_sustain = get_bot_sustain_config()
     now = time.time()
 
@@ -2014,7 +1772,7 @@ async def process_bot_presence_and_recovery(players: dict):
     if not server_is_online:
         bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
         if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 30:
-            print("[BOT PRESENCE] grace period active")
+            print("[ADMIN BOT] offline")
             bot_runtime_state["last_presence_log_at"] = now
         return
 
@@ -2026,23 +1784,17 @@ async def process_bot_presence_and_recovery(players: dict):
             admin_runtime_state["outage_started_at"] = None
             admin_runtime_state["offline_reminder_sent_at"] = 0.0
             await send_admin_transition_alert(False)
-        if bot_runtime_state.get("rejoin_started_at"):
-            print("[REJOIN] bot detected in playerlist, success")
         if bot_runtime_state.get("presence_state") != BOT_STATE_IN_GAME:
             bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
             bot_runtime_state["missing_since"] = None
-            bot_runtime_state["rejoin_attempt"] = 0
-            bot_runtime_state["rejoin_in_progress"] = False
-            bot_runtime_state["rejoin_started_at"] = 0.0
-            await send_restart_incident(
-                "Bot Rejoined",
-                "The in-game bot account has rejoined successfully and sustain mode is active.",
-                discord.Color.green(),
-            )
-            print("[BOT PRESENCE] bot account rejoined successfully")
+            print("[ADMIN BOT] back online")
+            print("[BOT SUSTAIN] running immediate sustain")
+            queue_sustain_commands()
+            bot_runtime_state["last_sustain_at"] = now
+            print("[BOT SUSTAIN] next sustain in 600s")
         else:
             if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 120:
-                print("[BOT PRESENCE] bot account detected in player list")
+                print("[ADMIN BOT] online")
                 bot_runtime_state["last_presence_log_at"] = now
     else:
         if not admin_runtime_state.get("outage_active"):
@@ -2062,73 +1814,23 @@ async def process_bot_presence_and_recovery(players: dict):
                 admin_runtime_state["offline_reminder_sent_at"] = now_ts
         if not bot_runtime_state.get("missing_since"):
             bot_runtime_state["missing_since"] = now
-            print("[BOT PRESENCE] bot account missing from player list")
-            await send_restart_incident(
-                "Bot Disconnected",
-                "The in-game bot account is no longer detected. Recovery checks have started.",
-                discord.Color.orange(),
-            )
+            print("[ADMIN BOT] offline")
         missing_for = now - float(bot_runtime_state.get("missing_since", now))
         if missing_for < cfg_presence["missing_grace_seconds"]:
-            print("[BOT PRESENCE] grace period active")
             return
 
         bot_runtime_state["presence_state"] = BOT_STATE_MISSING
-        if cfg_recovery["enabled"] and not bot_runtime_state.get("rejoin_in_progress") and now >= float(bot_runtime_state.get("next_rejoin_after", 0.0)):
-            attempts = int(bot_runtime_state.get("rejoin_attempt", 0))
-            if attempts >= cfg_recovery["max_rejoin_attempts"]:
-                bot_runtime_state["presence_state"] = BOT_STATE_FAILED
-                await send_restart_incident(
-                    "Rejoin Failed",
-                    "Automatic rejoin failed after all configured attempts. Manual intervention may be required.",
-                    discord.Color.red(),
-                )
-                print("[REJOIN] failed after max retries")
-                return
-            bot_runtime_state["rejoin_in_progress"] = True
-            bot_runtime_state["presence_state"] = BOT_STATE_REJOINING
-            bot_runtime_state["rejoin_attempt"] = attempts + 1
-            bot_runtime_state["rejoin_started_at"] = now
-            attempt_no = bot_runtime_state["rejoin_attempt"]
-            print(f"[REJOIN] attempt {attempt_no} started")
-            await send_restart_incident("Rejoin Attempt", "Attempting to rejoin the server now.", discord.Color.blurple())
-            ui_ok = await asyncio.to_thread(execute_rejoin_sequence)
-            if not ui_ok:
-                queue_priority_commands(build_rejoin_executor_commands())
-            retries = cfg_recovery["retry_backoff_seconds"]
-            backoff = retries[min(attempt_no - 1, len(retries) - 1)]
-            bot_runtime_state["next_rejoin_after"] = now + backoff
-            bot_runtime_state["rejoin_in_progress"] = False
-            print("[REJOIN] waiting for playerlist confirmation")
-            print(f"[REJOIN] scheduling retry in {backoff} seconds")
-
-    if bot_runtime_state.get("presence_state") == BOT_STATE_REJOINING and not present:
-        started_at = float(bot_runtime_state.get("rejoin_started_at", 0.0) or 0.0)
-        if started_at > 0 and (now - started_at) >= float(cfg_presence.get("confirm_rejoin_timeout_seconds", 120)):
-            print("[REJOIN] confirmation timed out")
-            bot_runtime_state["rejoin_started_at"] = 0.0
+        print(f"[ADMIN BOT] offline duration={_format_duration(missing_for)}")
 
     if bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME and cfg_sustain["enabled"]:
-        print("[REJOIN] confirmed via playerlist")
-        print("[REJOIN] recovery state cleared")
-        print("[BOT SUSTAIN] enabled after bot presence confirmed")
         if now - float(bot_runtime_state.get("last_sustain_at", 0.0)) >= cfg_sustain["interval_seconds"]:
+            print("[BOT SUSTAIN] running immediate sustain")
             queue_sustain_commands()
             bot_runtime_state["last_sustain_at"] = now
-            ui = get_ui_control_config()
-            if ui["use_admin_panel"]:
-                print("[BOT UI] opening admin panel")
-                print("[BOT UI] selecting player")
-                print("[BOT UI] setting hunger=100")
-                print("[BOT UI] setting thirst=100")
-                print("[BOT UI] setting health=100")
-                print("[BOT UI] sustain loop complete")
-            else:
-                for cmd in cfg_sustain["commands"]:
-                    print(f"[BOT SUSTAIN] sending {cmd}")
+            print("[BOT SUSTAIN] next sustain in 600s")
     elif cfg_sustain["enabled"]:
         if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 60:
-            print("[BOT SUSTAIN] skipped because bot not confirmed in-game")
+            print("[BOT SUSTAIN] skipped (offline)")
             bot_runtime_state["last_presence_log_at"] = now
     await refresh_admin_dashboard()
 
@@ -2810,10 +2512,13 @@ async def on_ready():
     print(f"[STARTUP] bot presence status={'BOT_IN_GAME' if startup_presence else 'BOT_MISSING'}")
     if startup_presence:
         bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
-        print("[STARTUP] sustain loop enabled")
+        print("[ADMIN BOT] online")
     elif startup_server == SERVER_STATE_ONLINE:
         bot_runtime_state["presence_state"] = BOT_STATE_MISSING
-        print("[STARTUP] scheduling rejoin")
+        admin_runtime_state["outage_active"] = True
+        admin_runtime_state["outage_started_at"] = time.time()
+        admin_runtime_state["offline_reminder_sent_at"] = 0.0
+        print("[ADMIN BOT] offline")
     else:
         bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
 
@@ -2999,6 +2704,7 @@ async def shop(ctx):
 async def buy(ctx, item: str):
     expire_old_purchases()
     if not is_admin_bot_online():
+        print("[BUY BLOCKED] admin bot offline")
         record_manual_issue(ctx, "!buy", item)
         await ctx.send("⚠️ Purchases are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
@@ -3079,6 +2785,7 @@ async def buy(ctx, item: str):
 async def claim(ctx):
     expire_old_purchases()
     if not is_admin_bot_online():
+        print("[CLAIM BLOCKED] admin bot offline")
         record_manual_issue(ctx, "!claim", "")
         await ctx.send("⚠️ Claims are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
@@ -3269,14 +2976,6 @@ async def checktier(ctx):
         discord.Color.green(),
     )
     await ctx.send(embed=embed)
-
-
-@bot.command()
-async def mousepos(ctx):
-    pos = pyautogui.position()
-    msg = f"[CALIBRATE] x={int(pos.x)} y={int(pos.y)}"
-    print(msg)
-    await ctx.send(msg)
 
 
 @bot.command()

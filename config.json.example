@@ -35,116 +35,15 @@
     "/growth": 3,
     "/health": 1
   },
-  "executor_enable_recovery_hook": false,
-  "executor_recovery_macro_delay": 2,
-  "executor_recovery_macro": [],
   "bot_presence": {
     "player_name": "YOUR_BOT_NAME",
     "steam_id": "",
-    "missing_grace_seconds": 60,
-    "confirm_rejoin_timeout_seconds": 120
-  },
-  "server_recovery": {
-    "enabled": true,
-    "max_rejoin_attempts": 10,
-    "retry_backoff_seconds": [10, 20, 30, 60, 60, 120],
-    "server_back_online_confirm_checks": 2
+    "missing_grace_seconds": 60
   },
   "bot_sustain": {
     "enabled": true,
-    "interval_seconds": 90,
+    "interval_seconds": 600,
     "commands": ["/hunger 100", "/thirst 100", "/health 100"]
-  },
-  "coordinate_join_macro": {
-    "enabled": true,
-    "post_step_delay_seconds": 0.5,
-    "steps": [
-      {"type": "focus_window", "window_title_contains": "The Isle"},
-      {"type": "wait_seconds", "seconds": 2},
-      {
-        "type": "click_position",
-        "x": 126,
-        "y": 395,
-        "offset_x": 0,
-        "offset_y": 40,
-        "move_duration_seconds": 0.15,
-        "pre_click_delay_seconds": 0.1,
-        "post_click_delay_seconds": 0.5,
-        "label": "play_button"
-      },
-      {"type": "wait_seconds", "seconds": 8},
-      {
-        "type": "click_position",
-        "x": 1443,
-        "y": 360,
-        "offset_x": 0,
-        "offset_y": 0,
-        "move_duration_seconds": 0.15,
-        "pre_click_delay_seconds": 0.05,
-        "post_click_delay_seconds": 0.3,
-        "label": "session_filter"
-      },
-      {"type": "wait_seconds", "seconds": 1},
-      {
-        "type": "click_position",
-        "x": 1437,
-        "y": 445,
-        "offset_x": 0,
-        "offset_y": 0,
-        "move_duration_seconds": 0.15,
-        "post_click_delay_seconds": 0.3,
-        "label": "unofficial_option"
-      },
-      {"type": "wait_seconds", "seconds": 1},
-      {
-        "type": "click_position",
-        "x": 1388,
-        "y": 164,
-        "offset_x": 0,
-        "offset_y": 0,
-        "move_duration_seconds": 0.15,
-        "post_click_delay_seconds": 0.2,
-        "label": "search_box"
-      },
-      {"type": "type_text", "text": "primal abyss"},
-      {"type": "wait_seconds", "seconds": 3},
-      {
-        "type": "click_position",
-        "x": 534,
-        "y": 129,
-        "offset_x": 0,
-        "offset_y": 0,
-        "move_duration_seconds": 0.15,
-        "post_click_delay_seconds": 0.2,
-        "label": "server_row"
-      },
-      {"type": "wait_seconds", "seconds": 1},
-      {
-        "type": "click_position",
-        "x": 1395,
-        "y": 757,
-        "offset_x": 0,
-        "offset_y": 0,
-        "move_duration_seconds": 0.15,
-        "post_click_delay_seconds": 0.5,
-        "label": "connect_button"
-      },
-      {"type": "wait_seconds", "seconds": 25}
-    ]
-  },
-  "ui_control": {
-    "use_admin_panel": true,
-    "player_name": "JJoness290",
-    "open_panel_key": "insert",
-    "stat_delay": 0.5,
-    "loop_interval": 90,
-    "player_row": {"x": 0, "y": 0},
-    "input_box": {"x": 0, "y": 0},
-    "buttons": {
-      "hunger": {"x": 0, "y": 0},
-      "thirst": {"x": 0, "y": 0},
-      "health": {"x": 0, "y": 0}
-    }
   },
   "admin_dashboard": {
     "enabled": true,
