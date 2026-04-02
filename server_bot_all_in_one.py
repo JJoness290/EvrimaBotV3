@@ -1747,7 +1747,7 @@ async def get_admin_alert_channel():
         ch = bot.get_channel(cfg["channel_id"])
         if ch:
             return ch
-    return await get_restarts_channel()
+    return None
 
 
 async def send_admin_transition_alert(is_offline: bool):
@@ -1792,6 +1792,7 @@ async def send_admin_transition_alert(is_offline: bool):
         admin_runtime_state["last_alert_type"] = "offline"
         admin_runtime_state["last_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
         print("[ALERT] immediate offline alert sent")
+        await refresh_admin_dashboard(force=True)
     else:
         embed = discord.Embed(
             title="Admin Bot Restored",
@@ -1803,6 +1804,7 @@ async def send_admin_transition_alert(is_offline: bool):
         admin_runtime_state["last_alert_type"] = "recovery"
         admin_runtime_state["last_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
         print("[ALERT] recovery alert sent")
+        await refresh_admin_dashboard(force=True)
 
 
 def record_manual_issue(ctx, command_name: str, item: str = ""):
@@ -1828,7 +1830,7 @@ async def get_admin_dashboard_channel():
         ch = bot.get_channel(cfg["channel_id"])
         if ch:
             return ch
-    return await get_restarts_channel()
+    return None
 
 
 def build_admin_dashboard_embed():
