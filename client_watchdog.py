@@ -88,7 +88,7 @@ def run_macro_once():
             time.sleep(delay)
 
 
-def test_single_step(label: str):
+def test_single_step(label: str, move_only: bool = False):
     cfg = load_config()
     macro = cfg.get("coordinate_join_macro", {})
     steps = macro.get("steps", []) if isinstance(macro, dict) else []
@@ -117,6 +117,9 @@ def test_single_step(label: str):
     post_delay = float(target.get("post_click_delay_seconds", 0.0) or 0.0)
     print(f"[TEST STEP] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({final_x},{final_y})")
     pyautogui.moveTo(final_x, final_y, duration=max(0.0, move_duration))
+    if move_only:
+        print("[TEST STEP] move-only enabled; skipping click")
+        return
     if pre_delay > 0:
         time.sleep(pre_delay)
     st = str(target.get("type", "")).strip().lower()
@@ -136,6 +139,7 @@ def main():
     parser.add_argument("--capture-template", type=str, help="Template name to capture into assets/ui/<name>.png")
     parser.add_argument("--test-macro", action="store_true", help="Run coordinate_join_macro once from config.json")
     parser.add_argument("--test-step", type=str, help="Run only one labeled step from coordinate_join_macro")
+    parser.add_argument("--move-only", action="store_true", help="With --test-step, move to final coords but do not click")
     parser.add_argument("--x", type=int, default=0)
     parser.add_argument("--y", type=int, default=0)
     parser.add_argument("--width", type=int, default=300)
@@ -155,7 +159,7 @@ def main():
         return
 
     if args.test_step:
-        test_single_step(args.test_step)
+        test_single_step(args.test_step, move_only=bool(args.move_only))
         return
 
     parser.print_help()

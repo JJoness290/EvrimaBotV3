@@ -1399,7 +1399,7 @@ def _execute_rejoin_ui_step(step: dict):
         move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
         pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
         post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] clicking {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
         pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
         if pre_delay > 0:
             time.sleep(pre_delay)
@@ -1415,7 +1415,7 @@ def _execute_rejoin_ui_step(step: dict):
         move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
         pre_delay = float(step.get("pre_click_delay_seconds", 0.0) or 0.0)
         post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] clicking {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
         pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
         if pre_delay > 0:
             time.sleep(pre_delay)
@@ -1430,7 +1430,7 @@ def _execute_rejoin_ui_step(step: dict):
         base_x, base_y, off_x, off_y, x, y = _calc_click(step)
         move_duration = float(step.get("move_duration_seconds", 0.15) or 0.0)
         post_delay = float(step.get("post_click_delay_seconds", 0.0) or 0.0)
-        print(f"[MACRO] moving {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
+        print(f"[MACRO] {label} base=({base_x},{base_y}) offset=({off_x},{off_y}) final=({x},{y})")
         pyautogui.moveTo(x, y, duration=max(0.0, move_duration))
         if post_delay > 0:
             time.sleep(post_delay)
