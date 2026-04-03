@@ -36,6 +36,7 @@
     "/health": 1
   },
   "admin_bot_grace_seconds": 120,
+  "rcon_check_interval_seconds": 10,
   "bot_presence": {
     "player_name": "YOUR_BOT_NAME",
     "steam_id": "",
