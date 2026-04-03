@@ -1378,14 +1378,22 @@ def _fmt_ts(ts_value):
 
 
 def is_bot_present_in_players(players: dict):
+    def _norm_name(value: str):
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
     cfg = get_bot_presence_config()
     target_name = str(cfg.get("player_name", "")).strip().lower()
     target_steam = str(cfg.get("steam_id", "")).strip()
     if target_steam and target_steam in players:
         return True
     if target_name:
+        target_norm = _norm_name(target_name)
         for steam_id, name in players.items():
-            if str(name).strip().lower() == target_name:
+            current_name = str(name).strip().lower()
+            if current_name == target_name:
+                return True
+            current_norm = _norm_name(current_name)
+            if current_norm and target_norm and (current_norm == target_norm or target_norm in current_norm or current_norm in target_norm):
                 return True
     return False
 
@@ -2674,6 +2682,8 @@ async def on_ready():
     bot_runtime_state["startup_warmup_complete_logged"] = False
     print("[ADMIN BOT] startup warmup active")
     startup_players = await asyncio.to_thread(get_players_from_rcon)
+    bot_runtime_state["last_rcon_check_at"] = time.time()
+    bot_runtime_state["startup_rcon_checked"] = True
     startup_server = map_server_state()
     print(f"[STARTUP] server status={startup_server}")
     print("[STARTUP] initial fresh tracking pass complete")
