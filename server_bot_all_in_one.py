@@ -1951,7 +1951,7 @@ async def process_bot_presence_and_recovery(players: dict):
                 print("[ADMIN BOT] back online")
             else:
                 print("[ADMIN BOT] online")
-            if bot_detected_from_logs and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
+            if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
                 print("[ADMIN BOT] startup warmup ended early because admin bot was detected")
                 bot_runtime_state["startup_warmup_complete_logged"] = True
                 bot_runtime_state["startup_started_at"] = 0.0
