@@ -154,8 +154,10 @@ bot_runtime_state = {
     "presence_state": BOT_STATE_MISSING,
     "server_state": SERVER_STATE_ONLINE,
     "missing_since": None,
+    "last_bot_seen_at": 0.0,
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
+    "empty_playerlist_logged_at": 0.0,
 }
 admin_runtime_state = {
     "outage_active": False,
@@ -302,6 +304,7 @@ def load_state():
             "last_minute_tick": {},
             "restart_cycle_state": {},
             "bot_presence_state": BOT_STATE_MISSING,
+            "last_bot_seen_at": 0.0,
         },
     )
 
@@ -312,6 +315,7 @@ def save_state():
         "last_minute_tick": last_minute_tick,
         "restart_cycle_state": restart_cycle_state,
         "bot_presence_state": bot_runtime_state.get("presence_state", BOT_STATE_MISSING),
+        "last_bot_seen_at": float(bot_runtime_state.get("last_bot_seen_at", 0.0) or 0.0),
     }
     save_json(STATE_FILE, state)
 
@@ -1285,6 +1289,7 @@ def get_bot_presence_config():
         "player_name": os.getenv("BOT_PLAYER_NAME", str(section.get("player_name", "")).strip()),
         "steam_id": os.getenv("BOT_STEAM_ID", str(section.get("steam_id", "")).strip()),
         "missing_grace_seconds": int(section.get("missing_grace_seconds", 60) or 60),
+        "admin_bot_grace_seconds": ConfigManager.get_int("admin_bot_grace_seconds", "ADMIN_BOT_GRACE_SECONDS", 120, minimum=30),
     }
 
 
@@ -1766,6 +1771,8 @@ async def process_bot_presence_and_recovery(players: dict):
     cfg_presence = get_bot_presence_config()
     cfg_sustain = get_bot_sustain_config()
     now = time.time()
+    admin_grace_seconds = int(cfg_presence.get("admin_bot_grace_seconds", 120))
+    has_empty_playerlist = len(players) == 0
 
     bot_runtime_state["server_state"] = map_server_state()
     server_is_online = bot_runtime_state["server_state"] == SERVER_STATE_ONLINE
@@ -1779,6 +1786,9 @@ async def process_bot_presence_and_recovery(players: dict):
     present = is_bot_present_in_players(players)
     if present:
         admin_runtime_state["last_seen_in_game_at"] = datetime.now(timezone.utc).isoformat()
+        bot_runtime_state["last_bot_seen_at"] = now
+        print("[ADMIN BOT] detected in playerlist")
+        print("[ADMIN BOT] last seen updated")
         if admin_runtime_state.get("outage_active"):
             admin_runtime_state["outage_active"] = False
             admin_runtime_state["outage_started_at"] = None
@@ -1797,6 +1807,21 @@ async def process_bot_presence_and_recovery(players: dict):
                 print("[ADMIN BOT] online")
                 bot_runtime_state["last_presence_log_at"] = now
     else:
+        last_seen_at = float(bot_runtime_state.get("last_bot_seen_at", 0.0) or 0.0)
+        seconds_since_last_seen = (now - last_seen_at) if last_seen_at > 0 else 10**9
+        if has_empty_playerlist:
+            if now - float(bot_runtime_state.get("empty_playerlist_logged_at", 0.0) or 0.0) > 30:
+                print("[ADMIN BOT] empty playerlist detected, entering grace period")
+                bot_runtime_state["empty_playerlist_logged_at"] = now
+            if last_seen_at > 0 and seconds_since_last_seen < admin_grace_seconds:
+                bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+                bot_runtime_state["missing_since"] = None
+                if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 15:
+                    print("[ADMIN BOT] still online (grace period active)")
+                    bot_runtime_state["last_presence_log_at"] = now
+                await refresh_admin_dashboard()
+                return
+
         if not admin_runtime_state.get("outage_active"):
             admin_runtime_state["outage_active"] = True
             admin_runtime_state["outage_started_at"] = time.time()
@@ -1816,10 +1841,14 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["missing_since"] = now
             print("[ADMIN BOT] offline")
         missing_for = now - float(bot_runtime_state.get("missing_since", now))
+        if has_empty_playerlist and last_seen_at > 0:
+            missing_for = max(missing_for, seconds_since_last_seen)
         if missing_for < cfg_presence["missing_grace_seconds"]:
             return
 
         bot_runtime_state["presence_state"] = BOT_STATE_MISSING
+        if has_empty_playerlist:
+            print(f"[ADMIN BOT] confirmed offline after {int(missing_for)} seconds")
         print(f"[ADMIN BOT] offline duration={_format_duration(missing_for)}")
 
     if bot_runtime_state.get("presence_state") == BOT_STATE_IN_GAME and cfg_sustain["enabled"]:
@@ -1835,26 +1864,34 @@ async def process_bot_presence_and_recovery(players: dict):
     await refresh_admin_dashboard()
 
 def get_players_from_rcon():
+    def _parse(raw_text: str):
+        lines = [l.strip() for l in str(raw_text or "").splitlines() if l.strip()]
+        ids, names = None, None
+        for line in lines:
+            if "," not in line:
+                continue
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if all(p.isdigit() for p in parts):
+                ids = parts
+            else:
+                names = parts
+        if ids and names:
+            return {ids[i]: names[i] for i in range(min(len(ids), len(names)))}
+        # Optional backup parser: "<steamid> <name>" rows.
+        fallback = {}
+        for line in lines:
+            m = re.match(r"^\s*(\d{17})\s+(.+?)\s*$", line)
+            if m:
+                fallback[m.group(1)] = m.group(2).strip()
+        return fallback
+
     raw = run_rcon("list")
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-
-    ids, names = None, None
-
-    for line in lines:
-        if "," not in line:
-            continue
-
-        parts = [p.strip() for p in line.split(",") if p.strip()]
-
-        if all(p.isdigit() for p in parts):
-            ids = parts
-        else:
-            names = parts
-
-    if not ids or not names:
-        return {}
-
-    return {ids[i]: names[i] for i in range(min(len(ids), len(names)))}
+    players = _parse(raw)
+    if players:
+        return players
+    time.sleep(0.8)
+    raw_retry = run_rcon("list")
+    return _parse(raw_retry)
 
 
 def restore_state():
@@ -1863,6 +1900,7 @@ def restore_state():
     saved_last_tick = state.get("last_minute_tick", {})
     saved_restart_cycle = state.get("restart_cycle_state", {})
     saved_bot_presence = state.get("bot_presence_state")
+    saved_last_bot_seen_at = state.get("last_bot_seen_at", 0.0)
     now_ts = int(time.time())
     catchup_cap_minutes = get_max_reward_catchup_minutes()
     catchup_cap_seconds = catchup_cap_minutes * 60
@@ -1917,6 +1955,10 @@ def restore_state():
         restart_cycle_state.update(saved_restart_cycle)
     if isinstance(saved_bot_presence, str) and saved_bot_presence:
         bot_runtime_state["presence_state"] = saved_bot_presence
+    try:
+        bot_runtime_state["last_bot_seen_at"] = float(saved_last_bot_seen_at or 0.0)
+    except Exception:
+        bot_runtime_state["last_bot_seen_at"] = 0.0
 
 
 def ensure_player_record(data: dict, steam_id: str, name: str):
@@ -2512,6 +2554,7 @@ async def on_ready():
     print(f"[STARTUP] bot presence status={'BOT_IN_GAME' if startup_presence else 'BOT_MISSING'}")
     if startup_presence:
         bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+        bot_runtime_state["last_bot_seen_at"] = time.time()
         print("[ADMIN BOT] online")
     elif startup_server == SERVER_STATE_ONLINE:
         bot_runtime_state["presence_state"] = BOT_STATE_MISSING

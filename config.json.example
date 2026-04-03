@@ -35,6 +35,7 @@
     "/growth": 3,
     "/health": 1
   },
+  "admin_bot_grace_seconds": 120,
   "bot_presence": {
     "player_name": "YOUR_BOT_NAME",
     "steam_id": "",
