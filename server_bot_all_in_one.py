@@ -28,6 +28,7 @@ GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 CONFIG_FILE = Path("config.json")
 EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
+CONFIG_DEBUG_LOGGED = False
 
 PURCHASE_TIMEOUT_MINUTES = 15
 QUEUED_TIMEOUT_MINUTES = 5
@@ -245,7 +246,20 @@ def save_json(path: Path, data) -> None:
 
 
 def load_config():
-    return load_json(CONFIG_FILE, {})
+    global CONFIG_DEBUG_LOGGED
+    config = load_json(CONFIG_FILE, {})
+    if not isinstance(config, dict):
+        config = {}
+    if not CONFIG_DEBUG_LOGGED:
+        try:
+            abs_path = str(CONFIG_FILE.resolve())
+        except Exception:
+            abs_path = str(CONFIG_FILE)
+        raw_presence = config.get("bot_presence", {})
+        print(f"[CONFIG] loading from: {abs_path}")
+        print(f"[CONFIG] bot_presence raw: {raw_presence}")
+        CONFIG_DEBUG_LOGGED = True
+    return config
 
 
 def get_scan_interval_seconds() -> int:
