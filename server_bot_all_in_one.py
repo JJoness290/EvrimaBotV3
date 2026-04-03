@@ -1378,24 +1378,41 @@ def _fmt_ts(ts_value):
 
 
 def is_bot_present_in_players(players: dict):
-    def _norm_name(value: str):
-        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    matched, _, _ = detect_admin_bot_match(players, log_debug=False, source_label="generic")
+    return matched
 
+
+def _normalize_admin_name(value: str):
+    text = str(value or "").strip().lower()
+    return " ".join(text.split())
+
+
+def detect_admin_bot_match(players: dict, log_debug: bool = False, source_label: str = "tracked"):
     cfg = get_bot_presence_config()
-    target_name = str(cfg.get("player_name", "")).strip().lower()
+    target_name_raw = str(cfg.get("player_name", "")).strip()
     target_steam = str(cfg.get("steam_id", "")).strip()
-    if target_steam and target_steam in players:
-        return True
+    target_name = _normalize_admin_name(target_name_raw)
+
+    if log_debug:
+        print(f"[ADMIN BOT] checking {source_label} player list for admin bot")
+
+    if target_steam:
+        for steam_id, player_name in players.items():
+            if str(steam_id).strip() == target_steam:
+                print(f"[ADMIN BOT] matched by steam id: {target_steam}")
+                return True, "steam_id", {"steam_id": str(steam_id), "name": str(player_name)}
+
     if target_name:
-        target_norm = _norm_name(target_name)
-        for steam_id, name in players.items():
-            current_name = str(name).strip().lower()
+        for steam_id, player_name in players.items():
+            current_name = _normalize_admin_name(player_name)
             if current_name == target_name:
-                return True
-            current_norm = _norm_name(current_name)
-            if current_norm and target_norm and (current_norm == target_norm or target_norm in current_norm or current_norm in target_norm):
-                return True
-    return False
+                print(f"[ADMIN BOT] matched by player name: {player_name}")
+                return True, "player_name", {"steam_id": str(steam_id), "name": str(player_name)}
+
+    if log_debug:
+        for steam_id, player_name in players.items():
+            print(f"[ADMIN BOT DEBUG] tracked player: name={player_name} steam_id={steam_id}")
+    return False, "none", {}
 
 
 def queue_priority_commands(commands: list[dict]):
@@ -1833,7 +1850,7 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["last_presence_log_at"] = now
         return
 
-    bot_detected_from_logs = is_bot_present_in_players(players)
+    bot_detected_from_logs, _, _ = detect_admin_bot_match(players, log_debug=True, source_label="tracked")
     bot_detected_from_rcon = False
     rcon_players = {}
     rcon_error = ""
@@ -1846,7 +1863,8 @@ async def process_bot_presence_and_recovery(players: dict):
             if rcon_players:
                 if has_empty_playerlist:
                     bot_runtime_state["last_player_count"] = len(rcon_players)
-                if is_bot_present_in_players(rcon_players):
+                rcon_match, _, _ = detect_admin_bot_match(rcon_players, log_debug=False, source_label="rcon")
+                if rcon_match:
                     bot_detected_from_rcon = True
                     print("[RCON] admin bot detected")
                 else:
@@ -1891,6 +1909,11 @@ async def process_bot_presence_and_recovery(players: dict):
         print("[ADMIN BOT] last seen updated")
         if previous_state != "ONLINE":
             print("[ADMIN BOT] online (detected via logs or RCON)")
+            if bot_detected_from_logs:
+                print("[ADMIN BOT] tracking confirms admin bot online")
+                if not bot_runtime_state.get("startup_warmup_complete_logged", False):
+                    print("[ADMIN BOT] startup warmup ended early because admin bot was detected")
+                    bot_runtime_state["startup_warmup_complete_logged"] = True
             if admin_runtime_state.get("outage_active"):
                 admin_runtime_state["outage_active"] = False
                 admin_runtime_state["outage_started_at"] = None
@@ -2681,6 +2704,9 @@ async def on_ready():
     bot_runtime_state["startup_rcon_checked"] = False
     bot_runtime_state["startup_warmup_complete_logged"] = False
     print("[ADMIN BOT] startup warmup active")
+    cfg_presence = get_bot_presence_config()
+    print(f"[ADMIN BOT CONFIG] player_name={str(cfg_presence.get('player_name', '')).strip() or '(empty)'}")
+    print(f"[ADMIN BOT CONFIG] steam_id={str(cfg_presence.get('steam_id', '')).strip() or '(empty)'}")
     startup_players = await asyncio.to_thread(get_players_from_rcon)
     bot_runtime_state["last_rcon_check_at"] = time.time()
     bot_runtime_state["startup_rcon_checked"] = True
@@ -2688,6 +2714,16 @@ async def on_ready():
     print(f"[STARTUP] server status={startup_server}")
     print("[STARTUP] initial fresh tracking pass complete")
     update_players(startup_players)
+    print("[ADMIN BOT] checking tracked player list for admin bot")
+    startup_match, _, _ = detect_admin_bot_match(startup_players, log_debug=True, source_label="tracked")
+    if startup_match:
+        bot_runtime_state["admin_bot_state"] = "ONLINE"
+        bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+        bot_runtime_state["last_bot_seen_at"] = time.time()
+        bot_runtime_state["last_detection_source"] = "Logs"
+        bot_runtime_state["startup_warmup_complete_logged"] = True
+        print("[ADMIN BOT] tracking confirms admin bot online")
+        print("[ADMIN BOT] startup warmup ended early because admin bot was detected")
     await process_bot_presence_and_recovery(startup_players)
 
     if not tracking_loop.is_running():
