@@ -38,6 +38,7 @@
   "admin_bot_grace_seconds": 120,
   "rcon_check_interval_seconds": 10,
   "admin_bot_startup_warmup_seconds": 30,
+  "debug_admin_bot_detection": false,
   "bot_presence": {
     "player_name": "YOUR_BOT_NAME",
     "steam_id": "",

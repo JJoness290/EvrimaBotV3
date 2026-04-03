@@ -84,6 +84,7 @@ last_remote_log_match = {}
 cached_resolved_remote_log_path = None
 last_remote_log_match_raw_line_by_steam = {}
 last_remote_grow_match = {}
+last_sftp_eof_warn_at = 0.0
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -802,6 +803,7 @@ def parse_grow_command_log_line(line: str):
 
 
 def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
+    global last_sftp_eof_warn_at
     cfg = get_remote_log_config()
     if not all([cfg.get("host"), cfg.get("username"), cfg.get("password"), cfg.get("remote_log_path")]):
         print("[SFTP LOG] Missing SFTP config values (host/username/password/remote_log_path).")
@@ -827,6 +829,14 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
         decoded = raw.decode("utf-8", errors="ignore")
         return decoded.splitlines(), None
     except Exception as e:
+        msg = str(e or "")
+        lowered = msg.lower()
+        if "eof" in lowered:
+            now_ts = time.time()
+            if now_ts - float(last_sftp_eof_warn_at or 0.0) > 60:
+                print(f"[SFTP LOG] Warning: transient EOF while reading remote log tail: {e}")
+                last_sftp_eof_warn_at = now_ts
+            return [], "transient_eof"
         print(f"[SFTP LOG] Failed reading remote log tail: {e}")
         return [], str(e)
     finally:
@@ -1327,6 +1337,7 @@ def get_bot_presence_config():
         "admin_bot_grace_seconds": ConfigManager.get_int("admin_bot_grace_seconds", "ADMIN_BOT_GRACE_SECONDS", 120, minimum=30),
         "rcon_check_interval_seconds": ConfigManager.get_int("rcon_check_interval_seconds", "RCON_CHECK_INTERVAL_SECONDS", 10, minimum=5),
         "admin_bot_startup_warmup_seconds": ConfigManager.get_int("admin_bot_startup_warmup_seconds", "ADMIN_BOT_STARTUP_WARMUP_SECONDS", 30, minimum=5),
+        "debug_admin_bot_detection": ConfigManager.get_bool("debug_admin_bot_detection", "DEBUG_ADMIN_BOT_DETECTION", False),
     }
 
 
@@ -1424,14 +1435,16 @@ def detect_admin_bot_match(players: dict, log_debug: bool = False, source_label:
     if target_steam:
         for steam_id, player_name in players.items():
             if str(steam_id).strip() == target_steam:
-                print(f"[ADMIN BOT] matched by steam id: {target_steam}")
+                if log_debug:
+                    print(f"[ADMIN BOT] matched by steam id: {target_steam}")
                 return True, "steam_id", {"steam_id": str(steam_id), "name": str(player_name)}
 
     if target_name:
         for steam_id, player_name in players.items():
             current_name = _normalize_admin_name(player_name)
             if current_name == target_name:
-                print(f"[ADMIN BOT] matched by player name: {player_name}")
+                if log_debug:
+                    print(f"[ADMIN BOT] matched by player name: {player_name}")
                 return True, "player_name", {"steam_id": str(steam_id), "name": str(player_name)}
 
     if log_debug:
@@ -1856,6 +1869,7 @@ def map_server_state():
 
 async def process_bot_presence_and_recovery(players: dict):
     cfg_presence = get_bot_presence_config()
+    debug_detection = bool(cfg_presence.get("debug_admin_bot_detection", False))
     cfg_sustain = get_bot_sustain_config()
     now = time.time()
     admin_grace_seconds = int(cfg_presence.get("admin_bot_grace_seconds", 120))
@@ -1875,7 +1889,7 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["last_presence_log_at"] = now
         return
 
-    bot_detected_from_logs, _, _ = detect_admin_bot_match(players, log_debug=True, source_label="tracked")
+    bot_detected_from_logs, _, _ = detect_admin_bot_match(players, log_debug=debug_detection, source_label="tracked")
     bot_detected_from_rcon = False
     rcon_players = {}
     rcon_error = ""
@@ -1888,18 +1902,20 @@ async def process_bot_presence_and_recovery(players: dict):
             if rcon_players:
                 if has_empty_playerlist:
                     bot_runtime_state["last_player_count"] = len(rcon_players)
-                rcon_match, _, _ = detect_admin_bot_match(rcon_players, log_debug=False, source_label="rcon")
+                rcon_match, _, _ = detect_admin_bot_match(rcon_players, log_debug=debug_detection, source_label="rcon")
                 if rcon_match:
                     bot_detected_from_rcon = True
-                    print("[RCON] admin bot detected")
-                else:
+                    if debug_detection:
+                        print("[RCON] admin bot detected")
+                elif debug_detection:
                     print("[RCON] admin bot not found")
-            else:
+            elif debug_detection:
                 print("[RCON] no players found")
         except Exception as e:
             rcon_error = str(e)
             bot_runtime_state["last_rcon_error"] = rcon_error
-            print("[RCON] error querying server")
+            if debug_detection:
+                print("[RCON] error querying server")
 
     last_seen_at = float(bot_runtime_state.get("last_bot_seen_at", 0.0) or 0.0)
     valid_last_seen_at = get_valid_last_seen_at()
@@ -1916,7 +1932,7 @@ async def process_bot_presence_and_recovery(players: dict):
     startup_started_at = float(bot_runtime_state.get("startup_started_at", 0.0) or 0.0)
     warmup_active = startup_started_at > 0 and (now - startup_started_at) < startup_warmup_seconds
     fresh_checks_complete = bool(bot_runtime_state.get("startup_tracking_checked")) and bool(bot_runtime_state.get("startup_rcon_checked"))
-    if warmup_active and now - bot_runtime_state.get("last_presence_log_at", 0.0) > 10:
+    if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)) and now - bot_runtime_state.get("last_presence_log_at", 0.0) > 10:
         print("[ADMIN BOT] startup warmup active")
         bot_runtime_state["last_presence_log_at"] = now
     if (not warmup_active) and fresh_checks_complete and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
@@ -1930,15 +1946,15 @@ async def process_bot_presence_and_recovery(players: dict):
         bot_runtime_state["last_detection_source"] = detected_source
         admin_runtime_state["last_seen_in_game_at"] = datetime.now(timezone.utc).isoformat()
         admin_runtime_state["last_alert_summary"] = "Admin bot online"
-        print("[ADMIN BOT] detected in playerlist")
-        print("[ADMIN BOT] last seen updated")
         if previous_state != "ONLINE":
-            print("[ADMIN BOT] online (detected via logs or RCON)")
-            if bot_detected_from_logs:
-                print("[ADMIN BOT] tracking confirms admin bot online")
-                if not bot_runtime_state.get("startup_warmup_complete_logged", False):
-                    print("[ADMIN BOT] startup warmup ended early because admin bot was detected")
-                    bot_runtime_state["startup_warmup_complete_logged"] = True
+            if previous_state in {"OFFLINE", "GRACE"}:
+                print("[ADMIN BOT] back online")
+            else:
+                print("[ADMIN BOT] online")
+            if bot_detected_from_logs and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
+                print("[ADMIN BOT] startup warmup ended early because admin bot was detected")
+                bot_runtime_state["startup_warmup_complete_logged"] = True
+                bot_runtime_state["startup_started_at"] = 0.0
             if admin_runtime_state.get("outage_active"):
                 admin_runtime_state["outage_active"] = False
                 admin_runtime_state["outage_started_at"] = None
@@ -1955,7 +1971,7 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["presence_state"] = BOT_STATE_MISSING
             bot_runtime_state["last_detection_source"] = "Unknown"
             admin_runtime_state["last_alert_summary"] = "Startup warmup active"
-            if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 10:
+            if debug_detection and now - bot_runtime_state.get("last_presence_log_at", 0.0) > 10:
                 print("[ADMIN BOT] delaying offline decision until fresh detection completes")
                 print("[ADMIN BOT] presence unknown (startup warmup / no confirmed last-seen yet)")
                 bot_runtime_state["last_presence_log_at"] = now
@@ -1970,11 +1986,11 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["last_detection_source"] = "Unknown"
             admin_runtime_state["last_alert_summary"] = "Grace period active"
             if has_empty_playerlist and now - float(bot_runtime_state.get("empty_playerlist_logged_at", 0.0) or 0.0) > 30:
-                print("[ADMIN BOT] empty playerlist detected, entering grace period")
+                if debug_detection:
+                    print("[ADMIN BOT] empty playerlist detected, entering grace period")
                 bot_runtime_state["empty_playerlist_logged_at"] = now
-            if now - bot_runtime_state.get("last_presence_log_at", 0.0) > 15:
+            if debug_detection and now - bot_runtime_state.get("last_presence_log_at", 0.0) > 15:
                 print(f"[ADMIN BOT] grace period active (last seen {int(seconds_since_last_seen)} seconds ago)")
-                print("[ADMIN BOT] still online (grace period active)")
                 bot_runtime_state["last_presence_log_at"] = now
             if rcon_error:
                 admin_runtime_state["last_alert_summary"] = "RCON query failure (grace active)"
@@ -1986,13 +2002,14 @@ async def process_bot_presence_and_recovery(players: dict):
             bot_runtime_state["missing_since"] = now
             bot_runtime_state["last_detection_source"] = "Unknown"
             admin_runtime_state["last_alert_summary"] = "Admin bot offline"
-            if valid_last_seen_at is None:
-                print("[ADMIN BOT] last seen unknown")
-                print("[ADMIN BOT] presence unknown (startup warmup / no confirmed last-seen yet)")
-            else:
-                seconds_since_last_seen = now - valid_last_seen_at
-                print(f"[ADMIN BOT] confirmed offline after {int(seconds_since_last_seen)} seconds")
-                print(f"[ADMIN BOT] offline duration={_format_duration(seconds_since_last_seen)}")
+            if previous_state != "OFFLINE":
+                print("[ADMIN BOT] offline")
+                if debug_detection:
+                    if valid_last_seen_at is None:
+                        print("[ADMIN BOT] last seen unknown")
+                    else:
+                        seconds_since_last_seen = now - valid_last_seen_at
+                        print(f"[ADMIN BOT] confirmed offline after {int(seconds_since_last_seen)} seconds")
             if not admin_runtime_state.get("outage_active"):
                 admin_runtime_state["outage_active"] = True
                 admin_runtime_state["outage_started_at"] = time.time()
@@ -2741,8 +2758,9 @@ async def on_ready():
     print(f"[STARTUP] server status={startup_server}")
     print("[STARTUP] initial fresh tracking pass complete")
     update_players(startup_players)
-    print("[ADMIN BOT] checking tracked player list for admin bot")
-    startup_match, _, _ = detect_admin_bot_match(startup_players, log_debug=True, source_label="tracked")
+    if debug_detection:
+        print("[ADMIN BOT] checking tracked player list for admin bot")
+    startup_match, _, _ = detect_admin_bot_match(startup_players, log_debug=debug_detection, source_label="tracked")
     if startup_match:
         bot_runtime_state["admin_bot_state"] = "ONLINE"
         bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
