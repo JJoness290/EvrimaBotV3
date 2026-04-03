@@ -1295,9 +1295,20 @@ def build_action_embed(title: str, description: str, player_name: str = "", ener
 
 def get_bot_presence_config():
     section = ConfigManager.get_section("bot_presence")
+    config = load_config()
+    if not isinstance(config, dict):
+        config = {}
+    if not isinstance(section, dict):
+        section = {}
+
+    env_player_name = str(os.getenv("BOT_PLAYER_NAME", "") or "").strip()
+    env_steam_id = str(os.getenv("BOT_STEAM_ID", "") or "").strip()
+    cfg_player_name = str(section.get("player_name", config.get("bot_player_name", "")) or "").strip()
+    cfg_steam_id = str(section.get("steam_id", config.get("bot_steam_id", "")) or "").strip()
+
     return {
-        "player_name": os.getenv("BOT_PLAYER_NAME", str(section.get("player_name", "")).strip()),
-        "steam_id": os.getenv("BOT_STEAM_ID", str(section.get("steam_id", "")).strip()),
+        "player_name": env_player_name if env_player_name else cfg_player_name,
+        "steam_id": env_steam_id if env_steam_id else cfg_steam_id,
         "missing_grace_seconds": int(section.get("missing_grace_seconds", 60) or 60),
         "admin_bot_grace_seconds": ConfigManager.get_int("admin_bot_grace_seconds", "ADMIN_BOT_GRACE_SECONDS", 120, minimum=30),
         "rcon_check_interval_seconds": ConfigManager.get_int("rcon_check_interval_seconds", "RCON_CHECK_INTERVAL_SECONDS", 10, minimum=5),
@@ -2707,6 +2718,8 @@ async def on_ready():
     cfg_presence = get_bot_presence_config()
     print(f"[ADMIN BOT CONFIG] player_name={str(cfg_presence.get('player_name', '')).strip() or '(empty)'}")
     print(f"[ADMIN BOT CONFIG] steam_id={str(cfg_presence.get('steam_id', '')).strip() or '(empty)'}")
+    if (not str(cfg_presence.get("player_name", "")).strip()) and (not str(cfg_presence.get("steam_id", "")).strip()):
+        print("[ADMIN BOT CONFIG] WARNING: no admin bot identity configured")
     startup_players = await asyncio.to_thread(get_players_from_rcon)
     bot_runtime_state["last_rcon_check_at"] = time.time()
     bot_runtime_state["startup_rcon_checked"] = True
