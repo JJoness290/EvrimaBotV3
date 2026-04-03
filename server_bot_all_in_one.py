@@ -75,10 +75,10 @@ CLAIM_OPEN_STATES = {
     "FINAL_VERIFY_PENDING",
 }
 
-PRECHECK_VERIFY_TIMEOUT_SECONDS = 8
-FINAL_VERIFY_TIMEOUT_SECONDS = 8
-REMOTE_LOG_TAIL_BYTES = 128 * 1024
-CLAIM_ACTIVE_TIMEOUT_SECONDS = 30
+PRECHECK_VERIFY_TIMEOUT_SECONDS = 20
+FINAL_VERIFY_TIMEOUT_SECONDS = 20
+REMOTE_LOG_TAIL_BYTES = 16 * 1024
+CLAIM_ACTIVE_TIMEOUT_SECONDS = 90
 
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
@@ -467,8 +467,11 @@ def _score_log_candidate(path_name: str, attrs) -> tuple:
 def resolve_remote_log_path(sftp, configured_path: str):
     global cached_resolved_remote_log_path
 
-    if cached_resolved_remote_log_path and _remote_file_exists(sftp, cached_resolved_remote_log_path):
-        return cached_resolved_remote_log_path
+    if cached_resolved_remote_log_path:
+        if _remote_file_exists(sftp, cached_resolved_remote_log_path):
+            print(f"[CLAIM] using cached remote log path: {cached_resolved_remote_log_path}")
+            return cached_resolved_remote_log_path
+        cached_resolved_remote_log_path = None
 
     for candidate in _normalize_path_variants(configured_path):
         print(f"[SFTP LOG] Trying remote path: {candidate}")
@@ -737,8 +740,8 @@ def parse_health_command_log_line(line: str):
     if not match:
         return None
 
-    command = match.group("command")
-    if str(command).strip().lower() != "sethealth":
+    command = str(match.group("command")).strip().lower()
+    if command not in {"sethealth", "health"}:
         return None
 
     try:
@@ -812,20 +815,26 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
     transport = None
     sftp = None
     try:
+        open_start = time.time()
         print(f"[SFTP LOG] Connecting host={cfg['host']} port={cfg['port']} user={cfg['username']}")
         transport, sftp = open_sftp_client(cfg)
+        open_elapsed = time.time() - open_start
+        print(f"[SFTP LOG] open_sftp duration={open_elapsed:.3f}s")
         remote_path = resolve_remote_log_path(sftp, cfg["remote_log_path"])
         if not remote_path:
             print("[SFTP LOG] Could not resolve remote log path.")
             return [], "remote_log_not_found"
         print(f"[SFTP LOG] Connected to remote log")
         print(f"[SFTP LOG] Reading tail from {remote_path}")
+        read_start_ts = time.time()
         with sftp.open(remote_path, "rb") as remote_file:
             remote_file.seek(0, 2)
             size = remote_file.tell()
             read_start = max(0, int(size) - int(tail_bytes))
             remote_file.seek(read_start)
             raw = remote_file.read()
+        read_elapsed = time.time() - read_start_ts
+        print(f"[SFTP LOG] read_tail duration={read_elapsed:.3f}s bytes={len(raw)}")
         decoded = raw.decode("utf-8", errors="ignore")
         return decoded.splitlines(), None
     except Exception as e:
@@ -855,6 +864,7 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
 def get_latest_health_log_for_steam(steam_id: str):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
+        print(f"[CLAIM] waiting for health log for steam_id={steam_id} err={err}")
         return None
 
     newest_match = None
@@ -871,15 +881,17 @@ def get_latest_health_log_for_steam(steam_id: str):
     if newest_match:
         last_remote_log_match[str(steam_id)] = newest_match
         last_remote_log_match_raw_line_by_steam[str(steam_id)] = newest_match.get("raw_line")
-        print(f"[SFTP LOG] Using newest SetHealth line for steam_id={steam_id}")
+        print(f"[CLAIM] health log found class={newest_match.get('class_name')} steam_id={steam_id}")
         return newest_match
 
+    print(f"[CLAIM] parser found no valid health line for steam_id={steam_id}")
     return last_remote_log_match.get(str(steam_id))
 
 
 def get_latest_grow_log_for_steam(steam_id: str):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
+        print(f"[CLAIM] waiting for grow log for steam_id={steam_id} err={err}")
         return None
 
     newest_match = None
@@ -894,8 +906,10 @@ def get_latest_grow_log_for_steam(steam_id: str):
 
     if newest_match:
         last_remote_grow_match[str(steam_id)] = newest_match
+        print(f"[CLAIM] grow log found class={newest_match.get('class_name')} steam_id={steam_id}")
         return newest_match
 
+    print(f"[CLAIM] parser found no valid grow line for steam_id={steam_id}")
     return last_remote_grow_match.get(str(steam_id))
 
 
@@ -2490,9 +2504,16 @@ def process_claim_orchestration():
 
             if status == "PRECHECK_VERIFYING" and claim_group_id:
                 verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
+                verify_start_ts = time.time()
+                elapsed_secs = 0
+                if verify_started_at:
+                    elapsed_secs = max(0, int((datetime.now() - verify_started_at).total_seconds()))
+                max_attempts = max(1, PRECHECK_VERIFY_TIMEOUT_SECONDS)
+                attempt_no = min(max_attempts, elapsed_secs + 1)
+                print(f"[CLAIM] precheck verify attempt {attempt_no}/{max_attempts}")
                 precheck_log = get_latest_health_log_for_steam(steam_id)
                 if not precheck_log:
-                    print(f"[CLAIM VERIFY] No matching SetHealth line found in current remote tail for {steam_id}")
+                    print(f"[CLAIM] waiting for health log for steam_id={steam_id}")
                     if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -2500,6 +2521,7 @@ def process_claim_orchestration():
                             "Verification timed out. Points refunded.",
                             "Verification timed out. Points refunded.",
                         )
+                        print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
                         changed_purchases = True
                     continue
@@ -2516,7 +2538,8 @@ def process_claim_orchestration():
                         "Wrong dinosaur detected. Your points were refunded.",
                         f"{reason} Energy refunded.",
                     )
-                    print(f"[CLAIM VERIFY] Wrong dino detected for {steam_id}: expected={item} detected={precheck_log['class_name']}")
+                    print(f"[CLAIM] wrong dino detected expected={item} actual={precheck_log['class_name']}")
+                    print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
                     changed_purchases = True
                     continue
 
@@ -2526,6 +2549,7 @@ def process_claim_orchestration():
                 )
                 purchase["failure_note"] = "Verification passed. Growth queued."
                 print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
+                print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
                 changed_purchases = True
 
                 player_name = purchase.get("player") or "Unknown"
@@ -2561,9 +2585,16 @@ def process_claim_orchestration():
 
             if status == "FINAL_VERIFY_PENDING":
                 final_started_at = parse_dt(purchase.get("final_verify_started_at"))
+                final_start_ts = time.time()
+                final_elapsed_secs = 0
+                if final_started_at:
+                    final_elapsed_secs = max(0, int((datetime.now() - final_started_at).total_seconds()))
+                final_max_attempts = max(1, FINAL_VERIFY_TIMEOUT_SECONDS)
+                final_attempt = min(final_max_attempts, final_elapsed_secs + 1)
+                print(f"[CLAIM] final grow verify attempt {final_attempt}/{final_max_attempts}")
                 grow_log = get_latest_grow_log_for_steam(steam_id)
                 if not grow_log:
-                    print(f"[CLAIM VERIFY] No matching Grow line found in current remote tail for {steam_id}")
+                    print(f"[CLAIM] waiting for grow log for steam_id={steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -2571,6 +2602,7 @@ def process_claim_orchestration():
                             "Verification timed out. Points refunded.",
                             "Verification timed out. Points refunded.",
                         )
+                        print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                         changed_purchases = True
                     continue
@@ -2592,10 +2624,12 @@ def process_claim_orchestration():
                         "Claim failed. Points refunded.",
                         "Claim failed. Points refunded.",
                     )
+                    print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
                     changed_purchases = True
                     continue
 
                 set_purchase_status(purchase, "DELIVERED", growth_note, "Growth confirmed — 100% complete.")
+                print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
                 changed_purchases = True
 
         if changed_commands:

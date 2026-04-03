@@ -13,12 +13,12 @@ EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 PLAYER_STATE_FILE = Path("player_state.json")
 
 DEFAULT_POST_SEND_DELAYS = {
-    "/elder": 5,
-    "/growth": 3,
-    "/diet1": 2,
-    "/diet2": 2,
-    "/diet3": 2,
-    "/hunger": 3,
+    "/elder": 3,
+    "/growth": 2,
+    "/diet1": 1,
+    "/diet2": 1,
+    "/diet3": 1,
+    "/hunger": 1,
     "/health": 1,
 }
 
