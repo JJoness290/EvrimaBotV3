@@ -1939,6 +1939,10 @@ async def process_bot_presence_and_recovery(players: dict):
     bot_detected_from_rcon = False
     rcon_players = {}
     rcon_error = ""
+    if debug_detection:
+        print(f"[ADMIN BOT DEBUG] configured name={cfg_presence.get('player_name', '')}")
+        print(f"[ADMIN BOT DEBUG] configured steam_id={cfg_presence.get('steam_id', '')}")
+        print(f"[ADMIN BOT DEBUG] tracked players={players}")
     if now - float(bot_runtime_state.get("last_rcon_check_at", 0.0) or 0.0) >= rcon_check_interval:
         bot_runtime_state["last_rcon_check_at"] = now
         bot_runtime_state["startup_rcon_checked"] = True
@@ -1954,14 +1958,20 @@ async def process_bot_presence_and_recovery(players: dict):
                     if debug_detection:
                         print("[RCON] admin bot detected")
                 elif debug_detection:
+                    print("[RCON] returned players but no configured identity match")
                     print("[RCON] admin bot not found")
             elif debug_detection:
+                print("[RCON] returned no players")
                 print("[RCON] no players found")
         except Exception as e:
             rcon_error = str(e)
             bot_runtime_state["last_rcon_error"] = rcon_error
             if debug_detection:
                 print("[RCON] error querying server")
+    if debug_detection:
+        print(f"[ADMIN BOT DEBUG] rcon players={rcon_players}")
+        print(f"[ADMIN BOT DEBUG] tracked match={bot_detected_from_logs}")
+        print(f"[ADMIN BOT DEBUG] rcon match={bot_detected_from_rcon}")
 
     last_seen_at = float(bot_runtime_state.get("last_bot_seen_at", 0.0) or 0.0)
     valid_last_seen_at = get_valid_last_seen_at()
@@ -2010,6 +2020,8 @@ async def process_bot_presence_and_recovery(players: dict):
             queue_sustain_commands()
             bot_runtime_state["last_sustain_at"] = now
             print("[BOT SUSTAIN] next sustain in 600s")
+            if debug_detection:
+                print(f"[ADMIN BOT DEBUG] detection source chosen={detected_source}")
             await refresh_admin_dashboard(force=True)
     else:
         if warmup_active or (not fresh_checks_complete):
@@ -2087,32 +2099,55 @@ async def process_bot_presence_and_recovery(players: dict):
 
 def parse_rcon_playerlist(raw_text: str):
     lines = [l.strip() for l in str(raw_text or "").splitlines() if l.strip()]
-    ids, names = None, None
+    players: dict[str, str] = {}
+
     for line in lines:
-        if "," not in line:
+        if not re.search(r"\d{17}", line):
             continue
-        parts = [p.strip() for p in line.split(",") if p.strip()]
-        if all(p.isdigit() for p in parts):
-            ids = parts
-        else:
-            names = parts
-    if ids and names:
-        return {ids[i]: names[i] for i in range(min(len(ids), len(names)))}
-    fallback = {}
-    for line in lines:
-        m = re.match(r"^\s*(\d{17})\s+(.+?)\s*$", line)
+        if re.search(r"steam\s*id", line, re.IGNORECASE) and re.search(r"\bname\b", line, re.IGNORECASE) and not re.search(r"\d{17}", line):
+            continue
+
+        # Name: <name>, SteamID: <id>
+        steam_label = re.search(r"steam\s*id\s*[:=]\s*(\d{17})", line, re.IGNORECASE)
+        name_label = re.search(r"name\s*[:=]\s*([^,|]+)", line, re.IGNORECASE)
+        if steam_label and name_label:
+            players[steam_label.group(1)] = str(name_label.group(1)).strip()
+            continue
+
+        # steamid,name | steamid name | steamid<TAB>name
+        m = re.match(r"^\s*(\d{17})\s*[,|\t:\- ]+\s*(.+?)\s*$", line)
         if m:
-            fallback[m.group(1)] = m.group(2).strip()
-    return fallback
+            players[m.group(1)] = str(m.group(2)).strip()
+            continue
+
+        # name (steamid) / name [steamid]
+        m = re.match(r"^\s*(.+?)\s*[\(\[]\s*(\d{17})\s*[\)\]]\s*$", line)
+        if m:
+            players[m.group(2)] = str(m.group(1)).strip()
+            continue
+
+        # name,steamid | name<TAB>steamid
+        m = re.match(r"^\s*(.+?)\s*[,|\t]+\s*(\d{17})\s*$", line)
+        if m:
+            players[m.group(2)] = str(m.group(1)).strip()
+            continue
+
+    return players
 
 
 def get_rcon_playerlist():
     print("[RCON] checking playerlist...")
     raw = run_rcon("list")
+    raw_text = str(raw or "")
+    raw_lines = raw_text.splitlines()
+    print(f"[RCON DEBUG] raw length={len(raw_text)}")
+    for idx, line in enumerate(raw_lines[:5], start=1):
+        print(f"[RCON DEBUG] raw preview line {idx}: {line}")
     lowered = str(raw or "").lower()
     if "error" in lowered or "timeout" in lowered:
         raise RuntimeError("RCON timeout/error")
     players = parse_rcon_playerlist(raw)
+    print(f"[RCON DEBUG] parsed players: {players}")
     if players:
         return players
     print("[RCON] no players found")
@@ -2806,8 +2841,15 @@ async def on_ready():
     print(f"[BOT STARTED] Logged in as {bot.user}")
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
-    if bot_runtime_state.get("startup_initialized") and tracking_loop.is_running():
+    if bot_runtime_state.get("startup_initialized"):
         print("[STARTUP] duplicate on_ready prevented (startup already initialized)")
+        if not tracking_loop.is_running():
+            tracking_loop.change_interval(seconds=get_scan_interval_seconds())
+            tracking_loop.start()
+            print("[TRACKING STARTED] background tracking loop online")
+        if not announcement_loop.is_running():
+            announcement_loop.start()
+            print("[ANNOUNCEMENTS STARTED]")
         return
     bot_runtime_state["admin_bot_state"] = "UNKNOWN"
     bot_runtime_state["startup_started_at"] = time.time()
