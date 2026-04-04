@@ -133,6 +133,7 @@ server_health_state = {
     "success_count": 0,
     "last_status_at": None,
     "last_health_poll": 0.0,
+    "last_skip_log_at": 0.0,
 }
 patreon_role_cache = {}
 last_role_cache_refresh = 0.0
@@ -166,6 +167,7 @@ bot_runtime_state = {
     "startup_tracking_checked": False,
     "startup_rcon_checked": False,
     "startup_warmup_complete_logged": False,
+    "startup_initialized": False,
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
     "empty_playerlist_logged_at": 0.0,
@@ -1427,6 +1429,22 @@ def _fmt_ts(ts_value):
         return str(ts_value)
 
 
+def is_any_claim_waiting_for_precheck() -> bool:
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+    return any(str(p.get("status", "")).upper() == "PRECHECK_VERIFYING" for p in purchases)
+
+
+def is_any_claim_waiting_for_final_verify() -> bool:
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+    return any(str(p.get("status", "")).upper() == "FINAL_VERIFY_PENDING" for p in purchases)
+
+
+def has_active_claim_verification_work() -> bool:
+    return is_any_claim_waiting_for_precheck() or is_any_claim_waiting_for_final_verify()
+
+
 def is_bot_present_in_players(players: dict):
     matched, _, _ = detect_admin_bot_match(players, log_debug=False, source_label="generic")
     return matched
@@ -1777,10 +1795,13 @@ async def refresh_admin_dashboard(force: bool = False):
     save_state()
     admin_runtime_state["last_dashboard_refresh_at"] = now
 
-def _classify_health_status():
+def _classify_health_status(skip_sftp: bool = False):
     rcon_ok = detect_server_back_up()
-    lines, sftp_err = read_remote_log_tail(2048)
-    sftp_ok = sftp_err is None and isinstance(lines, list)
+    if skip_sftp:
+        sftp_ok = rcon_ok
+    else:
+        lines, sftp_err = read_remote_log_tail(2048)
+        sftp_ok = sftp_err is None and isinstance(lines, list)
 
     if rcon_ok and sftp_ok:
         return "ONLINE"
@@ -1796,7 +1817,18 @@ async def process_server_health_updates():
         return
     server_health_state["last_health_poll"] = now_ts
 
-    health = await asyncio.to_thread(_classify_health_status)
+    no_players_online = len(online_since) == 0
+    no_active_verify = not has_active_claim_verification_work()
+    skip_sftp = bool(no_players_online and no_active_verify)
+    if skip_sftp:
+        now_skip = time.time()
+        if now_skip - float(server_health_state.get("last_skip_log_at", 0.0) or 0.0) > 30:
+            print("[SFTP LOG] skipped (no active verification work)")
+            print("[CLAIM] skipped remote log poll (no active claim)")
+            print("[TRACKING] skipped remote log read (server empty)")
+            server_health_state["last_skip_log_at"] = now_skip
+
+    health = await asyncio.to_thread(_classify_health_status, skip_sftp)
     previous = server_health_state.get("status", "ONLINE")
 
     if health == "ONLINE":
@@ -2774,13 +2806,18 @@ async def on_ready():
     print(f"[BOT STARTED] Logged in as {bot.user}")
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
+    if bot_runtime_state.get("startup_initialized") and tracking_loop.is_running():
+        print("[STARTUP] duplicate on_ready prevented (startup already initialized)")
+        return
     bot_runtime_state["admin_bot_state"] = "UNKNOWN"
     bot_runtime_state["startup_started_at"] = time.time()
     bot_runtime_state["startup_tracking_checked"] = False
     bot_runtime_state["startup_rcon_checked"] = False
     bot_runtime_state["startup_warmup_complete_logged"] = False
+    bot_runtime_state["startup_initialized"] = True
     print("[ADMIN BOT] startup warmup active")
     cfg_presence = get_bot_presence_config()
+    debug_detection = bool(cfg_presence.get("debug_admin_bot_detection", False))
     print(f"[ADMIN BOT CONFIG] player_name={str(cfg_presence.get('player_name', '')).strip() or '(empty)'}")
     print(f"[ADMIN BOT CONFIG] steam_id={str(cfg_presence.get('steam_id', '')).strip() or '(empty)'}")
     if (not str(cfg_presence.get("player_name", "")).strip()) and (not str(cfg_presence.get("steam_id", "")).strip()):
@@ -2809,9 +2846,13 @@ async def on_ready():
         tracking_loop.change_interval(seconds=get_scan_interval_seconds())
         tracking_loop.start()
         print("[TRACKING STARTED] background tracking loop online")
+    else:
+        print("[TRACKING] duplicate start prevented (already running)")
 
     if not announcement_loop.is_running():
         announcement_loop.start()
+    else:
+        print("[ANNOUNCEMENTS] duplicate start prevented (already running)")
     print("[ANNOUNCEMENTS STARTED]")
 
     for guild in bot.guilds:
