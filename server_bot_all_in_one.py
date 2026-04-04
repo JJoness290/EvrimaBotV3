@@ -1566,7 +1566,7 @@ async def _send_or_edit_restart_message(text: str, title: str = "Server Status",
 
 def detect_server_back_up():
     try:
-        raw = run_rcon("list")
+        raw = run_rcon("listplayers")
         lowered = str(raw or "").lower()
         if "error" in lowered and "connection" in lowered:
             return False
@@ -2136,8 +2136,12 @@ def parse_rcon_playerlist(raw_text: str):
 
 
 def get_rcon_playerlist():
-    print("[RCON] checking playerlist...")
-    raw = run_rcon("list")
+    print("[RCON] checking playerlist (listplayers)...")
+    try:
+        raw = run_rcon("listplayers")
+    except Exception:
+        time.sleep(0.5)
+        raw = run_rcon("listplayers")
     raw_text = str(raw or "")
     raw_lines = raw_text.splitlines()
     print(f"[RCON DEBUG] raw length={len(raw_text)}")
