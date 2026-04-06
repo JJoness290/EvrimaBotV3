@@ -1735,7 +1735,7 @@ async def _send_or_edit_restart_message(text: str, title: str = "Server Status",
 
 def detect_server_back_up():
     try:
-        raw = run_rcon("listplayers")
+        raw = run_rcon("playerlist")
         lowered = str(raw or "").lower()
         if "error" in lowered and "connection" in lowered:
             return False
@@ -2331,21 +2331,21 @@ def is_usable_rcon_playerlist_output(raw_text: str) -> bool:
 
 
 def get_rcon_playerlist():
-    print("[RCON] checking playerlist (listplayers)...")
+    print("[RCON] checking playerlist (playerlist)...")
     raw = ""
     try:
-        raw = run_rcon_raw("listplayers")
+        raw = run_rcon_raw("playerlist")
     except Exception as e:
-        print(f"[RCON RAW] listplayers failed: {e}")
+        print(f"[RCON RAW] playerlist failed: {e}")
         raw = ""
 
     if not is_usable_rcon_playerlist_output(raw):
         print("[RCON RAW] unusable output; falling back to legacy backend")
         try:
-            raw = run_rcon("listplayers")
+            raw = run_rcon("playerlist")
         except Exception:
             time.sleep(0.5)
-            raw = run_rcon("listplayers")
+            raw = run_rcon("playerlist")
 
     raw_text = str(raw or "")
     raw_lines = raw_text.splitlines()
