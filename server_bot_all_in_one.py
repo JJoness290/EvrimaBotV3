@@ -9,6 +9,8 @@ import time
 import re
 import uuid
 import os
+import socket
+import struct
 import stat
 import threading
 import tempfile
@@ -1252,6 +1254,106 @@ def run_rcon(command):
     return last_cleaned or last_raw
 
 
+def run_rcon_raw(command: str) -> str:
+    AUTH = 3
+    AUTH_RESPONSE = 2
+    COMMAND = 2
+    RESPONSE_VALUE = 0
+    request_id = int(time.time() * 1000) & 0x7FFFFFFF
+
+    def _pack_packet(req_id: int, packet_type: int, payload: str) -> bytes:
+        body = struct.pack("<ii", req_id, packet_type) + payload.encode("utf-8", errors="ignore") + b"\x00\x00"
+        return struct.pack("<i", len(body)) + body
+
+    def _recv_exact(sock_obj: socket.socket, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = sock_obj.recv(size - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+
+    def _read_packet(sock_obj: socket.socket):
+        header = _recv_exact(sock_obj, 4)
+        if len(header) < 4:
+            return None
+        packet_len = struct.unpack("<i", header)[0]
+        if packet_len < 10:
+            return None
+        body = _recv_exact(sock_obj, packet_len)
+        if len(body) < packet_len:
+            return None
+        req_id, packet_type = struct.unpack("<ii", body[:8])
+        payload_bytes = body[8:-2] if packet_len >= 10 else b""
+        payload = payload_bytes.decode("utf-8", errors="ignore")
+        return req_id, packet_type, payload
+
+    def _is_useful_line(line: str) -> bool:
+        trimmed = str(line or "").strip()
+        if not trimmed:
+            return False
+        lowered = trimmed.lower()
+        noise_prefixes = (
+            "tcp connection established with server",
+            "sending:",
+            "password accepted",
+            "[info",
+            "connected to",
+        )
+        return not any(lowered.startswith(p) for p in noise_prefixes)
+
+    response_parts = []
+    timeout_seconds = 6
+    print(f"[RCON RAW] connecting to {RCON_IP}:{RCON_PORT}")
+    with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=timeout_seconds) as sock_obj:
+        sock_obj.settimeout(timeout_seconds)
+        sock_obj.sendall(_pack_packet(request_id, AUTH, RCON_PASSWORD))
+        auth_success = False
+        auth_deadline = time.time() + timeout_seconds
+        while time.time() < auth_deadline:
+            packet = _read_packet(sock_obj)
+            if packet is None:
+                break
+            resp_id, packet_type, payload = packet
+            if packet_type == AUTH_RESPONSE:
+                auth_success = (resp_id == request_id and resp_id != -1)
+                break
+            if packet_type == RESPONSE_VALUE and payload:
+                response_parts.append(payload)
+        print(f"[RCON RAW] auth success={auth_success}")
+        if not auth_success:
+            return ""
+
+        response_parts.clear()
+        print(f"[RCON RAW] sending command={command}")
+        command_id = request_id + 1
+        sentinel_id = request_id + 2
+        sock_obj.sendall(_pack_packet(command_id, COMMAND, command))
+        sock_obj.sendall(_pack_packet(sentinel_id, COMMAND, ""))
+
+        while True:
+            try:
+                packet = _read_packet(sock_obj)
+            except socket.timeout:
+                break
+            if packet is None:
+                break
+            resp_id, packet_type, payload = packet
+            if packet_type == RESPONSE_VALUE:
+                if resp_id == sentinel_id and payload == "":
+                    break
+                if resp_id in (command_id, request_id):
+                    response_parts.append(payload)
+
+    cleaned_lines = [ln.strip() for chunk in response_parts for ln in str(chunk or "").splitlines() if _is_useful_line(ln)]
+    response_text = "\n".join(cleaned_lines).strip()
+    for idx, line in enumerate(cleaned_lines[:5], start=1):
+        print(f"[RCON RAW] response line {idx}: {line}")
+    print(f"[RCON RAW] response length={len(response_text)}")
+    return response_text
+
+
 def clean_message(msg):
     return msg.encode("ascii", "ignore").decode()
 
@@ -1980,6 +2082,13 @@ def map_server_state():
     return SERVER_STATE_DOWN
 
 
+def log_startup_warmup_banner_once():
+    if bot_runtime_state.get("startup_warmup_banner_logged", False):
+        return
+    print("[ADMIN BOT] startup warmup active")
+    bot_runtime_state["startup_warmup_banner_logged"] = True
+
+
 async def process_bot_presence_and_recovery(players: dict):
     cfg_presence = get_bot_presence_config()
     debug_detection = bool(cfg_presence.get("debug_admin_bot_detection", False))
@@ -2055,9 +2164,8 @@ async def process_bot_presence_and_recovery(players: dict):
     startup_started_at = float(bot_runtime_state.get("startup_started_at", 0.0) or 0.0)
     warmup_active = startup_started_at > 0 and (now - startup_started_at) < startup_warmup_seconds
     fresh_checks_complete = bool(bot_runtime_state.get("startup_tracking_checked")) and bool(bot_runtime_state.get("startup_rcon_checked"))
-    if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)) and (not bot_runtime_state.get("startup_warmup_banner_logged", False)):
-        print("[ADMIN BOT] startup warmup active")
-        bot_runtime_state["startup_warmup_banner_logged"] = True
+    if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
+        log_startup_warmup_banner_once()
     if (not warmup_active) and fresh_checks_complete and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
         print("[ADMIN BOT] startup warmup complete")
         bot_runtime_state["startup_warmup_complete_logged"] = True
@@ -2202,13 +2310,43 @@ def parse_rcon_playerlist(raw_text: str):
     return players
 
 
+def is_usable_rcon_playerlist_output(raw_text: str) -> bool:
+    text = str(raw_text or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if any(re.search(r"\d{17}", line) for line in lines):
+        return True
+    noise_prefixes = (
+        "tcp connection established with server",
+        "sending:",
+        "password accepted",
+        "[info",
+        "connected to",
+        "auth success",
+        "response length",
+    )
+    useful_lines = [line for line in lines if not any(line.lower().startswith(prefix) for prefix in noise_prefixes)]
+    return len(useful_lines) >= 2
+
+
 def get_rcon_playerlist():
     print("[RCON] checking playerlist (listplayers)...")
+    raw = ""
     try:
-        raw = run_rcon("listplayers")
-    except Exception:
-        time.sleep(0.5)
-        raw = run_rcon("listplayers")
+        raw = run_rcon_raw("listplayers")
+    except Exception as e:
+        print(f"[RCON RAW] listplayers failed: {e}")
+        raw = ""
+
+    if not is_usable_rcon_playerlist_output(raw):
+        print("[RCON RAW] unusable output; falling back to legacy backend")
+        try:
+            raw = run_rcon("listplayers")
+        except Exception:
+            time.sleep(0.5)
+            raw = run_rcon("listplayers")
+
     raw_text = str(raw or "")
     raw_lines = raw_text.splitlines()
     print(f"[RCON DEBUG] raw length={len(raw_text)}")
@@ -2929,8 +3067,7 @@ async def on_ready():
     bot_runtime_state["startup_warmup_complete_logged"] = False
     bot_runtime_state["startup_warmup_banner_logged"] = False
     bot_runtime_state["startup_initialized"] = True
-    print("[ADMIN BOT] startup warmup active")
-    bot_runtime_state["startup_warmup_banner_logged"] = True
+    log_startup_warmup_banner_once()
     cfg_presence = get_bot_presence_config()
     debug_detection = bool(cfg_presence.get("debug_admin_bot_detection", False))
     print(f"[ADMIN BOT CONFIG] player_name={str(cfg_presence.get('player_name', '')).strip() or '(empty)'}")
