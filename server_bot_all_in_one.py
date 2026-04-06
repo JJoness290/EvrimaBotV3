@@ -2287,38 +2287,35 @@ def parse_rcon_playerlist(raw_text: str):
         )
         return any(lowered.startswith(prefix) for prefix in noise_prefixes)
 
-    lines = []
+    cleaned_lines = []
     for raw_line in str(raw_text or "").splitlines():
-        line = str(raw_line or "").strip()
+        line = str(raw_line or "").strip().rstrip(",").strip()
         if not line:
+            continue
+        if line.lower() == "playerlist":
             continue
         if _is_noise_line(line):
             continue
-        lines.append(line)
+        cleaned_lines.append(line)
 
     players: dict[str, str] = {}
-    pending_steam_id = ""
+    pending_steam_id = None
 
-    for line in lines:
-        normalized = line.rstrip(",").strip()
+    for line in cleaned_lines:
+        normalized = line.strip()
         if not normalized:
             continue
 
-        lowered = normalized.lower()
-        if lowered == "playerlist":
-            continue
-
-        steam_only = re.match(r"^\s*(\d{17})\s*$", normalized)
-        if steam_only:
-            pending_steam_id = steam_only.group(1)
+        if re.fullmatch(r"\d{17}", normalized):
+            pending_steam_id = normalized
             continue
 
         if pending_steam_id:
-            candidate_name = normalized
-            if candidate_name and not re.search(r"\d{17}", candidate_name):
-                players[pending_steam_id] = candidate_name
-                print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={candidate_name}")
-                pending_steam_id = ""
+            player_name = normalized.strip()
+            if player_name:
+                players[pending_steam_id] = player_name
+                print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={player_name}")
+                pending_steam_id = None
                 continue
 
         if not re.search(r"\d{17}", normalized):
