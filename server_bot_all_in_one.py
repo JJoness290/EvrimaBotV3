@@ -2377,16 +2377,36 @@ def get_rcon_playerlist():
         if line.startswith("[DEBUG]"):
             continue
         cleaned_lines.append(line)
-    print(f"[RCON DEBUG] sending cleaned lines to parser: {cleaned_lines[:5]}")
+    print(f"[RCON DEBUG] sending cleaned lines to parser: {cleaned_lines}")
+    players = {}
+
+    pending_steam_id = None
+
+    for line in cleaned_lines:
+        line = line.strip().rstrip(",")
+
+        if not line or line.lower() == "playerlist":
+            continue
+
+        if line.isdigit() and len(line) >= 17:
+            pending_steam_id = line
+            continue
+
+        if pending_steam_id:
+            players[pending_steam_id] = line
+            print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={line}")
+            pending_steam_id = None
+
+    print(f"[RCON DEBUG] parsed players: {players}")
     lowered = str(raw or "").lower()
     if "error" in lowered or "timeout" in lowered:
         raise RuntimeError("RCON timeout/error")
-    players = parse_rcon_playerlist("\n".join(cleaned_lines))
-    print(f"[RCON DEBUG] parsed players: {players}")
-    if players:
-        return players
-    print("[RCON] no players found")
-    return {}
+    if not players:
+        print("[RCON WARNING] playerlist parsed empty — cleaned_lines:")
+        for i, l in enumerate(cleaned_lines[:10]):
+            print(f"  {i}: {l}")
+        print("[RCON] no players found")
+    return players
 
 
 def get_players_from_rcon():
