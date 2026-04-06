@@ -2406,12 +2406,26 @@ def get_rcon_playerlist():
         for i, l in enumerate(cleaned_lines[:10]):
             print(f"  {i}: {l}")
         print("[RCON] no players found")
-    return players
+    player_list = []
+
+    for steam_id, name in players.items():
+        player_list.append({
+            "steam_id": steam_id,
+            "name": name
+        })
+
+    print(f"[RCON DEBUG] final player_list: {player_list}")
+
+    if not player_list:
+        print("[RCON WARNING] player_list EMPTY after conversion")
+
+    return player_list
 
 
 def get_players_from_rcon():
     try:
         players = get_rcon_playerlist()
+        print(f"[TRACKING DEBUG] received players: {players}")
         if players:
             return players
     except Exception:
