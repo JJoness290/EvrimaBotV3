@@ -2394,10 +2394,19 @@ def get_rcon_playerlist():
     print(f"[RCON DEBUG] raw length={len(raw_text)}")
     for idx, line in enumerate(raw_lines[:5], start=1):
         print(f"[RCON DEBUG] raw preview line {idx}: {line}")
+    cleaned_lines = []
+    for line in raw_lines:
+        line = str(line or "").strip()
+        if not line:
+            continue
+        if line.startswith("[DEBUG]"):
+            continue
+        cleaned_lines.append(line)
+    print(f"[RCON DEBUG] sending cleaned lines to parser: {cleaned_lines[:5]}")
     lowered = str(raw or "").lower()
     if "error" in lowered or "timeout" in lowered:
         raise RuntimeError("RCON timeout/error")
-    players = parse_rcon_playerlist(raw)
+    players = parse_rcon_playerlist("\n".join(cleaned_lines))
     print(f"[RCON DEBUG] parsed players: {players}")
     if players:
         return players
