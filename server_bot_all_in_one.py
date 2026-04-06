@@ -167,6 +167,7 @@ bot_runtime_state = {
     "startup_tracking_checked": False,
     "startup_rcon_checked": False,
     "startup_warmup_complete_logged": False,
+    "startup_warmup_banner_logged": False,
     "startup_initialized": False,
     "last_sustain_at": 0.0,
     "last_presence_log_at": 0.0,
@@ -1174,15 +1175,81 @@ def get_online_players_from_data():
 
 
 def run_rcon(command):
-    result = subprocess.run([
-        "python",
-        RCON_SCRIPT,
-        "--ip", RCON_IP,
-        "--port", RCON_PORT,
-        "--password", RCON_PASSWORD,
-        "--command", command
-    ], input="\n", capture_output=True, text=True)
-    return (result.stdout or "") + (result.stderr or "")
+    def _noise_line(line: str) -> bool:
+        l = str(line or "").strip().lower()
+        if not l:
+            return True
+        noise_prefixes = (
+            "tcp connection established with server",
+            "sending:",
+            "password accepted",
+            "[info",
+            "connected to",
+        )
+        return any(l.startswith(p) for p in noise_prefixes)
+
+    def _clean_response(raw_text: str):
+        lines = [str(x).rstrip() for x in str(raw_text or "").splitlines()]
+        useful = [ln for ln in lines if not _noise_line(ln)]
+        return "\n".join(useful).strip()
+
+    def _is_usable(cleaned_text: str):
+        if not cleaned_text:
+            return False
+        lines = [ln.strip() for ln in cleaned_text.splitlines() if ln.strip()]
+        if any(re.search(r"\d{17}", ln) for ln in lines):
+            return True
+        return any(len(ln) >= 3 for ln in lines)
+
+    def _run_backend(backend: str):
+        if backend == "RconCli":
+            argv = [RCONCLI_PATH, RCON_IP, RCON_PORT, RCON_PASSWORD, command]
+        else:
+            argv = [
+                "python",
+                RCON_SCRIPT,
+                "--ip", RCON_IP,
+                "--port", RCON_PORT,
+                "--password", RCON_PASSWORD,
+                "--command", command,
+            ]
+        print(f"[RCON DEBUG] backend={backend}")
+        print(f"[RCON DEBUG] command={command}")
+        print(f"[RCON DEBUG] argv={argv}")
+        result = subprocess.run(argv, input="\n", capture_output=True, text=True, timeout=20)
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        print(f"[RCON DEBUG] returncode={result.returncode}")
+        for idx, line in enumerate(stdout.splitlines()[:3], start=1):
+            print(f"[RCON DEBUG] stdout line {idx}: {line}")
+        for idx, line in enumerate(stderr.splitlines()[:3], start=1):
+            print(f"[RCON DEBUG] stderr line {idx}: {line}")
+        merged = f"{stdout}\n{stderr}".strip()
+        cleaned = _clean_response(merged)
+        for idx, line in enumerate(cleaned.splitlines()[:3], start=1):
+            print(f"[RCON DEBUG] cleaned response line {idx}: {line}")
+        return cleaned, merged
+
+    backends = []
+    if Path(RCONCLI_PATH).exists():
+        backends.append("RconCli")
+    if Path(RCON_SCRIPT).exists():
+        backends.append("PythonScript")
+    if not backends:
+        backends = ["PythonScript", "RconCli"]
+
+    last_cleaned = ""
+    last_raw = ""
+    for backend in backends:
+        try:
+            cleaned, raw = _run_backend(backend)
+            last_cleaned, last_raw = cleaned, raw
+            if _is_usable(cleaned):
+                return cleaned
+        except Exception as e:
+            print(f"[RCON DEBUG] backend={backend} failed: {e}")
+            continue
+    return last_cleaned or last_raw
 
 
 def clean_message(msg):
@@ -1988,9 +2055,9 @@ async def process_bot_presence_and_recovery(players: dict):
     startup_started_at = float(bot_runtime_state.get("startup_started_at", 0.0) or 0.0)
     warmup_active = startup_started_at > 0 and (now - startup_started_at) < startup_warmup_seconds
     fresh_checks_complete = bool(bot_runtime_state.get("startup_tracking_checked")) and bool(bot_runtime_state.get("startup_rcon_checked"))
-    if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)) and now - bot_runtime_state.get("last_presence_log_at", 0.0) > 10:
+    if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)) and (not bot_runtime_state.get("startup_warmup_banner_logged", False)):
         print("[ADMIN BOT] startup warmup active")
-        bot_runtime_state["last_presence_log_at"] = now
+        bot_runtime_state["startup_warmup_banner_logged"] = True
     if (not warmup_active) and fresh_checks_complete and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
         print("[ADMIN BOT] startup warmup complete")
         bot_runtime_state["startup_warmup_complete_logged"] = True
@@ -2860,8 +2927,10 @@ async def on_ready():
     bot_runtime_state["startup_tracking_checked"] = False
     bot_runtime_state["startup_rcon_checked"] = False
     bot_runtime_state["startup_warmup_complete_logged"] = False
+    bot_runtime_state["startup_warmup_banner_logged"] = False
     bot_runtime_state["startup_initialized"] = True
     print("[ADMIN BOT] startup warmup active")
+    bot_runtime_state["startup_warmup_banner_logged"] = True
     cfg_presence = get_bot_presence_config()
     debug_detection = bool(cfg_presence.get("debug_admin_bot_detection", False))
     print(f"[ADMIN BOT CONFIG] player_name={str(cfg_presence.get('player_name', '')).strip() or '(empty)'}")
