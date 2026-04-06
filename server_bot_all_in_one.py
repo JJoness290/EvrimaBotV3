@@ -2298,57 +2298,32 @@ def parse_rcon_playerlist(raw_text: str):
             continue
         cleaned_lines.append(line)
 
-    players: dict[str, str] = {}
+    players = {}
     pending_steam_id = None
 
     for line in cleaned_lines:
-        normalized = line.strip()
-        if not normalized:
+        line = line.strip().rstrip(",")
+
+        if not line or line.lower() == "playerlist":
             continue
 
-        if re.fullmatch(r"\d{17}", normalized):
-            pending_steam_id = normalized
+        # Steam ID line
+        if line.isdigit() and len(line) >= 17:
+            pending_steam_id = line
             continue
 
+        # Name line
         if pending_steam_id:
-            player_name = normalized.strip()
-            if player_name:
-                players[pending_steam_id] = player_name
-                print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={player_name}")
-                pending_steam_id = None
-                continue
-
-        if not re.search(r"\d{17}", normalized):
-            continue
-        if re.search(r"steam\s*id", normalized, re.IGNORECASE) and re.search(r"\bname\b", normalized, re.IGNORECASE) and not re.search(r"\d{17}", normalized):
-            continue
-
-        # Name: <name>, SteamID: <id>
-        steam_label = re.search(r"steam\s*id\s*[:=]\s*(\d{17})", normalized, re.IGNORECASE)
-        name_label = re.search(r"name\s*[:=]\s*([^,|]+)", normalized, re.IGNORECASE)
-        if steam_label and name_label:
-            players[steam_label.group(1)] = str(name_label.group(1)).strip()
-            continue
-
-        # steamid,name | steamid name | steamid<TAB>name
-        m = re.match(r"^\s*(\d{17})\s*[,|\t:\- ]+\s*(.+?)\s*$", normalized)
-        if m:
-            players[m.group(1)] = str(m.group(2)).strip()
-            continue
-
-        # name (steamid) / name [steamid]
-        m = re.match(r"^\s*(.+?)\s*[\(\[]\s*(\d{17})\s*[\)\]]\s*$", normalized)
-        if m:
-            players[m.group(2)] = str(m.group(1)).strip()
-            continue
-
-        # name,steamid | name<TAB>steamid
-        m = re.match(r"^\s*(.+?)\s*[,|\t]+\s*(\d{17})\s*$", normalized)
-        if m:
-            players[m.group(2)] = str(m.group(1)).strip()
-            continue
+            players[pending_steam_id] = line
+            print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={line}")
+            pending_steam_id = None
 
     print(f"[RCON DEBUG] parsed players: {players}")
+    if not players:
+        print("[RCON WARNING] playerlist parsed empty — raw cleaned_lines:")
+        for i, l in enumerate(cleaned_lines[:10]):
+            print(f"  {i}: {l}")
+
     return players
 
 
