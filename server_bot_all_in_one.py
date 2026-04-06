@@ -2273,40 +2273,85 @@ async def process_bot_presence_and_recovery(players: dict):
     await refresh_admin_dashboard()
 
 def parse_rcon_playerlist(raw_text: str):
-    lines = [l.strip() for l in str(raw_text or "").splitlines() if l.strip()]
+    def _is_noise_line(line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return True
+        noise_prefixes = (
+            "[debug]",
+            "tcp connection established with server",
+            "sending:",
+            "password accepted",
+            "connected to",
+            "[info",
+        )
+        return any(lowered.startswith(prefix) for prefix in noise_prefixes)
+
+    lines = []
+    for raw_line in str(raw_text or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if _is_noise_line(line):
+            continue
+        lines.append(line)
+
     players: dict[str, str] = {}
+    pending_steam_id = ""
 
     for line in lines:
-        if not re.search(r"\d{17}", line):
+        normalized = line.rstrip(",").strip()
+        if not normalized:
             continue
-        if re.search(r"steam\s*id", line, re.IGNORECASE) and re.search(r"\bname\b", line, re.IGNORECASE) and not re.search(r"\d{17}", line):
+
+        lowered = normalized.lower()
+        if lowered == "playerlist":
+            continue
+
+        steam_only = re.match(r"^\s*(\d{17})\s*$", normalized)
+        if steam_only:
+            pending_steam_id = steam_only.group(1)
+            continue
+
+        if pending_steam_id:
+            candidate_name = normalized
+            if candidate_name and not re.search(r"\d{17}", candidate_name):
+                players[pending_steam_id] = candidate_name
+                print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={candidate_name}")
+                pending_steam_id = ""
+                continue
+
+        if not re.search(r"\d{17}", normalized):
+            continue
+        if re.search(r"steam\s*id", normalized, re.IGNORECASE) and re.search(r"\bname\b", normalized, re.IGNORECASE) and not re.search(r"\d{17}", normalized):
             continue
 
         # Name: <name>, SteamID: <id>
-        steam_label = re.search(r"steam\s*id\s*[:=]\s*(\d{17})", line, re.IGNORECASE)
-        name_label = re.search(r"name\s*[:=]\s*([^,|]+)", line, re.IGNORECASE)
+        steam_label = re.search(r"steam\s*id\s*[:=]\s*(\d{17})", normalized, re.IGNORECASE)
+        name_label = re.search(r"name\s*[:=]\s*([^,|]+)", normalized, re.IGNORECASE)
         if steam_label and name_label:
             players[steam_label.group(1)] = str(name_label.group(1)).strip()
             continue
 
         # steamid,name | steamid name | steamid<TAB>name
-        m = re.match(r"^\s*(\d{17})\s*[,|\t:\- ]+\s*(.+?)\s*$", line)
+        m = re.match(r"^\s*(\d{17})\s*[,|\t:\- ]+\s*(.+?)\s*$", normalized)
         if m:
             players[m.group(1)] = str(m.group(2)).strip()
             continue
 
         # name (steamid) / name [steamid]
-        m = re.match(r"^\s*(.+?)\s*[\(\[]\s*(\d{17})\s*[\)\]]\s*$", line)
+        m = re.match(r"^\s*(.+?)\s*[\(\[]\s*(\d{17})\s*[\)\]]\s*$", normalized)
         if m:
             players[m.group(2)] = str(m.group(1)).strip()
             continue
 
         # name,steamid | name<TAB>steamid
-        m = re.match(r"^\s*(.+?)\s*[,|\t]+\s*(\d{17})\s*$", line)
+        m = re.match(r"^\s*(.+?)\s*[,|\t]+\s*(\d{17})\s*$", normalized)
         if m:
             players[m.group(2)] = str(m.group(1)).strip()
             continue
 
+    print(f"[RCON DEBUG] parsed players: {players}")
     return players
 
 
