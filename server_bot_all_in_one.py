@@ -176,6 +176,7 @@ bot_runtime_state = {
     "empty_playerlist_logged_at": 0.0,
     "log_suppression": {},
     "last_tracking_summary_at": 0.0,
+    "last_successful_players": {},
 }
 admin_runtime_state = {
     "outage_active": False,
@@ -1741,15 +1742,13 @@ def poll_player_snapshot():
         "server_state": map_server_state(),
         "error": "",
     }
-    try:
-        players_raw = get_players_from_rcon()
-        players = normalize_players_map(players_raw)
-        snapshot["players"] = players
-        snapshot["player_count"] = len(players)
-        snapshot["success"] = True
-    except Exception as e:
-        snapshot["error"] = str(e)
-        log_error("RCON", f"player poll failed: {e}")
+    poll_result = get_players_from_rcon()
+    players = normalize_players_map(poll_result.get("players", {}))
+    snapshot["players"] = players
+    snapshot["player_count"] = int(poll_result.get("player_count", len(players)) or len(players))
+    snapshot["source"] = str(poll_result.get("source", "RCON") or "RCON")
+    snapshot["success"] = bool(poll_result.get("success", False))
+    snapshot["error"] = str(poll_result.get("error", "") or "")
     return snapshot
 
 
@@ -2364,14 +2363,14 @@ def parse_rcon_playerlist(raw_text: str):
         # Name line
         if pending_steam_id:
             players[pending_steam_id] = line
-            print(f"[RCON DEBUG] paired steam_id={pending_steam_id} with name={line}")
+            log_debug("RCON", f"paired steam_id={pending_steam_id} with name={line}", flag="debug_rcon")
             pending_steam_id = None
 
-    print(f"[RCON DEBUG] parsed players: {players}")
+    log_debug("RCON", f"parsed players: {players}", flag="debug_rcon")
     if not players:
-        print("[RCON WARNING] playerlist parsed empty — raw cleaned_lines:")
+        log_debug("RCON", "playerlist parsed empty", flag="debug_rcon")
         for i, l in enumerate(cleaned_lines[:10]):
-            print(f"  {i}: {l}")
+            log_debug("RCON", f"cleaned[{i}]={l}", flag="debug_rcon")
 
     return players
 
@@ -2397,63 +2396,96 @@ def is_usable_rcon_playerlist_output(raw_text: str) -> bool:
 
 
 def get_rcon_playerlist():
-    log_info("RCON", "checking playerlist (playerlist)...")
-    raw = ""
+    def _clean_lines(raw_text: str):
+        raw_lines = str(raw_text or "").splitlines()
+        cleaned = []
+        for line in raw_lines:
+            line = str(line or "").strip()
+            if not line:
+                continue
+            if line.startswith("[DEBUG]"):
+                continue
+            cleaned.append(line)
+        return cleaned
+
+    def _has_transport_error(raw_text: str):
+        lowered = str(raw_text or "").lower()
+        return any(token in lowered for token in ("timeout", "error", "failed", "exception"))
+
+    def _build_success(players: dict, source: str, error: str = ""):
+        return {
+            "success": True,
+            "players": normalize_players_map(players),
+            "player_count": len(normalize_players_map(players)),
+            "source": source,
+            "error": error,
+        }
+
+    raw_text = ""
+    raw_error = ""
     try:
-        raw = run_rcon_raw("playerlist")
+        raw_text = str(run_rcon_raw("playerlist") or "")
     except Exception as e:
-        log_warn("RCON", f"raw playerlist failed: {e}")
-        raw = ""
+        raw_error = str(e)
+        log_debug("RCON", f"raw backend exception: {e}", flag="debug_rcon")
 
-    if not is_usable_rcon_playerlist_output(raw):
-        log_warn("RCON", "raw output unusable; falling back to legacy backend")
-        try:
-            raw = run_rcon("playerlist")
-        except Exception:
-            time.sleep(0.5)
-            raw = run_rcon("playerlist")
+    raw_cleaned_lines = _clean_lines(raw_text)
+    log_debug("RCON", f"raw cleaned lines preview: {raw_cleaned_lines[:5]}", flag="debug_rcon")
+    raw_players = parse_rcon_playerlist("\n".join(raw_cleaned_lines)) if raw_cleaned_lines else {}
+    if raw_players:
+        return _build_success(raw_players, "RCON_RAW")
+    if raw_cleaned_lines and (not _has_transport_error(raw_text)):
+        return _build_success({}, "RCON_RAW")
 
-    raw_text = str(raw or "")
-    if not raw_text.strip():
-        raise RuntimeError("RCON playerlist response was empty")
-    raw_lines = raw_text.splitlines()
-    log_debug("RCON", f"raw length={len(raw_text)}", flag="debug_rcon")
-    for idx, line in enumerate(raw_lines[:5], start=1):
-        log_debug("RCON", f"raw preview line {idx}: {line}", flag="debug_rcon")
-    cleaned_lines = []
-    for line in raw_lines:
-        line = str(line or "").strip()
-        if not line:
-            continue
-        if line.startswith("[DEBUG]"):
-            continue
-        cleaned_lines.append(line)
-    log_debug("RCON", f"sending cleaned lines to parser: {cleaned_lines[:5]}", flag="debug_rcon")
-    lowered = str(raw or "").lower()
-    if "error" in lowered or "timeout" in lowered:
-        raise RuntimeError("RCON timeout/error")
-    players = parse_rcon_playerlist("\n".join(cleaned_lines))
-    if not players:
-        log_warn("RCON", "playerlist parsed empty — cleaned_lines:")
-        for i, l in enumerate(cleaned_lines[:10]):
-            print(f"  {i}: {l}")
-        log_info("RCON", "no players found")
-    return players
+    fallback_text = ""
+    fallback_error = ""
+    try:
+        fallback_text = str(run_rcon("playerlist") or "")
+    except Exception as e:
+        fallback_error = str(e)
+        log_debug("RCON", f"fallback backend exception: {e}", flag="debug_rcon")
+
+    fallback_cleaned_lines = _clean_lines(fallback_text)
+    log_debug("RCON", f"fallback cleaned lines preview: {fallback_cleaned_lines[:5]}", flag="debug_rcon")
+    fallback_players = parse_rcon_playerlist("\n".join(fallback_cleaned_lines)) if fallback_cleaned_lines else {}
+    if fallback_players:
+        return _build_success(fallback_players, "RCONCLI")
+    if fallback_cleaned_lines and (not _has_transport_error(fallback_text)):
+        return _build_success({}, "RCONCLI")
+
+    error_parts = []
+    if raw_error:
+        error_parts.append(f"raw={raw_error}")
+    if fallback_error:
+        error_parts.append(f"fallback={fallback_error}")
+    if _has_transport_error(raw_text):
+        error_parts.append("raw transport error")
+    if _has_transport_error(fallback_text):
+        error_parts.append("fallback transport error")
+    if not error_parts:
+        error_parts.append("unusable playerlist response")
+    return {
+        "success": False,
+        "players": {},
+        "player_count": 0,
+        "source": "RCON",
+        "error": "; ".join(error_parts),
+    }
 
 
 def get_players_from_rcon():
-    first_error = None
-    try:
-        players = get_rcon_playerlist()
-        log_debug("TRACKING", f"received players: {players}", flag="debug_presence")
-        return players
-    except Exception as e:
-        first_error = e
+    first_result = get_rcon_playerlist()
+    if first_result.get("success", False):
+        log_info("RCON", f"player poll OK via {first_result.get('source', 'RCON')} (players={int(first_result.get('player_count', 0))})")
+        return first_result
     time.sleep(0.8)
-    try:
-        return get_rcon_playerlist()
-    except Exception as e:
-        raise RuntimeError(f"RCON player poll failed after retry: {e} (first={first_error})")
+    second_result = get_rcon_playerlist()
+    if second_result.get("success", False):
+        log_info("RCON", f"player poll OK via {second_result.get('source', 'RCON')} (players={int(second_result.get('player_count', 0))})")
+        return second_result
+    error_text = str(second_result.get("error", "") or first_result.get("error", "") or "unknown error")
+    log_error("RCON", f"player poll failed: {error_text}")
+    return second_result
 
 
 def restore_state():
@@ -3094,8 +3126,13 @@ async def tracking_loop():
     try:
         await refresh_patreon_role_cache()
         snapshot = await asyncio.to_thread(poll_player_snapshot)
-        players = normalize_players_map(snapshot.get("players", {}))
-        update_players(players)
+        if snapshot.get("success", False):
+            players = normalize_players_map(snapshot.get("players", {}))
+            bot_runtime_state["last_successful_players"] = dict(players)
+            update_players(players)
+        else:
+            players = normalize_players_map(bot_runtime_state.get("last_successful_players", {}))
+            log_limited("tracking_poll_failed_keep_state", 30, "TRACKING", "player poll failed; preserving last successful snapshot", level="warn")
         tick_rewards()
         expire_old_purchases()
         await asyncio.to_thread(process_game_command_queue)
@@ -3156,8 +3193,13 @@ async def on_ready():
     if (not str(cfg_presence.get("player_name", "")).strip()) and (not str(cfg_presence.get("steam_id", "")).strip()):
         log_warn("STARTUP", "no admin bot identity configured")
     startup_snapshot = await asyncio.to_thread(poll_player_snapshot)
-    startup_players = normalize_players_map(startup_snapshot.get("players", {}))
-    update_players(startup_players)
+    if startup_snapshot.get("success", False):
+        startup_players = normalize_players_map(startup_snapshot.get("players", {}))
+        bot_runtime_state["last_successful_players"] = dict(startup_players)
+        update_players(startup_players)
+    else:
+        startup_players = normalize_players_map(bot_runtime_state.get("last_successful_players", {}))
+        log_warn("STARTUP", "initial player poll failed; using last successful snapshot")
     await process_bot_presence_and_recovery(startup_snapshot)
     admin_state = str(bot_runtime_state.get("admin_bot_state", "UNKNOWN")).lower()
     log_info("STARTUP", f"Initial player poll OK (players={len(startup_players)}, admin_bot={admin_state})")
