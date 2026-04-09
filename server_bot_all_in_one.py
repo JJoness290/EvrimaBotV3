@@ -1585,13 +1585,16 @@ def get_bot_presence_config():
 
 def get_bot_sustain_config():
     section = ConfigManager.get_section("bot_sustain")
-    commands = section.get("commands", ["/hunger 100", "/thirst 100", "/health 100"])
+    commands = section.get("commands", ["/heal 100", "/hunger 100", "/thirst 100"])
     if not isinstance(commands, list) or not commands:
-        commands = ["/hunger 100", "/thirst 100", "/health 100"]
+        commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+    normalized = [str(x).strip() for x in commands if str(x).strip()]
+    if len(normalized) != 3:
+        normalized = ["/heal 100", "/hunger 100", "/thirst 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
         "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
-        "commands": [str(x).strip() for x in commands if str(x).strip()],
+        "commands": normalized,
     }
 
 
@@ -1784,8 +1787,12 @@ def queue_priority_commands(commands: list[dict]):
 def queue_sustain_commands():
     cfg = get_bot_sustain_config()
     now_iso = datetime.now(timezone.utc).isoformat()
+    sustain_commands = cfg["commands"]
+    if len(sustain_commands) != 3:
+        sustain_commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+    batch_id = f"sustain_{int(time.time())}"
     payload = []
-    for i, cmd in enumerate(cfg["commands"], start=1):
+    for i, cmd in enumerate(sustain_commands, start=1):
         payload.append({
             "steam_id": "__bot__",
             "player_name": "SYSTEM",
@@ -1794,9 +1801,9 @@ def queue_sustain_commands():
             "status": "PENDING",
             "created_at": now_iso,
             "completed_at": None,
-            "claim_group_id": f"sustain_{int(time.time())}",
+            "claim_group_id": batch_id,
             "claim_step": i,
-            "claim_final": i == len(cfg["commands"]),
+            "claim_final": i == len(sustain_commands),
             "claim_phase": "SUSTAIN",
             "command_type": "sustain",
             "priority": 10,
@@ -1804,6 +1811,40 @@ def queue_sustain_commands():
             "max_age_seconds": cfg["interval_seconds"] * 2,
         })
     queue_priority_commands(payload)
+    log_info("BOT SUSTAIN", f"queued {len(payload)} commands")
+
+
+def has_pending_sustain_commands() -> bool:
+    with ECONOMY_LOCK:
+        commands = load_game_commands()
+    for entry in commands:
+        if str(entry.get("command_type", "")).lower() != "sustain":
+            continue
+        status = str(entry.get("status", "")).upper()
+        if status in {"PENDING", "EXECUTING"}:
+            return True
+    return False
+
+
+def try_queue_sustain(now_ts: float, cfg_sustain: dict, immediate: bool = False) -> bool:
+    if has_pending_sustain_commands():
+        log_limited("sustain_skipped_pending", 30, "BOT SUSTAIN", "skipped (already pending)")
+        return False
+    interval = int(cfg_sustain.get("interval_seconds", 600) or 600)
+    last_sustain_at = float(bot_runtime_state.get("last_sustain_at", 0.0) or 0.0)
+    if (not immediate) and last_sustain_at > 0 and (now_ts - last_sustain_at) < interval:
+        log_limited("sustain_skipped_interval", 30, "BOT SUSTAIN", "skipped (interval not reached)")
+        return False
+    queue_sustain_commands()
+    bot_runtime_state["last_sustain_at"] = now_ts
+    return True
+
+
+# Sustain behavior examples:
+# - Admin bot ONLINE transition -> immediate sustain once (heal/hunger/thirst).
+# - Admin bot stays ONLINE for >= 600s -> sustain queues again.
+# - Admin bot OFFLINE/UNKNOWN or server not ONLINE -> sustain skipped.
+# - Sustain commands already pending in queue -> skip duplicate batch.
 
 async def get_restarts_channel():
     configured_id = ConfigManager.get_int("restart_channel_id", "RESTART_CHANNEL_ID", 0, minimum=0)
@@ -2260,9 +2301,8 @@ async def process_bot_presence_and_recovery(snapshot: dict):
                 admin_runtime_state["outage_started_at"] = None
                 admin_runtime_state["offline_reminder_sent_at"] = 0.0
                 await send_admin_transition_alert(False)
-            log_info("BOT SUSTAIN", "Running immediate sustain")
-            queue_sustain_commands()
-            bot_runtime_state["last_sustain_at"] = now
+            log_info("BOT SUSTAIN", "immediate sustain on ONLINE transition")
+            try_queue_sustain(now, cfg_sustain, immediate=True)
             await refresh_admin_dashboard(force=True)
         log_debug("PRESENCE", f"matched steam_id={matched_steam_id} name={matched_name}", flag="debug_presence")
     else:
@@ -2311,10 +2351,7 @@ async def process_bot_presence_and_recovery(snapshot: dict):
                     admin_runtime_state["offline_reminder_sent_at"] = now_ts
 
     if str(bot_runtime_state.get("admin_bot_state", "OFFLINE")).upper() == "ONLINE" and cfg_sustain["enabled"]:
-        if now - float(bot_runtime_state.get("last_sustain_at", 0.0)) >= cfg_sustain["interval_seconds"]:
-            log_info("BOT SUSTAIN", "Running immediate sustain")
-            queue_sustain_commands()
-            bot_runtime_state["last_sustain_at"] = now
+        try_queue_sustain(now, cfg_sustain, immediate=False)
     elif cfg_sustain["enabled"] and str(bot_runtime_state.get("admin_bot_state", "OFFLINE")).upper() == "OFFLINE":
         log_limited("sustain_skipped_offline", 60, "BOT SUSTAIN", "skipped (offline)")
 
