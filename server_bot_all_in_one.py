@@ -136,6 +136,9 @@ server_health_state = {
     "last_status_at": None,
     "last_health_poll": 0.0,
     "last_skip_log_at": 0.0,
+    "last_remote_log_success_at": 0.0,
+    "last_remote_log_activity_signature": "",
+    "last_remote_log_activity_changed_at": 0.0,
 }
 patreon_role_cache = {}
 last_role_cache_refresh = 0.0
@@ -154,6 +157,35 @@ SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
 SERVER_STATE_SUSPECTED_DOWN = "SERVER_SUSPECTED_DOWN"
 SERVER_STATE_DOWN = "SERVER_DOWN"
 SERVER_STATE_RECOVERING = "SERVER_RECOVERING"
+
+SERVER_RESTART_MARKERS = (
+    "shutting down",
+    "server restart",
+    "exiting",
+    "session end",
+    "terminated",
+    "stopping server",
+    "map change",
+    "teardown",
+)
+SERVER_RECOVERING_MARKERS = (
+    "log init",
+    "initialized",
+    "map loaded",
+    "listening",
+    "startup complete",
+    "session created",
+    "world loaded",
+    "server started",
+)
+SERVER_CRASH_MARKERS = (
+    "fatal error",
+    "critical error",
+    "unhandled exception",
+    "crash",
+    "access violation",
+    "assert failed",
+)
 
 bot_runtime_state = {
     "presence_state": BOT_STATE_MISSING,
@@ -2313,6 +2345,28 @@ def _classify_health_status(skip_sftp: bool = False):
     return "DOWN"
 
 
+def classify_server_state_from_remote_logs(lines: list[str]):
+    text_lines = [str(x or "").strip().lower() for x in (lines or []) if str(x or "").strip()]
+    joined = "\n".join(text_lines[-200:])
+    restart_hits = [m for m in SERVER_RESTART_MARKERS if m in joined]
+    recovering_hits = [m for m in SERVER_RECOVERING_MARKERS if m in joined]
+    crash_hits = [m for m in SERVER_CRASH_MARKERS if m in joined]
+    if crash_hits:
+        return {"state": "DOWN", "reason": f"crash markers: {', '.join(crash_hits[:2])}"}
+    if restart_hits:
+        return {"state": "RESTARTING", "reason": f"restart markers: {', '.join(restart_hits[:2])}"}
+    if recovering_hits:
+        return {"state": "RECOVERING", "reason": f"startup markers: {', '.join(recovering_hits[:2])}"}
+    return {"state": "ONLINE", "reason": "no lifecycle markers"}
+
+
+def compute_remote_log_activity_signature(lines: list[str]):
+    tail = [str(x or "").strip() for x in (lines or []) if str(x or "").strip()]
+    if not tail:
+        return ""
+    return "|".join(tail[-8:])
+
+
 def get_recent_player_poll_signal(fresh_seconds: int = 30):
     now_ts = time.time()
     last_ok_at = float(bot_runtime_state.get("last_player_poll_success_at", 0.0) or 0.0)
@@ -2331,73 +2385,76 @@ async def process_server_health_updates():
     if now_ts - float(server_health_state.get("last_health_poll", 0.0)) < poll_interval:
         return
     server_health_state["last_health_poll"] = now_ts
-
-    no_players_online = len(online_since) == 0
-    no_active_verify = not has_active_claim_verification_work()
-    skip_sftp = bool(no_players_online and no_active_verify)
-    if skip_sftp:
-        now_skip = time.time()
-        if now_skip - float(server_health_state.get("last_skip_log_at", 0.0) or 0.0) > 30:
-            log_debug("SFTP", "skipped (no active verification work)", flag="debug_sftp")
-            log_debug("CLAIM", "skipped remote log poll (no active claim)", flag="debug_sftp")
-            log_debug("TRACKING", "skipped remote log read (server empty)", flag="debug_sftp")
-            server_health_state["last_skip_log_at"] = now_skip
-
-    health = await asyncio.to_thread(_classify_health_status, skip_sftp)
     previous = server_health_state.get("status", "ONLINE")
 
-    recent_poll_signal = get_recent_player_poll_signal(30)
-    if recent_poll_signal["ok_recent"] and recent_poll_signal["player_count"] > 0:
-        if health != "ONLINE":
-            log_limited(
-                "server_health_override_players_online",
-                30,
-                "SERVER",
-                "suppressing DOWN state because players are currently online",
-            )
-        health = "ONLINE"
-    elif recent_poll_signal["ok_recent"] and health != "ONLINE":
-        if skip_sftp:
-            log_limited(
-                "server_aux_health_failed_rcon_ok",
-                30,
-                "SERVER",
-                "auxiliary health check failed but RCON is healthy",
-            )
-        else:
-            log_limited(
-                "server_health_override_recent_poll",
-                30,
-                "SERVER",
-                "health overridden to ONLINE due to recent successful RCON player poll",
-            )
-        health = "ONLINE"
+    lines, sftp_err = await asyncio.to_thread(read_remote_log_tail, 4096)
+    remote_ok = sftp_err is None and isinstance(lines, list)
+    lifecycle = classify_server_state_from_remote_logs(lines if remote_ok else [])
+    rcon_ok = await asyncio.to_thread(detect_server_back_up)
 
-    if health == "ONLINE":
+    if remote_ok:
+        server_health_state["last_remote_log_success_at"] = now_ts
+        signature = compute_remote_log_activity_signature(lines)
+        previous_sig = str(server_health_state.get("last_remote_log_activity_signature", "") or "")
+        if signature and signature != previous_sig:
+            server_health_state["last_remote_log_activity_signature"] = signature
+            server_health_state["last_remote_log_activity_changed_at"] = now_ts
+    else:
+        log_limited("server_remote_log_read_failed", 30, "SERVER", f"auxiliary log read failed: {sftp_err}", level="warn")
+
+    last_log_ok_at = float(server_health_state.get("last_remote_log_success_at", 0.0) or 0.0)
+    last_log_change_at = float(server_health_state.get("last_remote_log_activity_changed_at", 0.0) or 0.0)
+    remote_recent = last_log_ok_at > 0 and (now_ts - last_log_ok_at) <= 90
+    activity_recent = last_log_change_at > 0 and (now_ts - last_log_change_at) <= 120
+
+    new_status = previous
+    lifecycle_state = str(lifecycle.get("state", "ONLINE")).upper()
+    if lifecycle_state == "RESTARTING":
+        new_status = "RESTARTING"
+    elif lifecycle_state == "DOWN" and (not rcon_ok) and (not remote_recent):
+        new_status = "DOWN"
+    elif lifecycle_state == "RECOVERING":
+        new_status = "RECOVERING" if not rcon_ok else "ONLINE"
+    else:
+        if rcon_ok and remote_recent:
+            new_status = "ONLINE"
+        elif rcon_ok and not remote_recent:
+            log_limited("server_aux_health_failed_rcon_ok", 30, "SERVER", "auxiliary health check failed but RCON is healthy")
+            new_status = "ONLINE"
+        elif remote_recent and activity_recent:
+            new_status = "RECOVERING"
+        elif remote_recent and (not activity_recent):
+            new_status = "SUSPECTED_DOWN"
+        else:
+            new_status = "DOWN"
+
+    if new_status in {"RESTARTING", "RECOVERING"}:
+        server_health_state["fail_count"] = 0
+        server_health_state["success_count"] = 0
+    elif new_status == "ONLINE":
         server_health_state["success_count"] = int(server_health_state.get("success_count", 0)) + 1
         server_health_state["fail_count"] = 0
     else:
         server_health_state["fail_count"] = int(server_health_state.get("fail_count", 0)) + 1
         server_health_state["success_count"] = 0
 
-    suspect_threshold = ConfigManager.get_int("crash_suspect_threshold", "CRASH_SUSPECT_THRESHOLD", 2, minimum=1)
-    down_threshold = ConfigManager.get_int("crash_confirm_threshold", "CRASH_CONFIRM_THRESHOLD", 4, minimum=2)
-
-    new_status = previous
-    fail_count = int(server_health_state.get("fail_count", 0))
-    success_count = int(server_health_state.get("success_count", 0))
-    if fail_count >= down_threshold:
-        new_status = "DOWN"
-    elif fail_count >= suspect_threshold:
-        new_status = "SUSPECTED_DOWN"
-    elif success_count >= 2:
-        new_status = "ONLINE"
-
     if new_status != previous:
         server_health_state["status"] = new_status
         server_health_state["last_status_at"] = datetime.now(timezone.utc).isoformat()
         log_info("SERVER", f"State: {new_status}")
-        if new_status == "SUSPECTED_DOWN":
+        if new_status == "RESTARTING":
+            await send_restart_incident(
+                "Server Restarting",
+                "Server restart detected from remote logs.",
+                discord.Color.orange(),
+            )
+        elif new_status == "RECOVERING":
+            await send_restart_incident(
+                "Server Recovering",
+                "Server is starting up and recovering.",
+                discord.Color.gold(),
+            )
+        elif new_status == "SUSPECTED_DOWN":
             await send_restart_incident(
                 "Server Issue Detected",
                 "Connection checks are failing. Monitoring closely.",
@@ -2405,14 +2462,14 @@ async def process_server_health_updates():
             )
         elif new_status == "DOWN":
             await send_restart_incident(
-                "Server Offline",
-                "Server crash/offline confirmed. Auto recovery is in progress.",
+                "Server Offline / Crash Detected",
+                "Server appears offline or crashed. Auto recovery is in progress.",
                 discord.Color.red(),
             )
         elif new_status == "ONLINE":
             await send_restart_incident(
-                "Recovery Complete",
-                "Bot systems reconnected and monitoring has resumed.",
+                "Server Online",
+                "Recovery complete. Server is online.",
                 discord.Color.green(),
             )
 
@@ -2451,6 +2508,10 @@ def map_server_state():
     health = server_health_state.get("status", "ONLINE")
     if health == "ONLINE":
         return SERVER_STATE_ONLINE
+    if health == "RESTARTING":
+        return SERVER_STATE_RESTARTING
+    if health == "RECOVERING":
+        return SERVER_STATE_RECOVERING
     if health == "SUSPECTED_DOWN":
         return SERVER_STATE_SUSPECTED_DOWN
     return SERVER_STATE_DOWN
@@ -3386,7 +3447,16 @@ async def tracking_loop():
             update_players(players)
         else:
             players = normalize_players_map(bot_runtime_state.get("last_successful_players", {}))
-            log_limited("tracking_poll_failed_keep_state", 30, "TRACKING", "player poll failed; preserving last successful snapshot", level="warn")
+            current_server_state = str(server_health_state.get("status", "ONLINE")).upper()
+            last_ok_at = float(bot_runtime_state.get("last_player_poll_success_at", 0.0) or 0.0)
+            stale_online = last_ok_at <= 0 or (time.time() - last_ok_at) > 25
+            if current_server_state in {"RESTARTING", "DOWN", "SUSPECTED_DOWN"} and stale_online:
+                players = {}
+                bot_runtime_state["last_successful_players"] = {}
+                update_players({})
+                log_limited("tracking_cleared_stale_players", 30, "TRACKING", "cleared stale online display during restart/outage")
+            else:
+                log_limited("tracking_poll_failed_keep_state", 30, "TRACKING", "player poll failed; preserving last successful snapshot", level="warn")
         tick_rewards()
         expire_old_purchases()
         await asyncio.to_thread(process_game_command_queue)
@@ -3726,6 +3796,10 @@ async def buy(ctx, item: str):
 @bot.command()
 async def claim(ctx):
     expire_old_purchases()
+    current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
+    if current_server_state in {SERVER_STATE_RESTARTING, SERVER_STATE_RECOVERING, SERVER_STATE_DOWN, SERVER_STATE_SUSPECTED_DOWN}:
+        await ctx.send("⚠️ Claims are temporarily unavailable while the server is restarting/recovering. Please try again shortly.")
+        return
     if is_admin_bot_offline():
         print("[CLAIM BLOCKED] admin bot offline")
         record_manual_issue(ctx, "!claim", "")
