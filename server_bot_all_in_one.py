@@ -33,7 +33,7 @@ EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 CONFIG_DEBUG_LOGGED = False
 
 PURCHASE_TIMEOUT_MINUTES = 15
-QUEUED_TIMEOUT_MINUTES = 5
+CLAIM_QUEUE_TIMEOUT_MINUTES = 2
 
 DEFAULT_SCAN_INTERVAL = 5
 DEFAULT_REWARD_INTERVAL_MINUTES = 60
@@ -1076,6 +1076,113 @@ def set_purchase_status(purchase: dict, new_status: str, delivery_note: str | No
         queue_claim_progress_message_update(purchase)
 
 
+def get_discord_id_for_steam_id(steam_id: str):
+    links = load_json(LINK_FILE, {})
+    target = str(steam_id or "").strip()
+    if not target:
+        return None
+    for discord_id, linked_steam in links.items():
+        if str(linked_steam or "").strip() == target:
+            return str(discord_id)
+    return None
+
+
+async def _notify_claim_timeout_refund_async(discord_id: str, message: str):
+    did = str(discord_id or "").strip()
+    if not did:
+        return False
+    user_obj = None
+    try:
+        user_obj = bot.get_user(int(did)) or await bot.fetch_user(int(did))
+    except Exception:
+        user_obj = None
+    if user_obj:
+        try:
+            await user_obj.send(message)
+            return True
+        except Exception:
+            pass
+    fallback = await get_admin_alert_channel()
+    if fallback:
+        try:
+            await fallback.send(f"<@{did}> {message}")
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def notify_claim_timeout_refund(steam_id: str, message: str):
+    discord_id = get_discord_id_for_steam_id(steam_id)
+    if not discord_id:
+        return False
+    if MAIN_LOOP is None:
+        return False
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            _notify_claim_timeout_refund_async(discord_id, message),
+            MAIN_LOOP,
+        )
+
+        def _done(fut):
+            try:
+                ok = bool(fut.result())
+            except Exception:
+                ok = False
+            if ok:
+                log_info("CLAIM TIMEOUT", f"notified player discord_id={discord_id}")
+            else:
+                log_warn("CLAIM TIMEOUT", f"notify failed discord_id={discord_id}")
+
+        future.add_done_callback(_done)
+        return True
+    except Exception:
+        return False
+
+
+def expire_claim_commands_for_purchase(game_commands: list, purchase: dict):
+    steam_id = str(purchase.get("steam_id", "")).strip()
+    item = str(purchase.get("item", "")).lower().strip()
+    claim_group_id = str(purchase.get("claim_group_id", "") or "").strip()
+    expired_count = 0
+    for cmd in game_commands:
+        if str(cmd.get("status", "")).upper() not in {"PENDING", "EXECUTING"}:
+            continue
+        grouped_match = bool(claim_group_id) and str(cmd.get("claim_group_id", "")).strip() == claim_group_id
+        fallback_match = (
+            (str(cmd.get("steam_id", "")).strip() == steam_id)
+            and (str(cmd.get("item", "")).lower().strip() == item)
+            and (
+                str(cmd.get("command_type", "")).lower() in {"claim", "precheck"}
+                or str(cmd.get("claim_phase", "")).upper() in {"PRECHECK", "RECOVERY", "CLAIM", "FINAL_VERIFY"}
+            )
+        )
+        if not grouped_match and not fallback_match:
+            continue
+        cmd["status"] = "EXPIRED"
+        cmd["completed_at"] = str(datetime.now())
+        cmd["error"] = "Claim queue timed out after 2 minutes."
+        expired_count += 1
+    return expired_count
+
+
+def refund_timed_out_claim_purchase(purchase: dict, data: dict):
+    if purchase.get("refund_applied"):
+        return False
+    steam_id = str(purchase.get("steam_id", "")).strip()
+    item = str(purchase.get("item", "")).lower().strip()
+    price, _ = find_shop_price(item)
+    if price is None or steam_id not in data:
+        return False
+    _, _ = adjust_energy_in_data(data, steam_id, int(price))
+    purchase["refund_applied"] = True
+    purchase["refund_amount"] = int(price)
+    purchase["refunded_at"] = str(datetime.now())
+    purchase["refund_note"] = "Claim timed out after 2 minutes. Energy refunded automatically."
+    purchase["timeout_reason"] = "claim_queue_timeout"
+    return True
+
+
 def expire_old_purchases():
     with ECONOMY_LOCK:
         purchases = load_purchases()
@@ -1111,25 +1218,41 @@ def expire_old_purchases():
                     purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
                     changed_purchases = True
 
-            elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING"}:
+            elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}:
                 claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
                 if not claimed_at:
                     continue
 
-                if now - claimed_at >= timedelta(minutes=QUEUED_TIMEOUT_MINUTES):
-                    for cmd in game_commands:
-                        if (
-                            cmd.get("steam_id") == steam_id
-                            and str(cmd.get("item", "")).lower().strip() == item
-                            and cmd.get("status") in {"PENDING", "EXECUTING"}
-                        ):
-                            cmd["status"] = "EXPIRED"
-                            cmd["completed_at"] = str(datetime.now())
-                            changed_commands = True
+                if now - claimed_at >= timedelta(minutes=CLAIM_QUEUE_TIMEOUT_MINUTES):
+                    if purchase.get("timeout_reason") == "claim_queue_timeout":
+                        continue
+                    log_info("CLAIM TIMEOUT", f"purchase timed out steam={steam_id} item={item}")
+                    expired_count = expire_claim_commands_for_purchase(game_commands, purchase)
+                    if expired_count > 0:
+                        changed_commands = True
+                        log_info("CLAIM TIMEOUT", f"commands expired count={expired_count}")
 
+                    refund_applied = refund_timed_out_claim_purchase(purchase, data)
+                    if refund_applied:
+                        changed_data = True
+                        log_info("CLAIM TIMEOUT", f"refunded {int(purchase.get('refund_amount', 0) or 0)} energy steam={steam_id}")
+
+                    timeout_note = "⚠️ Claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
                     purchase["status"] = "FAILED"
-                    purchase["delivery_note"] = f"Claim queue expired after {QUEUED_TIMEOUT_MINUTES} minutes"
+                    purchase["delivery_note"] = timeout_note
+                    purchase["failure_note"] = timeout_note
+                    purchase["timeout_reason"] = "claim_queue_timeout"
+
+                    if not purchase.get("timeout_notified"):
+                        notify_claim_timeout_refund(steam_id, timeout_note)
+                        purchase["timeout_notified"] = True
                     changed_purchases = True
+
+        # Timeout behavior examples:
+        # - queued claim >2 minutes -> FAILED + refunded + notified + related commands expired.
+        # - second expire pass -> no second refund, no second timeout notification.
+        # - UNCLAIMED purchase expiry still follows PURCHASE_TIMEOUT_MINUTES path.
+        # - successful claim completed before 2 minutes -> not touched by timeout branch.
 
         if changed_purchases:
             save_purchases(purchases)
@@ -3539,8 +3662,11 @@ async def claim(ctx):
                     "Your energy has been refunded. Switch dinos and buy again when ready."
                 )
             elif latest_mine and latest_mine.get("status") == "FAILED":
-                note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
-                response = f"⚠️ {note}"
+                if latest_mine.get("timeout_reason") == "claim_queue_timeout":
+                    response = "⚠️ Your claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
+                else:
+                    note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
+                    response = f"⚠️ {note}"
             else:
                 response = "❌ You do not have any active dinosaur purchases."
         else:
