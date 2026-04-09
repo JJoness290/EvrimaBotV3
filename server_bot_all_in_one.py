@@ -487,10 +487,10 @@ def resolve_remote_log_path(sftp, configured_path: str):
         cached_resolved_remote_log_path = None
 
     for candidate in _normalize_path_variants(configured_path):
-        print(f"[SFTP LOG] Trying remote path: {candidate}")
+        log_debug("SFTP", f"Trying remote path: {candidate}", flag="debug_sftp")
         if _remote_file_exists(sftp, candidate):
             cached_resolved_remote_log_path = candidate
-            print(f"[SFTP LOG] Found remote log path: {candidate}")
+            log_debug("SFTP", f"Found remote log path: {candidate}", flag="debug_sftp")
             return candidate
 
     candidate_dirs = [
@@ -514,11 +514,11 @@ def resolve_remote_log_path(sftp, configured_path: str):
 
     discovered = []
     for d in candidate_dirs:
-        print(f"[SFTP LOG] Scanning candidate directory: {d}")
+        log_debug("SFTP", f"Scanning candidate directory: {d}", flag="debug_sftp")
         try:
             entries = sftp.listdir_attr(d)
         except Exception:
-            print(f"[SFTP LOG] Candidate directory missing: {d}")
+            log_debug("SFTP", f"Candidate directory missing: {d}", flag="debug_sftp")
             continue
 
         for entry in entries:
@@ -543,21 +543,21 @@ def resolve_remote_log_path(sftp, configured_path: str):
         best_path = ranked[0][0]
         if _remote_file_exists(sftp, best_path):
             cached_resolved_remote_log_path = best_path
-            print(f"[SFTP LOG] Auto-discovered remote log path: {best_path}")
+            log_debug("SFTP", f"Auto-discovered remote log path: {best_path}", flag="debug_sftp")
             return best_path
 
     # Diagnostics only on failure.
     try:
         cwd = sftp.getcwd()
-        print(f"[SFTP LOG] Path resolution failed. SFTP cwd: {cwd}")
+        log_warn("SFTP", f"Path resolution failed. SFTP cwd: {cwd}")
     except Exception:
-        print("[SFTP LOG] Path resolution failed. Could not read SFTP cwd.")
+        log_warn("SFTP", "Path resolution failed. Could not read SFTP cwd.")
 
     for d in [".", "/", "./Saved", "./Saved/Logs", "/TheIsle/Saved/Logs"]:
         try:
             names = sftp.listdir(d)
             preview = ", ".join(names[:15])
-            print(f"[SFTP LOG] Directory snapshot {d}: {preview}")
+            log_debug("SFTP", f"Directory snapshot {d}: {preview}", flag="debug_sftp")
         except Exception:
             continue
 
@@ -822,23 +822,23 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
     global last_sftp_eof_warn_at
     cfg = get_remote_log_config()
     if not all([cfg.get("host"), cfg.get("username"), cfg.get("password"), cfg.get("remote_log_path")]):
-        print("[SFTP LOG] Missing SFTP config values (host/username/password/remote_log_path).")
+        log_warn("SFTP", "Missing SFTP config values (host/username/password/remote_log_path).")
         return [], "missing_sftp_config"
 
     transport = None
     sftp = None
     try:
         open_start = time.time()
-        print(f"[SFTP LOG] Connecting host={cfg['host']} port={cfg['port']} user={cfg['username']}")
+        log_debug("SFTP", f"Connecting host={cfg['host']} port={cfg['port']} user={cfg['username']}", flag="debug_sftp")
         transport, sftp = open_sftp_client(cfg)
         open_elapsed = time.time() - open_start
-        print(f"[SFTP LOG] open_sftp duration={open_elapsed:.3f}s")
+        log_debug("SFTP", f"open_sftp duration={open_elapsed:.3f}s", flag="debug_sftp")
         remote_path = resolve_remote_log_path(sftp, cfg["remote_log_path"])
         if not remote_path:
-            print("[SFTP LOG] Could not resolve remote log path.")
+            log_warn("SFTP", "Could not resolve remote log path.")
             return [], "remote_log_not_found"
-        print(f"[SFTP LOG] Connected to remote log")
-        print(f"[SFTP LOG] Reading tail from {remote_path}")
+        log_debug("SFTP", "Connected to remote log", flag="debug_sftp")
+        log_debug("SFTP", f"Reading tail from {remote_path}", flag="debug_sftp")
         read_start_ts = time.time()
         with sftp.open(remote_path, "rb") as remote_file:
             remote_file.seek(0, 2)
@@ -847,7 +847,7 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
             remote_file.seek(read_start)
             raw = remote_file.read()
         read_elapsed = time.time() - read_start_ts
-        print(f"[SFTP LOG] read_tail duration={read_elapsed:.3f}s bytes={len(raw)}")
+        log_debug("SFTP", f"read_tail duration={read_elapsed:.3f}s bytes={len(raw)}", flag="debug_sftp")
         decoded = raw.decode("utf-8", errors="ignore")
         return decoded.splitlines(), None
     except Exception as e:
@@ -856,10 +856,10 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
         if "eof" in lowered:
             now_ts = time.time()
             if now_ts - float(last_sftp_eof_warn_at or 0.0) > 60:
-                print(f"[SFTP LOG] Warning: transient EOF while reading remote log tail: {e}")
+                log_warn("SFTP", f"transient EOF while reading remote log tail: {e}")
                 last_sftp_eof_warn_at = now_ts
             return [], "transient_eof"
-        print(f"[SFTP LOG] Failed reading remote log tail: {e}")
+        log_error("SFTP", f"Failed reading remote log tail: {e}")
         return [], str(e)
     finally:
         try:
@@ -887,7 +887,7 @@ def get_latest_health_log_for_steam(steam_id: str):
             continue
         if parsed["steam_id"] != str(steam_id):
             continue
-        print(f"[SFTP LOG] Found candidate SetHealth line for steam_id={steam_id}")
+        log_debug("SFTP", f"Found candidate SetHealth line for steam_id={steam_id}", flag="debug_sftp")
         newest_match = parsed
         break
 
@@ -1346,21 +1346,21 @@ def run_rcon(command):
                 "--password", RCON_PASSWORD,
                 "--command", command,
             ]
-        print(f"[RCON DEBUG] backend={backend}")
-        print(f"[RCON DEBUG] command={command}")
-        print(f"[RCON DEBUG] argv={argv}")
+        log_debug("RCON", f"backend={backend}", flag="debug_rcon")
+        log_debug("RCON", f"command={command}", flag="debug_rcon")
+        log_debug("RCON", f"argv={argv}", flag="debug_rcon")
         result = subprocess.run(argv, input="\n", capture_output=True, text=True, timeout=20)
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        print(f"[RCON DEBUG] returncode={result.returncode}")
+        log_debug("RCON", f"returncode={result.returncode}", flag="debug_rcon")
         for idx, line in enumerate(stdout.splitlines()[:3], start=1):
-            print(f"[RCON DEBUG] stdout line {idx}: {line}")
+            log_debug("RCON", f"stdout line {idx}: {line}", flag="debug_rcon")
         for idx, line in enumerate(stderr.splitlines()[:3], start=1):
-            print(f"[RCON DEBUG] stderr line {idx}: {line}")
+            log_debug("RCON", f"stderr line {idx}: {line}", flag="debug_rcon")
         merged = f"{stdout}\n{stderr}".strip()
         cleaned = _clean_response(merged)
         for idx, line in enumerate(cleaned.splitlines()[:3], start=1):
-            print(f"[RCON DEBUG] cleaned response line {idx}: {line}")
+            log_debug("RCON", f"cleaned response line {idx}: {line}", flag="debug_rcon")
         return cleaned, merged
 
     backends = []
@@ -1380,7 +1380,7 @@ def run_rcon(command):
             if _is_usable(cleaned):
                 return cleaned
         except Exception as e:
-            print(f"[RCON DEBUG] backend={backend} failed: {e}")
+            log_debug("RCON", f"backend={backend} failed: {e}", flag="debug_rcon")
             continue
     return last_cleaned or last_raw
 
@@ -1436,7 +1436,7 @@ def run_rcon_raw(command: str) -> str:
 
     response_parts = []
     timeout_seconds = 6
-    print(f"[RCON RAW] connecting to {RCON_IP}:{RCON_PORT}")
+    log_debug("RCON", f"raw connecting to {RCON_IP}:{RCON_PORT}", flag="debug_rcon")
     with socket.create_connection((RCON_IP, int(RCON_PORT)), timeout=timeout_seconds) as sock_obj:
         sock_obj.settimeout(timeout_seconds)
         sock_obj.sendall(_pack_packet(request_id, AUTH, RCON_PASSWORD))
@@ -1452,12 +1452,12 @@ def run_rcon_raw(command: str) -> str:
                 break
             if packet_type == RESPONSE_VALUE and payload:
                 response_parts.append(payload)
-        print(f"[RCON RAW] auth success={auth_success}")
+        log_debug("RCON", f"raw auth success={auth_success}", flag="debug_rcon")
         if not auth_success:
             return ""
 
         response_parts.clear()
-        print(f"[RCON RAW] sending command={command}")
+        log_debug("RCON", f"raw sending command={command}", flag="debug_rcon")
         command_id = request_id + 1
         sentinel_id = request_id + 2
         sock_obj.sendall(_pack_packet(command_id, COMMAND, command))
@@ -1480,8 +1480,8 @@ def run_rcon_raw(command: str) -> str:
     cleaned_lines = [ln.strip() for chunk in response_parts for ln in str(chunk or "").splitlines() if _is_useful_line(ln)]
     response_text = "\n".join(cleaned_lines).strip()
     for idx, line in enumerate(cleaned_lines[:5], start=1):
-        print(f"[RCON RAW] response line {idx}: {line}")
-    print(f"[RCON RAW] response length={len(response_text)}")
+        log_debug("RCON", f"raw response line {idx}: {line}", flag="debug_rcon")
+    log_debug("RCON", f"raw response length={len(response_text)}", flag="debug_rcon")
     return response_text
 
 
@@ -1637,8 +1637,15 @@ def get_logging_config():
     section = ConfigManager.get_section("logging")
     if not isinstance(section, dict):
         section = {}
+    env_mode = str(os.getenv("BOT_LOG_MODE", "") or "").strip().lower()
+    cfg_mode = str(section.get("log_mode", ConfigManager.get("log_mode", "BOT_LOG_MODE", "concise")) or "concise").strip().lower()
+    log_mode = env_mode if env_mode in {"concise", "debug"} else cfg_mode
+    if log_mode not in {"concise", "debug"}:
+        log_mode = "concise"
+    debug_master = bool(log_mode == "debug")
     return {
-        "debug_logging": ConfigManager.get_bool("debug_logging", "DEBUG_LOGGING", bool(section.get("debug_logging", False))),
+        "log_mode": log_mode,
+        "debug_logging": debug_master or ConfigManager.get_bool("debug_logging", "DEBUG_LOGGING", bool(section.get("debug_logging", False))),
         "debug_rcon": ConfigManager.get_bool("debug_rcon", "DEBUG_RCON", bool(section.get("debug_rcon", False))),
         "debug_sftp": ConfigManager.get_bool("debug_sftp", "DEBUG_SFTP", bool(section.get("debug_sftp", False))),
         "debug_presence": ConfigManager.get_bool("debug_presence", "DEBUG_PRESENCE", bool(section.get("debug_presence", False))),
@@ -1681,6 +1688,14 @@ def log_limited(key: str, interval_seconds: float, tag: str, msg: str, level: st
         log_debug(tag, msg)
     else:
         log_info(tag, msg)
+
+
+# Expected concise console output example:
+# [STARTUP] Bot logged in
+# [ADMIN BOT] ONLINE
+# [TRACKING] Players online: 1
+# JJoness290 | 76561198798435427 | session=43 mins | total=570 mins | energy=1666
+# [CLAIM TIMEOUT] refunded 25 energy steam=...
 
 
 def get_bot_presence_config():
@@ -2182,46 +2197,23 @@ async def get_admin_dashboard_channel():
 
 def build_admin_dashboard_embed():
     state = str(bot_runtime_state.get("admin_bot_state", "OFFLINE")).upper()
-    status_text = "OFFLINE ❌"
+    status_text = "🔴 Bot Offline"
     color = discord.Color.red()
     if state == "ONLINE":
-        status_text = "ONLINE ✅"
+        status_text = "🟢 Bot Online"
         color = discord.Color.green()
     elif state == "GRACE":
-        status_text = "GRACE ⚠️"
+        status_text = "🟠 Bot Starting / Recovering"
         color = discord.Color.orange()
     elif state == "UNKNOWN":
-        status_text = "UNKNOWN ⏳"
+        status_text = "⚪ Bot Status Unknown"
         color = discord.Color.light_grey()
 
-    pending_claims = 0
-    try:
-        purchases = load_purchases()
-        pending_claims = sum(1 for p in purchases if p.get("status") in CLAIM_OPEN_STATES)
-    except Exception:
-        pending_claims = 0
-    if state == "OFFLINE":
-        pending_claims += int(admin_runtime_state.get("outage_issue_count", 0) or 0)
-
-    detection_source = str(bot_runtime_state.get("last_detection_source", "Unknown") or "Unknown")
-    last_seen = _fmt_ts(admin_runtime_state.get("last_seen_in_game_at"))
-    alerts_text = str(admin_runtime_state.get("last_alert_summary", "None") or "None")
-    player_count = int(bot_runtime_state.get("last_player_count", 0) or 0)
-    if bot_runtime_state.get("last_rcon_error"):
-        alerts_text = f"{alerts_text} | RCON query failure"
-
     embed = discord.Embed(
-        title="Primal Abyss Admin Bot Dashboard",
+        title="Primal Abyss Bot Status",
+        description=status_text,
         color=color,
-        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Bot Status", value=status_text, inline=True)
-    embed.add_field(name="Player Count", value=f"{player_count} online", inline=True)
-    embed.add_field(name="Pending Claims", value=str(int(pending_claims)), inline=True)
-    embed.add_field(name="Alerts", value=alerts_text, inline=False)
-    embed.add_field(name="Last Seen", value=last_seen, inline=True)
-    embed.add_field(name="Detection Source", value=detection_source, inline=True)
-    embed.set_footer(text=f"Last updated {datetime.now(timezone.utc).isoformat()}")
     return embed
 
 
@@ -2243,14 +2235,11 @@ async def refresh_admin_dashboard(force: bool = False):
             msg = await channel.fetch_message(int(message_id))
             await msg.edit(embed=embed, content=None)
             admin_runtime_state["last_dashboard_refresh_at"] = now
-            print("[DASHBOARD] updating dashboard")
             return
         except Exception:
             restart_cycle_state["admin_dashboard_message_id"] = None
             save_state()
-            print("[DASHBOARD] recreating missing dashboard message")
     sent = await channel.send(embed=embed)
-    print("[DASHBOARD] creating dashboard message")
     restart_cycle_state["admin_dashboard_message_id"] = int(sent.id)
     restart_cycle_state["admin_dashboard_channel_id"] = int(channel.id)
     save_state()
