@@ -1743,9 +1743,22 @@ def get_bot_sustain_config():
 
 def get_admin_dashboard_config():
     section = ConfigManager.get_section("admin_dashboard")
+    configured_id = ConfigManager.get_int("admin_dashboard_channel_id", "ADMIN_DASHBOARD_CHANNEL_ID", 0, minimum=0)
+    if not configured_id:
+        configured_id = int(section.get("admin_dashboard_channel_id", 0) or 0)
+    if not configured_id:
+        configured_id = int(section.get("dashboard_channel_id", 0) or 0)
+    fallback_name = str(
+        os.getenv(
+            "ADMIN_DASHBOARD_CHANNEL_NAME",
+            section.get("admin_dashboard_channel_name", section.get("channel_name", "bot-status")),
+        )
+        or "bot-status"
+    ).strip()
     return {
         "enabled": bool(section.get("enabled", True)),
-        "channel_id": int(section.get("channel_id", 0) or 0),
+        "channel_id": int(configured_id or 0),
+        "channel_name": fallback_name or "bot-status",
         "refresh_interval_seconds": int(section.get("refresh_interval_seconds", 60) or 60),
     }
 
@@ -2188,10 +2201,49 @@ def record_manual_issue(ctx, command_name: str, item: str = ""):
 
 async def get_admin_dashboard_channel():
     cfg = get_admin_dashboard_config()
-    if cfg["channel_id"]:
-        ch = bot.get_channel(cfg["channel_id"])
+    channel_id = int(cfg.get("channel_id", 0) or 0)
+    if channel_id:
+        ch = bot.get_channel(channel_id)
         if ch:
+            log_limited("dashboard_channel_by_id", 300, "DASHBOARD", f"using configured channel id: {channel_id}")
             return ch
+        try:
+            ch = await bot.fetch_channel(channel_id)
+            if ch:
+                log_limited("dashboard_channel_by_id_fetch", 300, "DASHBOARD", f"using configured channel id: {channel_id}")
+                return ch
+        except Exception:
+            pass
+        log_limited(
+            "dashboard_channel_id_invalid",
+            300,
+            "DASHBOARD",
+            "configured channel id invalid, falling back to name search",
+            level="warn",
+        )
+
+    target_name = str(cfg.get("channel_name", "bot-status") or "bot-status").strip().lower()
+    exact_target = "".join(target_name.split())
+
+    def _norm(name: str):
+        return "".join(str(name or "").strip().lower().split())
+
+    for guild in bot.guilds:
+        exact_match = None
+        fuzzy_match = None
+        for channel in guild.text_channels:
+            norm_name = _norm(channel.name)
+            if norm_name == exact_target:
+                exact_match = channel
+                break
+            if (target_name in str(channel.name or "").strip().lower()) or (exact_target in norm_name):
+                if fuzzy_match is None:
+                    fuzzy_match = channel
+        chosen = exact_match or fuzzy_match
+        if chosen:
+            log_limited("dashboard_channel_by_name", 300, "DASHBOARD", f"found status channel by name: {chosen.name}")
+            return chosen
+    log_limited("dashboard_channel_not_found", 300, "DASHBOARD", "bot-status channel not found", level="warn")
     return None
 
 
@@ -2226,6 +2278,7 @@ async def refresh_admin_dashboard(force: bool = False):
         return
     channel = await get_admin_dashboard_channel()
     if not channel:
+        log_limited("dashboard_channel_missing_refresh", 300, "DASHBOARD", "bot-status channel not found", level="warn")
         return
 
     embed = build_admin_dashboard_embed()
