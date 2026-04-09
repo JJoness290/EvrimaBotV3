@@ -177,6 +177,11 @@ bot_runtime_state = {
     "log_suppression": {},
     "last_tracking_summary_at": 0.0,
     "last_successful_players": {},
+    "last_player_poll_success_at": 0.0,
+    "last_player_poll_player_count": 0,
+    "last_player_poll_source": "unknown",
+    "last_player_poll_failed_at": 0.0,
+    "last_player_poll_ok": False,
 }
 admin_runtime_state = {
     "outage_active": False,
@@ -1875,6 +1880,14 @@ def poll_player_snapshot():
     snapshot["source"] = str(poll_result.get("source", "RCON") or "RCON")
     snapshot["success"] = bool(poll_result.get("success", False))
     snapshot["error"] = str(poll_result.get("error", "") or "")
+    now_ts = time.time()
+    bot_runtime_state["last_player_poll_ok"] = bool(snapshot["success"])
+    bot_runtime_state["last_player_poll_source"] = str(snapshot["source"])
+    if snapshot["success"]:
+        bot_runtime_state["last_player_poll_success_at"] = now_ts
+        bot_runtime_state["last_player_poll_player_count"] = int(snapshot["player_count"])
+    else:
+        bot_runtime_state["last_player_poll_failed_at"] = now_ts
     return snapshot
 
 
@@ -2258,6 +2271,18 @@ def _classify_health_status(skip_sftp: bool = False):
     return "DOWN"
 
 
+def get_recent_player_poll_signal(fresh_seconds: int = 30):
+    now_ts = time.time()
+    last_ok_at = float(bot_runtime_state.get("last_player_poll_success_at", 0.0) or 0.0)
+    ok_recent = last_ok_at > 0 and (now_ts - last_ok_at) <= int(max(5, fresh_seconds))
+    player_count = int(bot_runtime_state.get("last_player_poll_player_count", 0) or 0)
+    return {
+        "ok_recent": ok_recent,
+        "player_count": player_count,
+        "source": str(bot_runtime_state.get("last_player_poll_source", "unknown") or "unknown"),
+    }
+
+
 async def process_server_health_updates():
     poll_interval = ConfigManager.get_int("health_poll_interval_seconds", "HEALTH_POLL_INTERVAL_SECONDS", 10, minimum=3)
     now_ts = time.time()
@@ -2278,6 +2303,33 @@ async def process_server_health_updates():
 
     health = await asyncio.to_thread(_classify_health_status, skip_sftp)
     previous = server_health_state.get("status", "ONLINE")
+
+    recent_poll_signal = get_recent_player_poll_signal(30)
+    if recent_poll_signal["ok_recent"] and recent_poll_signal["player_count"] > 0:
+        if health != "ONLINE":
+            log_limited(
+                "server_health_override_players_online",
+                30,
+                "SERVER",
+                "suppressing DOWN state because players are currently online",
+            )
+        health = "ONLINE"
+    elif recent_poll_signal["ok_recent"] and health != "ONLINE":
+        if skip_sftp:
+            log_limited(
+                "server_aux_health_failed_rcon_ok",
+                30,
+                "SERVER",
+                "auxiliary health check failed but RCON is healthy",
+            )
+        else:
+            log_limited(
+                "server_health_override_recent_poll",
+                30,
+                "SERVER",
+                "health overridden to ONLINE due to recent successful RCON player poll",
+            )
+        health = "ONLINE"
 
     if health == "ONLINE":
         server_health_state["success_count"] = int(server_health_state.get("success_count", 0)) + 1
