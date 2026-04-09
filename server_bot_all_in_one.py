@@ -1968,6 +1968,34 @@ def match_admin_bot_in_snapshot(snapshot: dict, source_label: str = "RCON"):
     return False, "", "", source_label
 
 
+def get_effective_admin_bot_status(snapshot=None, poll_success=None, now_ts=None):
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    now = float(now_ts if now_ts is not None else time.time())
+    if poll_success is None:
+        poll_success = bool(snap.get("success", False))
+    source_label = str(snap.get("source", "RCON") or "RCON")
+
+    matched = False
+    matched_steam_id = ""
+    matched_name = ""
+    if poll_success:
+        matched, matched_steam_id, matched_name, source_label = match_admin_bot_in_snapshot(snap, source_label)
+        if matched:
+            return {"status": "ONLINE", "reason": "matched_live_playerlist", "source": source_label, "matched_steam_id": matched_steam_id, "matched_name": matched_name}
+        return {"status": "OFFLINE", "reason": "not_present_in_live_playerlist", "source": source_label, "matched_steam_id": "", "matched_name": ""}
+
+    cfg_presence = get_bot_presence_config()
+    admin_grace_seconds = int(cfg_presence.get("admin_bot_grace_seconds", 120))
+    startup_warmup_seconds = int(cfg_presence.get("admin_bot_startup_warmup_seconds", 30))
+    startup_started_at = float(bot_runtime_state.get("startup_started_at", 0.0) or 0.0)
+    if startup_started_at > 0 and (now - startup_started_at) < startup_warmup_seconds:
+        return {"status": "GRACE", "reason": "startup_warmup", "source": source_label, "matched_steam_id": "", "matched_name": ""}
+    valid_last_seen_at = get_valid_last_seen_at()
+    if valid_last_seen_at is not None and (now - valid_last_seen_at) < admin_grace_seconds:
+        return {"status": "GRACE", "reason": "poll_grace_window", "source": source_label, "matched_steam_id": "", "matched_name": ""}
+    return {"status": "OFFLINE", "reason": "poll_grace_expired", "source": source_label, "matched_steam_id": "", "matched_name": ""}
+
+
 def queue_priority_commands(commands: list[dict]):
     if not commands:
         return
@@ -2286,12 +2314,9 @@ def build_admin_dashboard_embed():
     if state == "ONLINE":
         status_text = "🟢 Bot Online"
         color = discord.Color.green()
-    elif state == "GRACE":
-        status_text = "🟠 Bot Starting / Recovering"
+    elif state in {"GRACE", "UNKNOWN"}:
+        status_text = "🟠 Bot Starting"
         color = discord.Color.orange()
-    elif state == "UNKNOWN":
-        status_text = "⚪ Bot Status Unknown"
-        color = discord.Color.light_grey()
 
     embed = discord.Embed(
         title="Primal Abyss Bot Status",
@@ -2545,25 +2570,16 @@ async def process_bot_presence_and_recovery(snapshot: dict):
     else:
         bot_runtime_state["last_rcon_error"] = str(snapshot.get("error", "") or "RCON poll failed")
 
-    if bot_runtime_state["server_state"] != SERVER_STATE_ONLINE:
-        bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
-        bot_runtime_state["admin_bot_state"] = "UNKNOWN"
-        log_limited("presence_waiting_server", 30, "SERVER", f"State: {bot_runtime_state['server_state']}")
-        await refresh_admin_dashboard()
-        return
-
     startup_started_at = float(bot_runtime_state.get("startup_started_at", 0.0) or 0.0)
     warmup_active = startup_started_at > 0 and (now - startup_started_at) < startup_warmup_seconds
     if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
         log_startup_warmup_banner_once()
 
-    if not poll_success:
-        log_limited("rcon_poll_failure", 30, "RCON", f"poll unsuccessful: {bot_runtime_state.get('last_rcon_error', 'unknown')}", level="warn")
-        await refresh_admin_dashboard()
-        return
+    effective = get_effective_admin_bot_status(snapshot=snapshot, poll_success=poll_success, now_ts=now)
+    effective_status = str(effective.get("status", "OFFLINE")).upper()
+    source_label = str(effective.get("source", poll_source) or poll_source)
 
-    matched, matched_steam_id, matched_name, source_label = match_admin_bot_in_snapshot(snapshot, poll_source)
-    if matched:
+    if effective_status == "ONLINE":
         bot_runtime_state["admin_bot_state"] = "ONLINE"
         bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
         bot_runtime_state["missing_since"] = None
@@ -2574,6 +2590,7 @@ async def process_bot_presence_and_recovery(snapshot: dict):
         admin_runtime_state["last_alert_summary"] = "Admin bot online"
         if previous_state != "ONLINE":
             log_info("ADMIN BOT", f"ONLINE via {source_label}")
+            log_info("DASHBOARD", "status -> ONLINE")
             if admin_runtime_state.get("outage_active"):
                 admin_runtime_state["outage_active"] = False
                 admin_runtime_state["outage_started_at"] = None
@@ -2582,27 +2599,18 @@ async def process_bot_presence_and_recovery(snapshot: dict):
             log_info("BOT SUSTAIN", "immediate sustain on ONLINE transition")
             try_queue_sustain(now, cfg_sustain, immediate=True)
             await refresh_admin_dashboard(force=True)
-        log_debug("PRESENCE", f"matched steam_id={matched_steam_id} name={matched_name}", flag="debug_presence")
+        if effective.get("matched_steam_id"):
+            log_debug("PRESENCE", f"matched steam_id={effective.get('matched_steam_id')} name={effective.get('matched_name')}", flag="debug_presence")
     else:
-        valid_last_seen_at = get_valid_last_seen_at()
-        if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
-            bot_runtime_state["admin_bot_state"] = "UNKNOWN"
-            bot_runtime_state["presence_state"] = BOT_STATE_MISSING
-            bot_runtime_state["last_detection_source"] = "Unknown"
-            admin_runtime_state["last_alert_summary"] = "Startup warmup active"
-            log_limited("startup_warmup_presence", 30, "ADMIN BOT", "presence unknown (startup warmup)")
-            await refresh_admin_dashboard()
-            return
-
-        if valid_last_seen_at is not None and (now - valid_last_seen_at) < admin_grace_seconds:
+        if effective_status == "GRACE":
             bot_runtime_state["admin_bot_state"] = "GRACE"
             bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
             bot_runtime_state["missing_since"] = None
             bot_runtime_state["last_detection_source"] = "Unknown"
             admin_runtime_state["last_alert_summary"] = "Grace period active"
-            log_limited("presence_grace", 30, "ADMIN BOT", "GRACE period active")
             if previous_state != "GRACE":
                 await refresh_admin_dashboard(force=True)
+            log_limited("presence_grace", 30, "ADMIN BOT", "GRACE period active")
         else:
             bot_runtime_state["admin_bot_state"] = "OFFLINE"
             bot_runtime_state["presence_state"] = BOT_STATE_MISSING
@@ -2610,7 +2618,11 @@ async def process_bot_presence_and_recovery(snapshot: dict):
             bot_runtime_state["last_detection_source"] = "Unknown"
             admin_runtime_state["last_alert_summary"] = "Admin bot offline"
             if previous_state != "OFFLINE":
-                log_warn("ADMIN BOT", "OFFLINE")
+                if poll_success:
+                    log_warn("ADMIN BOT", "OFFLINE (not present in live player list)")
+                else:
+                    log_warn("ADMIN BOT", "OFFLINE after poll grace expired")
+                log_info("DASHBOARD", "status -> OFFLINE")
             if not admin_runtime_state.get("outage_active"):
                 admin_runtime_state["outage_active"] = True
                 admin_runtime_state["outage_started_at"] = time.time()
