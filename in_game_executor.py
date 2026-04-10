@@ -19,6 +19,7 @@ DEFAULT_POST_SEND_DELAYS = {
     "/diet2": 1,
     "/diet3": 1,
     "/hunger": 1,
+    "/thirst": 1,
     "/health": 1,
 }
 
@@ -81,7 +82,6 @@ def write_heartbeat(state: str, extra: dict | None = None):
     if extra:
         payload.update(extra)
     save_json(EXECUTOR_HEARTBEAT_FILE, payload)
-    print("[EXECUTOR] heartbeat updated")
 
 
 def type_command(cmd: str):
@@ -195,10 +195,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
 
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
-        print(
-            f"[EXECUTOR] dispatched group={claim_group_id} cmd_id={cmd_id} step={step} "
-            f"phase={phase} cmd={command_text} started_at={command_entry.get('started_at')}"
-        )
+        print(f"[EXEC] {command_text}")
         save_commands(commands_data)
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
 
@@ -222,7 +219,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
-            print(f"[EXECUTOR] completed group={claim_group_id} cmd_id={cmd_id} step={step} phase={phase}")
+            print(f"[DONE] {command_text}")
             changed = True
             save_commands(commands_data)
             break
@@ -230,7 +227,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
-            print(f"[EXECUTOR] failed group={claim_group_id} cmd_id={cmd_id} step={step} phase={phase} error={e}")
+            print(f"[FAIL] {command_text} error={e}")
             changed = True
             save_commands(commands_data)
             write_heartbeat("error", {"group": claim_group_id, "error": str(e)})
@@ -253,29 +250,28 @@ def process_legacy(commands_data):
             or command_entry.get("phase")
             or command_entry.get("claim_phase")
         ):
-            print(
-                f"[EXECUTOR ERROR] claim command fell into legacy path "
-                f"cmd_id={command_entry.get('id')} command={command_text}"
-            )
+            print(f"[EXECUTOR ERROR] claim command fell into legacy path cmd_id={command_entry.get('id')} command={command_text}")
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
         save_commands(commands_data)
         write_heartbeat("executing", {"command": command_text, "type": "legacy"})
 
         try:
-            print(f"[EXECUTOR] legacy cmd={command_text}")
+            print(f"[EXEC] {command_text}")
             type_command(command_text)
             time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
             changed = True
+            print(f"[DONE] {command_text}")
             save_commands(commands_data)
         except Exception as e:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
             changed = True
+            print(f"[FAIL] {command_text} error={e}")
             save_commands(commands_data)
             write_heartbeat("error", {"error": str(e), "type": "legacy"})
             break

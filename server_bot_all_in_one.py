@@ -91,6 +91,7 @@ last_remote_log_match_raw_line_by_steam = {}
 last_remote_grow_match = {}
 last_sftp_eof_warn_at = 0.0
 CLAIM_STARTUP_CLEANUP_DONE = False
+SIMPLE_CLAIM_LOCKS: dict[str, asyncio.Lock] = {}
 
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
@@ -1031,6 +1032,24 @@ def get_fresh_grow_log_for_steam(steam_id: str, since_dt: datetime | None):
     return None
 
 
+def get_fresh_health_log_for_claim(steam_id: str, since_dt: datetime | None):
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
+        return None
+    for line in reversed(lines):
+        parsed = parse_health_command_log_line(line)
+        if not parsed or str(parsed.get("steam_id")) != str(steam_id):
+            continue
+        event_dt = get_log_event_dt(parsed)
+        if since_dt and event_dt and event_dt < since_dt:
+            continue
+        if since_dt and event_dt is None:
+            # unparseable timestamp: only current-read match is accepted (this is one)
+            return parsed
+        return parsed
+    return None
+
+
 def verify_growth_log_for_purchase(purchase, grow_log):
     if not grow_log:
         return False, "No Grow verification log found."
@@ -1338,7 +1357,7 @@ def expire_old_purchases():
         purchases = load_purchases()
         data = load_json(DATA_FILE, {})
         game_commands = load_game_commands()
-        if run_claim_cleanup_pass(purchases, game_commands):
+        if retire_old_claim_flow_purchases(purchases) or run_claim_cleanup_pass(purchases, game_commands):
             save_purchases(purchases)
 
         now = datetime.now()
@@ -3458,6 +3477,8 @@ def run_claim_cleanup_pass(purchases: list, game_commands: list):
 
 
 def process_claim_orchestration():
+    # Retired for simplified direct !claim flow.
+    return
     global CLAIM_STARTUP_CLEANUP_DONE
     with ECONOMY_LOCK:
         purchases = load_purchases()
@@ -3618,9 +3639,110 @@ def process_claim_orchestration():
 
 
 def process_game_command_queue():
-    # Command execution ownership is handled exclusively by in_game_executor.py.
-    # This bot-side function only orchestrates claim-state transitions from metadata/logs.
-    process_claim_orchestration()
+    # Old queued claim orchestration is retired for simplified direct !claim flow.
+    return
+
+
+def retire_old_claim_flow_purchases(purchases: list):
+    changed = False
+    retired_states = {"READY_TO_CLAIM", "PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_SEND", "CLAIM_WAIT", "FINAL_VERIFY"}
+    for purchase in purchases:
+        claim_state = str(purchase.get("claim_state") or "").upper()
+        if claim_state not in retired_states:
+            continue
+        purchase["claim_state"] = None
+        purchase["status"] = "FAILED"
+        purchase["failed_at"] = str(datetime.now())
+        purchase["delivery_note"] = "Old claim flow retired. Please use !claim again."
+        if not purchase.get("refund_applied"):
+            refund_purchase_energy_if_needed(purchase, "old_flow_retired")
+        changed = True
+    return changed
+
+
+async def execute_game_command_direct(command_text: str, delay_after: float = 1.0) -> bool:
+    with ECONOMY_LOCK:
+        commands_data = load_game_commands()
+        cmd_id = f"cmd_{get_next_command_id(commands_data):03d}"
+        commands_data.append({
+            "id": cmd_id,
+            "command": command_text,
+            "status": "PENDING",
+            "created_at": str(datetime.now()),
+            "completed_at": None,
+            "command_type": "direct_claim",
+        })
+        save_game_commands(commands_data)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        await asyncio.sleep(0.4)
+        with ECONOMY_LOCK:
+            current = load_game_commands()
+        target = next((c for c in current if str(c.get("id")) == cmd_id), None)
+        if not target:
+            continue
+        status = str(target.get("status", "")).upper()
+        if status == "DONE":
+            await asyncio.sleep(delay_after)
+            return True
+        if status in {"FAILED", "EXPIRED", "SKIPPED", "CANCELLED"}:
+            return False
+    return False
+
+
+async def run_simple_claim_flow(ctx, purchase, steam_id: str, player_record: dict, player_data: dict):
+    item = str(purchase.get("item", "")).lower().strip()
+    start_embed = discord.Embed(title="🧬 Dino Claim", description="Verifying your dinosaur...", color=discord.Color.blurple())
+    await ctx.send(embed=start_embed)
+
+    health_started_at = datetime.now()
+    if not await execute_game_command_direct(f"/health {steam_id} 100", delay_after=1.0):
+        fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_command_failed")
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    health_log = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        health_log = await asyncio.to_thread(get_fresh_health_log_for_claim, steam_id, health_started_at)
+        if health_log:
+            break
+        await asyncio.sleep(1)
+    if not health_log:
+        fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_verify_timeout")
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    detected_class = str(health_log.get("class_name", "Unknown"))
+    if not classes_match(item, detected_class):
+        fail_purchase_with_refund(purchase, "FAILED", "Wrong dinosaur detected. Energy refunded.", "wrong_dino_detected")
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Wrong dinosaur detected", color=discord.Color.red())
+        fail_embed.add_field(name="Expected", value=item.upper(), inline=True)
+        fail_embed.add_field(name="Detected", value=detected_class, inline=True)
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    for cmd in (f"/growth {steam_id} 65", f"/hunger {steam_id} 100", f"/thirst {steam_id} 100"):
+        if not await execute_game_command_direct(cmd, delay_after=1.2):
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
+            fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+            fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+            await ctx.send(embed=fail_embed)
+            return
+
+    purchase["status"] = "DELIVERED"
+    purchase["claim_state"] = None
+    purchase["claimed_at"] = str(datetime.now())
+    purchase["delivery_note"] = f"{item.upper()} primed."
+    purchase["failure_note"] = "Claim completed."
+    success_embed = discord.Embed(title="✅ Claim Complete", description=f"Your {item} has been primed.", color=discord.Color.green())
+    success_embed.add_field(name="Commands applied", value="- Growth set to 65%\n- Hunger restored\n- Thirst restored", inline=False)
+    await ctx.send(embed=success_embed)
 
 
 def enforce_claim_watchdog_timeout():
@@ -3785,6 +3907,10 @@ async def on_ready():
     bot_runtime_state["startup_warmup_complete_logged"] = False
     bot_runtime_state["startup_warmup_banner_logged"] = False
     bot_runtime_state["startup_initialized"] = True
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        if retire_old_claim_flow_purchases(purchases):
+            save_purchases(purchases)
     log_limited("startup_warmup_banner", 120, "STARTUP", "warmup active")
     cfg_presence = get_bot_presence_config()
     log_info("STARTUP", f"Admin bot config loaded (steam_id={str(cfg_presence.get('steam_id', '')).strip() or '(empty)'})")
@@ -4016,7 +4142,7 @@ async def buy(ctx, item: str):
         player = data.get(steam_id) if steam_id else None
         if not player:
             response_message = "❌ Use !link first"
-        elif any(p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES for p in purchases):
+        elif any(p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED" for p in purchases):
             response_message = "❌ You already have an active purchase. Use `!claim` first."
         elif int(player.get("energy", 0)) < int(price):
             response_message = "❌ Not enough energy"
@@ -4024,7 +4150,7 @@ async def buy(ctx, item: str):
             duplicate_unclaimed = any(
                 p.get("steam_id") == steam_id
                 and str(p.get("item", "")).lower().strip() == item
-                and p.get("status") in CLAIM_OPEN_STATES
+                and str(p.get("status", "")).upper() == "UNCLAIMED"
                 for p in purchases
             )
             if duplicate_unclaimed:
@@ -4098,70 +4224,54 @@ async def claim(ctx):
         await ctx.send("❌ Use !link first")
         return
 
+    lock = SIMPLE_CLAIM_LOCKS.setdefault(str(steam_id), asyncio.Lock())
+    if lock.locked():
+        await ctx.send("⏳ Your claim is already in progress.")
+        return
+
+    selected_purchase = None
     with ECONOMY_LOCK:
         purchases = load_purchases()
         game_commands = load_game_commands()
-        if run_claim_cleanup_pass(purchases, game_commands):
+        if retire_old_claim_flow_purchases(purchases) or run_claim_cleanup_pass(purchases, game_commands):
             save_purchases(purchases)
-        active_idx = get_latest_active_claim_purchase_index(purchases, steam_id)
-        ready_idx = get_latest_ready_to_claim_purchase_index(purchases, steam_id)
-
-        if active_idx is not None:
-            response = "⏳ Your claim is already in progress."
-        elif ready_idx is None:
-            latest_mine = None
-            for p in reversed(purchases):
-                if p.get("steam_id") == steam_id:
-                    latest_mine = p
-                    break
-            if latest_mine and latest_mine.get("status") == "WRONG_DINO_REFUNDED":
-                response = (
-                    "❌ Claim blocked: wrong dino detected on your last attempt. "
-                    "Your energy has been refunded. Switch dinos and buy again when ready."
-                )
-            elif latest_mine and latest_mine.get("status") == "FAILED":
-                if latest_mine.get("timeout_reason") == "claim_queue_timeout":
-                    response = (
-                        f"⚠️ Your claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. "
-                        "Your energy has been refunded. Please run !claim again."
-                    )
-                else:
-                    note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
-                    response = f"⚠️ {note}"
-            else:
-                response = "❌ You do not have any active dinosaur purchases."
-        else:
-            purchase = purchases[ready_idx]
-            purchase["claim_attempt_id"] = f"attempt_{uuid.uuid4().hex[:10]}"
-            purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
-            ensure_claim_identity(purchase)
-            purchase["active_command_ids"] = []
-            purchase["precheck_started_at"] = None
-            purchase["claim_started_at"] = None
-            purchase["final_verify_started_at"] = None
-            purchase["last_progress_note"] = "Claim queued"
-            purchase["claimed_at"] = str(datetime.now())
-            clear_cached_health_log_for_steam(steam_id)
-            clear_cached_grow_log_for_steam(steam_id)
-            print(f"[CLAIM] cleared cached verification logs steam={steam_id}")
-            set_claim_state(purchase, "PRECHECK_SEND")
-            save_purchases(purchases)
-            response = "✅ Claim queued. Verification starting now."
-
-    sent_message = await ctx.send(response)
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        target = None
         for p in reversed(purchases):
-            state_key = str(p.get("claim_state") or p.get("status") or "").upper()
-            if p.get("steam_id") == steam_id and state_key in CLAIM_OPEN_STATES.union({"FAILED", "WRONG_DINO_REFUNDED", "DELIVERED"}):
-                target = p
+            if p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED":
+                selected_purchase = p
                 break
-        if target and target.get("claim_group_id"):
-            target["progress_channel_id"] = int(ctx.channel.id)
-            target["progress_message_id"] = int(sent_message.id)
-            target["progress_guild_id"] = int(ctx.guild.id) if ctx.guild else None
-            target["progress_user_id"] = int(ctx.author.id)
+        if not selected_purchase:
+            await ctx.send("❌ You do not have any active dinosaur purchases.")
+            return
+
+    async with lock:
+        purchase_ref = None
+        purchase_time_key = None
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase_ref = next(
+                (p for p in reversed(purchases) if p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED"),
+                None,
+            )
+            if not purchase_ref:
+                await ctx.send("❌ You do not have any active dinosaur purchases.")
+                return
+            purchase_time_key = purchase_ref.get("time")
+            purchase_ref["claim_state"] = None
+            purchase_ref["delivery_note"] = "Verifying your dinosaur..."
+            save_purchases(purchases)
+
+        with ECONOMY_LOCK:
+            player_data = load_json(DATA_FILE, {})
+            player_record = player_data.get(steam_id, {})
+        await run_simple_claim_flow(ctx, purchase_ref, steam_id, player_record, player_data)
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            target = next(
+                (p for p in purchases if p.get("steam_id") == steam_id and p.get("time") == purchase_time_key),
+                None,
+            )
+            if target:
+                target.update(purchase_ref)
             save_purchases(purchases)
 
 
@@ -4184,19 +4294,18 @@ async def myclaims(ctx):
 
     lines = ["📦 **Your Purchases**\n"]
     for p in mine[-10:]:
-        effective_state = str(p.get("claim_state") or p.get("status") or "").upper()
-        if effective_state == "FAILED" and p.get("refund_applied"):
-            label, pct = ("Failed / Refunded", None)
-        elif effective_state == "WRONG_DINO_REFUNDED":
-            label, pct = ("Wrong dino / Refunded", None)
-        elif effective_state == "DELIVERED":
-            label, pct = ("Completed", 100)
+        status = str(p.get("status") or "").upper()
+        if status == "DELIVERED":
+            label = "✅ Completed"
+        elif status == "FAILED":
+            label = "❌ Failed"
+        elif status == "EXPIRED":
+            label = "⌛ Expired"
         else:
-            label, pct = get_claim_status_display(p.get("status"), effective_state)
-        pct_text = f"{pct}% complete" if pct is not None else "Not completed"
+            label = "⏳ Unclaimed"
         extra_note = clean_claim_note_for_user(p.get("failure_note") or p.get("delivery_note") or "")
         lines.append(
-            f"{p.get('item', '?').upper()} — {label} — {pct_text}"
+            f"{p.get('item', '?').upper()} — {label}"
             + (f" — {extra_note}" if extra_note else "")
         )
 
