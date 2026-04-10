@@ -84,6 +84,23 @@ def get_simple_claim_lock(steam_id: str) -> asyncio.Lock:
         SIMPLE_CLAIM_LOCKS[key] = asyncio.Lock()
     return SIMPLE_CLAIM_LOCKS[key]
 
+
+def is_server_claimable_now() -> tuple[bool, str]:
+    current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
+    admin_state = str(bot_runtime_state.get("admin_bot_state", "")).upper()
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    _last_player_count = int(bot_runtime_state.get("last_player_poll_player_count", 0) or 0)
+
+    if current_server_state in {SERVER_STATE_DOWN, SERVER_STATE_SUSPECTED_DOWN}:
+        return False, "server_down"
+    if current_server_state == SERVER_STATE_RESTARTING:
+        return False, "server_restarting"
+    if current_server_state == SERVER_STATE_RECOVERING:
+        if admin_state == "ONLINE" and last_poll_ok:
+            return True, "recovering_but_usable"
+        return False, "server_recovering"
+    return True, "online"
+
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
 ]
@@ -4164,8 +4181,24 @@ async def buy(ctx, item: str):
 async def claim(ctx):
     expire_old_purchases()
     current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
-    if current_server_state in {SERVER_STATE_RESTARTING, SERVER_STATE_RECOVERING, SERVER_STATE_DOWN, SERVER_STATE_SUSPECTED_DOWN}:
-        await ctx.send("⚠️ Claims are temporarily unavailable while the server is restarting/recovering. Please try again shortly.")
+    admin_state = str(bot_runtime_state.get("admin_bot_state", "")).upper()
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    player_count = int(bot_runtime_state.get("last_player_poll_player_count", 0) or 0)
+    claimable, reason = is_server_claimable_now()
+    print(
+        f"[CLAIM GATE] state={current_server_state} admin_state={admin_state} "
+        f"last_poll_ok={last_poll_ok} player_count={player_count} "
+        f"result={'allow' if claimable else 'block'} reason={reason}"
+    )
+    if not claimable:
+        if reason == "server_restarting":
+            await ctx.send("⚠️ Claims are temporarily unavailable while the server is restarting. Please try again shortly.")
+        elif reason == "server_recovering":
+            await ctx.send("⚠️ Claims are temporarily unavailable while the server is still recovering. Please try again shortly.")
+        elif reason == "server_down":
+            await ctx.send("⚠️ Claims are temporarily unavailable because the server is currently offline.")
+        else:
+            await ctx.send("⚠️ Claims are temporarily unavailable right now. Please try again shortly.")
         return
     if is_admin_bot_offline():
         print("[CLAIM BLOCKED] admin bot offline")
@@ -4213,18 +4246,24 @@ async def myclaims(ctx):
         await ctx.send("📭 You have no purchases.")
         return
 
-    lines = ["📦 **Your Purchases**\n"]
-    for p in mine[-10:]:
+    lines = ["📦 **Your Purchases (Newest First)**\n"]
+    for p in reversed(mine[-10:]):
         status = str(p.get("status") or "").upper()
         if status == "DELIVERED":
             label = "✅ Completed"
+        elif status == "CLAIMING":
+            label = "🔄 Claiming"
         elif status == "FAILED":
             label = "❌ Failed"
         elif status == "EXPIRED":
             label = "⌛ Expired"
         else:
             label = "⏳ Unclaimed"
-        extra_note = clean_claim_note_for_user(p.get("failure_note") or p.get("delivery_note") or "")
+        raw_note = str(p.get("failure_note") or p.get("delivery_note") or "")
+        if "Old claim flow retired" in raw_note or "timed out" in raw_note.lower():
+            extra_note = raw_note.strip()
+        else:
+            extra_note = clean_claim_note_for_user(raw_note)
         lines.append(
             f"{p.get('item', '?').upper()} — {label}"
             + (f" — {extra_note}" if extra_note else "")
