@@ -3740,18 +3740,74 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         await ctx.send(embed=fail_embed)
         return
 
-    for cmd in (f"/growth {steam_id} 65", f"/hunger {steam_id} 100", f"/thirst {steam_id} 100"):
-        if not await execute_game_command_direct(cmd, timeout_seconds=12, delay_after=1.2):
-            with ECONOMY_LOCK:
-                purchases = load_purchases()
-                purchase = purchases[purchase_index]
-                fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
-                purchase["failed_at"] = str(datetime.now())
-                save_purchases(purchases)
-            fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
-            fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
-            await ctx.send(embed=fail_embed)
-            return
+    print(f"[CLAIM CMD] /growth {steam_id} 65")
+    if not await execute_game_command_direct(f"/growth {steam_id} 65", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+    await asyncio.sleep(1)
+
+    print(f"[CLAIM CMD] /hunger {steam_id} 100")
+    if not await execute_game_command_direct(f"/hunger {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "hunger_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+    await asyncio.sleep(1)
+
+    print(f"[CLAIM CMD] /diet1 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet1 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet1_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+    await asyncio.sleep(1)
+
+    print(f"[CLAIM CMD] /diet2 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet2 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet2_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+    await asyncio.sleep(1)
+
+    print(f"[CLAIM CMD] /diet3 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet3 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet3_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
 
     with ECONOMY_LOCK:
         purchases = load_purchases()
@@ -3764,7 +3820,7 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         purchase["failure_note"] = "Claim completed."
         save_purchases(purchases)
     success_embed = discord.Embed(title="✅ Claim Complete", description=f"Your {item} has been primed.", color=discord.Color.green())
-    success_embed.add_field(name="Commands applied", value="- Growth set to 65%\n- Hunger restored\n- Thirst restored", inline=False)
+    success_embed.add_field(name="Commands applied", value="- Growth set to 65%\n- Hunger restored\n- Diet fully restored", inline=False)
     await ctx.send(embed=success_embed)
 
 
