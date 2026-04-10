@@ -164,6 +164,8 @@ PATREON_TIER_RATES = {
 BOT_STATE_IN_GAME = "BOT_IN_GAME"
 BOT_STATE_MISSING = "BOT_MISSING"
 BOT_STATE_WAITING_SERVER = "BOT_WAITING_FOR_SERVER"
+ADMIN_BOT_PLAYER_NAME = "Primal Abyss Bot"
+ADMIN_BOT_STEAM_ID = "76561198721331299"
 
 SERVER_STATE_ONLINE = "SERVER_ONLINE"
 SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
@@ -1896,7 +1898,7 @@ def log_limited(key: str, interval_seconds: float, tag: str, msg: str, level: st
 # [STARTUP] Bot logged in
 # [ADMIN BOT] ONLINE
 # [TRACKING] Players online: 1
-# JJoness290 | 76561198798435427 | session=43 mins | total=570 mins | energy=1666
+# JJoness290 | 76561198721331299 | session=43 mins | total=570 mins | energy=1666
 # [CLAIM TIMEOUT] refunded 25 energy steam=...
 
 
@@ -1908,10 +1910,14 @@ def get_bot_presence_config():
     if not isinstance(section, dict):
         section = {}
 
-    env_player_name = str(os.getenv("BOT_PLAYER_NAME", "") or "").strip()
-    env_steam_id = str(os.getenv("BOT_STEAM_ID", "") or "").strip()
-    cfg_player_name = str(section.get("player_name", config.get("bot_player_name", "")) or "").strip()
-    cfg_steam_id = str(section.get("steam_id", config.get("bot_steam_id", "")) or "").strip()
+    bot_presence = {
+        "player_name": ADMIN_BOT_PLAYER_NAME,
+        "steam_id": ADMIN_BOT_STEAM_ID,
+    }
+    env_player_name = str(os.getenv("BOT_PLAYER_NAME", bot_presence["player_name"]) or "").strip()
+    env_steam_id = str(os.getenv("BOT_STEAM_ID", bot_presence["steam_id"]) or "").strip()
+    cfg_player_name = str(section.get("player_name", config.get("bot_player_name", bot_presence["player_name"])) or "").strip()
+    cfg_steam_id = str(section.get("steam_id", config.get("bot_steam_id", bot_presence["steam_id"])) or "").strip()
 
     return {
         "player_name": env_player_name if env_player_name else cfg_player_name,
