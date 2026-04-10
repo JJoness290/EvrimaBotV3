@@ -67,23 +67,7 @@ DINO_CLASS_MAP = {
     "rex": ["Tyrannosaurus", "TRex", "Rex"],
 }
 
-CLAIM_ACTIVE_STATES = {
-    "READY_TO_CLAIM",
-    "PRECHECK_SEND",
-    "PRECHECK_WAIT",
-    "PRECHECK_VERIFY",
-    "CLAIM_SEND",
-    "CLAIM_WAIT",
-    "FINAL_VERIFY",
-}
-CLAIM_OPEN_STATES = CLAIM_ACTIVE_STATES.union({"UNCLAIMED"})
-CLAIM_PRECHECK_STATES = {"PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY"}
-
-PRECHECK_TOTAL_TIMEOUT_SECONDS = 45
-CLAIM_COMMAND_TIMEOUT_SECONDS = 90
-FINAL_VERIFY_TIMEOUT_SECONDS = 30
 REMOTE_LOG_TAIL_BYTES = 16 * 1024
-CLAIM_ACTIVE_TIMEOUT_SECONDS = 90
 
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
@@ -1457,44 +1441,9 @@ def expire_old_purchases():
 def has_open_purchase(steam_id: str) -> bool:
     purchases = load_purchases()
     return any(
-        p.get("steam_id") == steam_id and str(p.get("claim_state") or p.get("status") or "").upper() in CLAIM_OPEN_STATES
+        p.get("steam_id") == steam_id and is_simple_open_purchase_status(p.get("status", ""))
         for p in purchases
     )
-
-
-def get_claimable_purchase_index(purchases, steam_id: str):
-    active_idx = get_latest_active_claim_purchase_index(purchases, steam_id)
-    if active_idx is not None:
-        p = purchases[active_idx]
-        return active_idx, str(p.get("claim_state") or p.get("status") or "").upper()
-    ready_idx = get_latest_ready_to_claim_purchase_index(purchases, steam_id)
-    if ready_idx is not None:
-        return ready_idx, "READY_TO_CLAIM"
-    return None, None
-
-
-def get_latest_active_claim_purchase_index(purchases, steam_id: str):
-    real_active_states = CLAIM_ACTIVE_STATES.difference({"READY_TO_CLAIM"})
-    for i in range(len(purchases) - 1, -1, -1):
-        p = purchases[i]
-        if p.get("steam_id") != steam_id:
-            continue
-        claim_state = str(p.get("claim_state") or p.get("status") or "").upper()
-        if claim_state in real_active_states:
-            return i
-    return None
-
-
-def get_latest_ready_to_claim_purchase_index(purchases, steam_id: str):
-    for i in range(len(purchases) - 1, -1, -1):
-        p = purchases[i]
-        if p.get("steam_id") != steam_id:
-            continue
-        claim_state = str(p.get("claim_state") or "").upper()
-        status = str(p.get("status") or "").upper()
-        if claim_state == "READY_TO_CLAIM" or status == "UNCLAIMED":
-            return i
-    return None
 
 
 def get_latest_unclaimed_purchase_index(purchases, steam_id: str):
@@ -1503,6 +1452,10 @@ def get_latest_unclaimed_purchase_index(purchases, steam_id: str):
         if str(p.get("steam_id")) == str(steam_id) and str(p.get("status", "")).upper() == "UNCLAIMED":
             return i
     return None
+
+
+def is_simple_open_purchase_status(status: str) -> bool:
+    return str(status or "").upper() in {"UNCLAIMED", "CLAIMING"}
 
 
 def get_online_players_from_data():
@@ -3365,40 +3318,8 @@ def ensure_claim_identity(purchase: dict):
 
 
 def cleanup_broken_active_purchases(purchases: list, game_commands: list):
-    changed = False
-    for purchase in purchases:
-        claim_state = str(purchase.get("claim_state") or purchase.get("status") or "").upper()
-        if claim_state not in CLAIM_ACTIVE_STATES:
-            continue
-        purchase_id = purchase.get("id", "unknown")
-        claim_group_id = purchase.get("claim_group_id")
-        claim_attempt_id = purchase.get("claim_attempt_id")
-        if not claim_group_id or not claim_attempt_id:
-            print(f"[CLAIM CLEANUP] purchase_id={purchase_id} reason=missing_claim_identity")
-            refund_purchase_energy_if_needed(purchase, "broken_state_cleanup")
-            purchase["claim_state"] = "FAILED"
-            purchase["status"] = "FAILED"
-            purchase["delivery_note"] = "Broken claim state cleaned up. Please run !claim again."
-            changed = True
-            continue
-        grouped = get_group_commands(game_commands, claim_group_id, claim_attempt_id)
-        if claim_state in {"PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_WAIT", "FINAL_VERIFY"} and not grouped:
-            print(f"[CLAIM CLEANUP] purchase_id={purchase_id} reason=missing_command_group")
-            refund_purchase_energy_if_needed(purchase, "broken_state_cleanup")
-            purchase["claim_state"] = "FAILED"
-            purchase["status"] = "FAILED"
-            purchase["delivery_note"] = "Broken claim state cleaned up. Please run !claim again."
-            changed = True
-            continue
-        active_ids = [str(x) for x in (purchase.get("active_command_ids") or [])]
-        if claim_state in {"PRECHECK_WAIT", "CLAIM_WAIT"} and active_ids and all(not any(str(cmd.get("id")) == cid for cmd in grouped) for cid in active_ids):
-            print(f"[CLAIM CLEANUP] purchase_id={purchase_id} reason=orphaned_active_purchase")
-            refund_purchase_energy_if_needed(purchase, "broken_state_cleanup")
-            purchase["claim_state"] = "FAILED"
-            purchase["status"] = "FAILED"
-            purchase["delivery_note"] = "Broken claim state cleaned up. Please run !claim again."
-            changed = True
-    return changed
+    # Old grouped claim cleanup retired.
+    return False
 
 
 def queue_command(game_commands: list, purchase: dict, player_name: str, phase: str, step_index: int, command_text: str):
@@ -3481,15 +3402,8 @@ def normalize_legacy_claim_purchase(purchase: dict):
 
 
 def run_claim_cleanup_pass(purchases: list, game_commands: list):
-    changed = False
-    for purchase in purchases:
-        had = purchase.get("claim_state")
-        normalize_legacy_claim_purchase(purchase)
-        if had != purchase.get("claim_state"):
-            changed = True
-    if cleanup_broken_active_purchases(purchases, game_commands):
-        changed = True
-    return changed
+    # Old grouped claim cleanup retired.
+    return False
 
 
 def process_claim_orchestration():
@@ -3812,52 +3726,8 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
 
 
 def enforce_claim_watchdog_timeout():
-    active_states = CLAIM_ACTIVE_STATES
-    now = datetime.now()
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        game_commands = load_game_commands()
-        changed_purchases = False
-        changed_commands = False
-
-        for purchase in purchases:
-            claim_state = str(purchase.get("claim_state") or purchase.get("status") or "").upper()
-            if claim_state not in active_states:
-                continue
-
-            started_at = parse_dt(purchase.get("claim_started_at")) or parse_dt(purchase.get("claimed_at")) or parse_dt(purchase.get("time"))
-            if not started_at:
-                purchase["claim_started_at"] = str(now)
-                changed_purchases = True
-                continue
-
-            if (now - started_at).total_seconds() <= CLAIM_ACTIVE_TIMEOUT_SECONDS:
-                continue
-
-            claim_group_id = purchase.get("claim_group_id")
-            claim_attempt_id = purchase.get("claim_attempt_id")
-            if claim_group_id and claim_attempt_id and clear_stale_claim_commands_for_attempt(
-                game_commands,
-                claim_group_id,
-                claim_attempt_id,
-                f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds.",
-            ):
-                changed_commands = True
-
-            timeout_note = f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds. Points refunded."
-            fail_purchase_with_refund(
-                purchase,
-                "CANCELLED_TIMEOUT",
-                timeout_note,
-                "Claim timed out — points refunded.",
-            )
-            purchase["timeout_at"] = str(now)
-            changed_purchases = True
-
-        if changed_commands:
-            save_game_commands(game_commands)
-        if changed_purchases:
-            save_purchases(purchases)
+    # Old watchdog retired with old claim queue/state machine flow.
+    return
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -4232,25 +4102,17 @@ async def buy(ctx, item: str):
                     "steam_id": steam_id,
                     "item": item,
                     "status": "UNCLAIMED",
-                    "claim_state": "READY_TO_CLAIM",
-                    "claim_attempt_id": f"attempt_{uuid.uuid4().hex[:10]}",
                     "time": str(datetime.now()),
                     "claimed_at": None,
+                    "delivered_at": None,
+                    "failed_at": None,
                     "delivery_note": None,
                     "failure_note": None,
-                    "claim_group_id": f"claim_{steam_id}_{uuid.uuid4().hex[:10]}",
-                    "active_command_ids": [],
-                    "precheck_started_at": None,
-                    "claim_started_at": None,
-                    "final_verify_started_at": None,
-                    "last_progress_note": None,
-                    "timeout_reason": None,
-                    "verify_expected_item": item,
-                    "verify_expected_steam_id": steam_id,
                     "refund_applied": False,
                     "refund_amount": 0,
                     "refunded_at": None,
                     "refund_note": None,
+                    "timeout_reason": None,
                     "economy_note": f"Buy deducted {price} energy @ {datetime.now()}",
                 }
                 purchases.append(new_purchase)
