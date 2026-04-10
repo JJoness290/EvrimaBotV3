@@ -3752,7 +3752,6 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
         return
-    await asyncio.sleep(1)
 
     print(f"[CLAIM CMD] /hunger {steam_id} 100")
     if not await execute_game_command_direct(f"/hunger {steam_id} 100", timeout_seconds=12, delay_after=1.0):
@@ -3766,7 +3765,6 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
         return
-    await asyncio.sleep(1)
 
     print(f"[CLAIM CMD] /diet1 {steam_id} 100")
     if not await execute_game_command_direct(f"/diet1 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
@@ -3780,7 +3778,6 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
         return
-    await asyncio.sleep(1)
 
     print(f"[CLAIM CMD] /diet2 {steam_id} 100")
     if not await execute_game_command_direct(f"/diet2 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
@@ -3794,7 +3791,6 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
         return
-    await asyncio.sleep(1)
 
     print(f"[CLAIM CMD] /diet3 {steam_id} 100")
     if not await execute_game_command_direct(f"/diet3 {steam_id} 100", timeout_seconds=12, delay_after=1.0):

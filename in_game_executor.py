@@ -14,11 +14,11 @@ PLAYER_STATE_FILE = Path("player_state.json")
 
 DEFAULT_POST_SEND_DELAYS = {
     "/elder": 3,
-    "/growth": 2,
-    "/diet1": 1,
-    "/diet2": 1,
-    "/diet3": 1,
-    "/hunger": 1,
+    "/growth": 1,
+    "/diet1": 0,
+    "/diet2": 0,
+    "/diet3": 0,
+    "/hunger": 0,
     "/thirst": 1,
     "/health": 1,
 }
@@ -116,7 +116,7 @@ def get_delay_for_command(command_text: str) -> int:
     delays = get_delay_overrides()
     for prefix, delay in delays.items():
         if normalized.startswith(prefix):
-            return int(delay)
+            return max(0, int(delay))
     return 3
 
 
