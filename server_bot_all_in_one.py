@@ -1023,21 +1023,37 @@ def get_fresh_grow_log_for_steam(steam_id: str, since_dt: datetime | None):
     return None
 
 
-def get_fresh_health_log_for_claim(steam_id: str, since_dt: datetime | None):
+def get_latest_health_log_raw_for_steam(steam_id: str):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         return None
     for line in reversed(lines):
         parsed = parse_health_command_log_line(line)
-        if not parsed or str(parsed.get("steam_id")) != str(steam_id):
+        if parsed and str(parsed.get("steam_id")) == str(steam_id):
+            return str(parsed.get("raw_line") or "").strip()
+    return None
+
+
+def get_fresh_health_log_for_claim(steam_id: str, previous_raw_line: str | None = None):
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
+        print(f"[CLAIM] waiting for fresh health log steam={steam_id} err={err}")
+        return None
+    saw_matching_line = False
+    for line in reversed(lines):
+        parsed = parse_health_command_log_line(line)
+        if not parsed:
             continue
-        event_dt = get_log_event_dt(parsed)
-        if since_dt and event_dt and event_dt < since_dt:
+        if str(parsed.get("steam_id")) != str(steam_id):
             continue
-        if since_dt and event_dt is None:
-            # unparseable timestamp: only current-read match is accepted (this is one)
-            return parsed
+        saw_matching_line = True
+        raw_line = str(parsed.get("raw_line") or "").strip()
+        if previous_raw_line and raw_line == previous_raw_line:
+            print(f"[CLAIM] health log rejected steam={steam_id} reason=baseline_match")
+            continue
+        print(f"[CLAIM] fresh health log accepted steam={steam_id} class={parsed.get('class_name')}")
         return parsed
+    print(f"[CLAIM] waiting for fresh health log steam={steam_id} matching_found={saw_matching_line}")
     return None
 
 
@@ -3650,7 +3666,12 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
     start_embed = discord.Embed(title="🧬 Dino Claim", description="Verifying your dinosaur...", color=discord.Color.blurple())
     await ctx.send(embed=start_embed)
 
-    health_started_at = datetime.now()
+    clear_cached_health_log_for_steam(steam_id)
+    previous_health_raw = await asyncio.to_thread(get_latest_health_log_raw_for_steam, steam_id)
+    print(
+        f"[CLAIM] baseline health raw captured steam={steam_id} "
+        f"found={'yes' if previous_health_raw else 'no'}"
+    )
     if not await execute_game_command_direct(f"/health {steam_id} 100", timeout_seconds=12, delay_after=1.0):
         with ECONOMY_LOCK:
             purchases = load_purchases()
@@ -3666,11 +3687,16 @@ async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
     health_log = None
     deadline = time.time() + 20
     while time.time() < deadline:
-        health_log = await asyncio.to_thread(get_fresh_health_log_for_claim, steam_id, health_started_at)
+        health_log = await asyncio.to_thread(get_fresh_health_log_for_claim, steam_id, previous_health_raw)
         if health_log:
             break
+        print(f"[CLAIM] waiting for fresh health log steam={steam_id}")
         await asyncio.sleep(1)
     if not health_log:
+        print(
+            f"[CLAIM] health verify timeout steam={steam_id} "
+            f"baseline_found={'yes' if previous_health_raw else 'no'}"
+        )
         with ECONOMY_LOCK:
             purchases = load_purchases()
             purchase = purchases[purchase_index]
