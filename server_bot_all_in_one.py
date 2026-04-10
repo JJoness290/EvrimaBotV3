@@ -1938,7 +1938,7 @@ def get_bot_sustain_config():
         normalized = ["/health 100", "/hunger 100", "/thirst 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
-        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
+        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 60)) or 60),
         "commands": normalized,
     }
 
@@ -2219,17 +2219,50 @@ def has_pending_sustain_commands() -> bool:
     return False
 
 
+def cleanup_stale_sustain_commands(max_age_seconds: int = 30) -> int:
+    cleaned = 0
+    now = datetime.now(timezone.utc)
+    with ECONOMY_LOCK:
+        commands = load_game_commands()
+        changed = False
+        for entry in commands:
+            if str(entry.get("command_type", "")).lower() not in {"sustain", "sustain_command"}:
+                continue
+            if str(entry.get("status", "")).upper() not in {"PENDING", "EXECUTING"}:
+                continue
+            base_dt = parse_dt(str(entry.get("started_at") or entry.get("created_at") or ""))
+            if not base_dt:
+                continue
+            if base_dt.tzinfo is None:
+                age_seconds = (datetime.now() - base_dt).total_seconds()
+            else:
+                age_seconds = (now - base_dt).total_seconds()
+            if age_seconds <= max_age_seconds:
+                continue
+            entry["status"] = "FAILED"
+            entry["completed_at"] = now.isoformat()
+            entry["error"] = "Stale sustain command cleaned up automatically"
+            cleaned += 1
+            changed = True
+        if changed:
+            save_game_commands(commands)
+    return cleaned
+
+
 def try_queue_sustain(now_ts: float, cfg_sustain: dict, immediate: bool = False) -> bool:
+    cleaned_count = cleanup_stale_sustain_commands(max_age_seconds=30)
+    if cleaned_count > 0:
+        print(f"[SUSTAIN] cleaned stale commands count={cleaned_count}")
     if str(load_json(STATE_FILE, {}).get("bot_presence_state", "")).upper() != BOT_STATE_IN_GAME:
-        log_limited("sustain_skipped_presence", 30, "BOT SUSTAIN", "skipped (bot not in game)")
+        print("[SUSTAIN] skipped (bot not in game)")
         return False
     if has_pending_sustain_commands():
-        log_limited("sustain_skipped_pending", 30, "BOT SUSTAIN", "skipped (already pending)")
+        print("[SUSTAIN] skipped (already pending)")
         return False
     interval = int(cfg_sustain.get("interval_seconds", 600) or 600)
     last_sustain_at = float(bot_runtime_state.get("last_sustain_at", 0.0) or 0.0)
     if (not immediate) and last_sustain_at > 0 and (now_ts - last_sustain_at) < interval:
-        log_limited("sustain_skipped_interval", 30, "BOT SUSTAIN", "skipped (interval not reached)")
+        print("[SUSTAIN] skipped (interval not reached)")
         return False
     print("[SUSTAIN] due")
     queue_sustain_commands()
