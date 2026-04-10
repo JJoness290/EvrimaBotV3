@@ -1938,7 +1938,7 @@ def get_bot_sustain_config():
         normalized = ["/health 100", "/hunger 100", "/thirst 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
-        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 60)) or 60),
+        "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
         "commands": normalized,
     }
 
