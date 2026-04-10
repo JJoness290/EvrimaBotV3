@@ -1,0 +1,65 @@
+{
+  "discord_token": "",
+  "rcon_password": "",
+  "restart_channel_id": 0,
+  "restart_channel_name": "restarts",
+  "restart_times": ["00:00", "06:00", "12:00", "18:00"],
+  "scan_interval": 5,
+  "starting_energy": 100,
+  "reward_interval_seconds": 60,
+  "max_reward_catchup_minutes": 60,
+  "patreon_role_cache_ttl_seconds": 120,
+  "health_poll_interval_seconds": 10,
+  "crash_suspect_threshold": 2,
+  "crash_confirm_threshold": 4,
+  "executor_heartbeat_timeout_seconds": 60,
+  "claim_retry_limit": 1,
+  "claim_use_recovery_chain": true,
+  "claim_precheck_commands": ["/health {steam_id} 100"],
+  "claim_recovery_commands": [
+    "/diet1 {steam_id} 100",
+    "/diet2 {steam_id} 100",
+    "/diet3 {steam_id} 100",
+    "/health {steam_id} 100"
+  ],
+  "claim_commands": [
+    "/growth {steam_id} 65",
+    "/diet1 {steam_id} 100",
+    "/diet2 {steam_id} 100",
+    "/diet3 {steam_id} 100",
+    "/hunger {steam_id} 100",
+    "/health {steam_id} 100"
+  ],
+  "executor_loop_delay_seconds": 2,
+  "executor_command_delays": {
+    "/growth": 3,
+    "/health": 1
+  },
+  "admin_bot_grace_seconds": 120,
+  "rcon_check_interval_seconds": 10,
+  "admin_bot_startup_warmup_seconds": 30,
+  "debug_admin_bot_detection": false,
+  "bot_presence": {
+    "player_name": "YOUR_BOT_NAME",
+    "steam_id": "",
+    "missing_grace_seconds": 60
+  },
+  "bot_sustain": {
+    "enabled": true,
+    "interval_seconds": 600,
+    "commands": ["/hunger 100", "/thirst 100", "/health 100"]
+  },
+  "admin_dashboard": {
+    "enabled": true,
+    "channel_id": 0,
+    "refresh_interval_seconds": 60
+  },
+  "admin_alerts": {
+    "enabled": true,
+    "channel_id": 0,
+    "ping_role_id": 0,
+    "ping_user_ids": [],
+    "send_immediate_offline_alert": true,
+    "send_recovery_alert": true
+  }
+}
