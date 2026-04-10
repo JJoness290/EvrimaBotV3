@@ -93,6 +93,13 @@ last_sftp_eof_warn_at = 0.0
 CLAIM_STARTUP_CLEANUP_DONE = False
 SIMPLE_CLAIM_LOCKS: dict[str, asyncio.Lock] = {}
 
+
+def get_simple_claim_lock(steam_id: str) -> asyncio.Lock:
+    key = str(steam_id or "").strip()
+    if key not in SIMPLE_CLAIM_LOCKS:
+        SIMPLE_CLAIM_LOCKS[key] = asyncio.Lock()
+    return SIMPLE_CLAIM_LOCKS[key]
+
 announcement_messages = [
     "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
 ]
@@ -1389,13 +1396,13 @@ def expire_old_purchases():
                     purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
                     changed_purchases = True
 
-            elif str(status).upper() in CLAIM_ACTIVE_STATES:
+            elif str(status).upper() == "CLAIMING":
                 claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
                 if not claimed_at:
                     continue
 
-                if now - claimed_at >= timedelta(minutes=CLAIM_QUEUE_TIMEOUT_MINUTES):
-                    if purchase.get("timeout_reason") == "claim_queue_timeout":
+                if now - claimed_at >= timedelta(minutes=3):
+                    if purchase.get("timeout_reason") == "simple_claim_timeout":
                         continue
                     claim_group_id = str(purchase.get("claim_group_id", "")).strip()
                     age_seconds = int((now - claimed_at).total_seconds())
@@ -1418,19 +1425,20 @@ def expire_old_purchases():
                         changed_data = True
                         log_info("CLAIM TIMEOUT", f"refunded {int(purchase.get('refund_amount', 0) or 0)} energy steam={steam_id}")
 
-                    timeout_note = (
-                        f"⚠️ Claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. "
-                        "Your energy has been refunded. Please run !claim again."
-                    )
+                    timeout_note = "⚠️ Claim timed out while processing. Your energy has been refunded. Please run !claim again."
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = timeout_note
                     purchase["failure_note"] = timeout_note
-                    purchase["timeout_reason"] = "claim_queue_timeout"
+                    purchase["timeout_reason"] = "simple_claim_timeout"
 
                     if not purchase.get("timeout_notified"):
                         notify_claim_timeout_refund(steam_id, timeout_note)
                         purchase["timeout_notified"] = True
                     changed_purchases = True
+            elif str(status).upper() in {"READY_TO_CLAIM", "PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_SEND", "CLAIM_WAIT", "FINAL_VERIFY"}:
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = "Old claim flow retired. Please use !claim again."
+                changed_purchases = True
 
         # Timeout behavior examples:
         # - queued claim >2 minutes -> FAILED + refunded + notified + related commands expired.
@@ -1485,6 +1493,14 @@ def get_latest_ready_to_claim_purchase_index(purchases, steam_id: str):
         claim_state = str(p.get("claim_state") or "").upper()
         status = str(p.get("status") or "").upper()
         if claim_state == "READY_TO_CLAIM" or status == "UNCLAIMED":
+            return i
+    return None
+
+
+def get_latest_unclaimed_purchase_index(purchases, steam_id: str):
+    for i in range(len(purchases) - 1, -1, -1):
+        p = purchases[i]
+        if str(p.get("steam_id")) == str(steam_id) and str(p.get("status", "")).upper() == "UNCLAIMED":
             return i
     return None
 
@@ -3660,10 +3676,10 @@ def retire_old_claim_flow_purchases(purchases: list):
     return changed
 
 
-async def execute_game_command_direct(command_text: str, delay_after: float = 1.0) -> bool:
+async def execute_game_command_direct(command_text: str, timeout_seconds: int = 12, delay_after: float = 1.0) -> bool:
     with ECONOMY_LOCK:
         commands_data = load_game_commands()
-        cmd_id = f"cmd_{get_next_command_id(commands_data):03d}"
+        cmd_id = f"direct_{uuid.uuid4().hex[:10]}"
         commands_data.append({
             "id": cmd_id,
             "command": command_text,
@@ -3673,7 +3689,7 @@ async def execute_game_command_direct(command_text: str, delay_after: float = 1.
             "command_type": "direct_claim",
         })
         save_game_commands(commands_data)
-    deadline = time.time() + 10
+    deadline = time.time() + max(3, int(timeout_seconds))
     while time.time() < deadline:
         await asyncio.sleep(0.4)
         with ECONOMY_LOCK:
@@ -3687,17 +3703,47 @@ async def execute_game_command_direct(command_text: str, delay_after: float = 1.
             return True
         if status in {"FAILED", "EXPIRED", "SKIPPED", "CANCELLED"}:
             return False
+    with ECONOMY_LOCK:
+        current = load_game_commands()
+        for cmd in current:
+            if str(cmd.get("id")) == cmd_id and str(cmd.get("status", "")).upper() in {"PENDING", "EXECUTING"}:
+                cmd["status"] = "FAILED"
+                cmd["completed_at"] = str(datetime.now())
+                cmd["error"] = "Direct command timed out waiting for executor completion."
+                save_game_commands(current)
+                break
     return False
 
 
-async def run_simple_claim_flow(ctx, purchase, steam_id: str, player_record: dict, player_data: dict):
-    item = str(purchase.get("item", "")).lower().strip()
+async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        data = load_json(DATA_FILE, {})
+        if purchase_index is None or purchase_index < 0 or purchase_index >= len(purchases):
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        purchase = purchases[purchase_index]
+        if str(purchase.get("steam_id")) != str(steam_id) or str(purchase.get("status", "")).upper() != "UNCLAIMED":
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        item = str(purchase.get("item", "")).lower().strip()
+        purchase["status"] = "CLAIMING"
+        purchase["claimed_at"] = purchase.get("claimed_at") or str(datetime.now())
+        purchase["delivery_note"] = "Verification in progress"
+        purchase["failure_note"] = None
+        save_purchases(purchases)
+
     start_embed = discord.Embed(title="🧬 Dino Claim", description="Verifying your dinosaur...", color=discord.Color.blurple())
     await ctx.send(embed=start_embed)
 
     health_started_at = datetime.now()
-    if not await execute_game_command_direct(f"/health {steam_id} 100", delay_after=1.0):
-        fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_command_failed")
+    if not await execute_game_command_direct(f"/health {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
         fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
@@ -3711,7 +3757,12 @@ async def run_simple_claim_flow(ctx, purchase, steam_id: str, player_record: dic
             break
         await asyncio.sleep(1)
     if not health_log:
-        fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_verify_timeout")
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_verify_timeout")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
         fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
         fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
         await ctx.send(embed=fail_embed)
@@ -3719,7 +3770,12 @@ async def run_simple_claim_flow(ctx, purchase, steam_id: str, player_record: dic
 
     detected_class = str(health_log.get("class_name", "Unknown"))
     if not classes_match(item, detected_class):
-        fail_purchase_with_refund(purchase, "FAILED", "Wrong dinosaur detected. Energy refunded.", "wrong_dino_detected")
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Wrong dinosaur detected. Energy refunded.", "wrong_dino_detected")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
         fail_embed = discord.Embed(title="❌ Claim Failed", description="Wrong dinosaur detected", color=discord.Color.red())
         fail_embed.add_field(name="Expected", value=item.upper(), inline=True)
         fail_embed.add_field(name="Detected", value=detected_class, inline=True)
@@ -3728,18 +3784,28 @@ async def run_simple_claim_flow(ctx, purchase, steam_id: str, player_record: dic
         return
 
     for cmd in (f"/growth {steam_id} 65", f"/hunger {steam_id} 100", f"/thirst {steam_id} 100"):
-        if not await execute_game_command_direct(cmd, delay_after=1.2):
-            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
+        if not await execute_game_command_direct(cmd, timeout_seconds=12, delay_after=1.2):
+            with ECONOMY_LOCK:
+                purchases = load_purchases()
+                purchase = purchases[purchase_index]
+                fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
+                purchase["failed_at"] = str(datetime.now())
+                save_purchases(purchases)
             fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
             fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
             await ctx.send(embed=fail_embed)
             return
 
-    purchase["status"] = "DELIVERED"
-    purchase["claim_state"] = None
-    purchase["claimed_at"] = str(datetime.now())
-    purchase["delivery_note"] = f"{item.upper()} primed."
-    purchase["failure_note"] = "Claim completed."
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        purchase = purchases[purchase_index]
+        purchase["status"] = "DELIVERED"
+        purchase["claim_state"] = None
+        purchase["claimed_at"] = purchase.get("claimed_at") or str(datetime.now())
+        purchase["delivered_at"] = str(datetime.now())
+        purchase["delivery_note"] = "Claim completed successfully."
+        purchase["failure_note"] = "Claim completed."
+        save_purchases(purchases)
     success_embed = discord.Embed(title="✅ Claim Complete", description=f"Your {item} has been primed.", color=discord.Color.green())
     success_embed.add_field(name="Commands applied", value="- Growth set to 65%\n- Hunger restored\n- Thirst restored", inline=False)
     await ctx.send(embed=success_embed)
@@ -4142,7 +4208,10 @@ async def buy(ctx, item: str):
         player = data.get(steam_id) if steam_id else None
         if not player:
             response_message = "❌ Use !link first"
-        elif any(p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED" for p in purchases):
+        elif any(
+            p.get("steam_id") == steam_id and str(p.get("status", "")).upper() in {"UNCLAIMED", "CLAIMING"}
+            for p in purchases
+        ):
             response_message = "❌ You already have an active purchase. Use `!claim` first."
         elif int(player.get("energy", 0)) < int(price):
             response_message = "❌ Not enough energy"
@@ -4150,7 +4219,7 @@ async def buy(ctx, item: str):
             duplicate_unclaimed = any(
                 p.get("steam_id") == steam_id
                 and str(p.get("item", "")).lower().strip() == item
-                and str(p.get("status", "")).upper() == "UNCLAIMED"
+                and str(p.get("status", "")).upper() in {"UNCLAIMED", "CLAIMING"}
                 for p in purchases
             )
             if duplicate_unclaimed:
@@ -4224,55 +4293,19 @@ async def claim(ctx):
         await ctx.send("❌ Use !link first")
         return
 
-    lock = SIMPLE_CLAIM_LOCKS.setdefault(str(steam_id), asyncio.Lock())
+    lock = get_simple_claim_lock(steam_id)
     if lock.locked():
         await ctx.send("⏳ Your claim is already in progress.")
         return
 
-    selected_purchase = None
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        game_commands = load_game_commands()
-        if retire_old_claim_flow_purchases(purchases) or run_claim_cleanup_pass(purchases, game_commands):
-            save_purchases(purchases)
-        for p in reversed(purchases):
-            if p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED":
-                selected_purchase = p
-                break
-        if not selected_purchase:
-            await ctx.send("❌ You do not have any active dinosaur purchases.")
-            return
-
     async with lock:
-        purchase_ref = None
-        purchase_time_key = None
         with ECONOMY_LOCK:
             purchases = load_purchases()
-            purchase_ref = next(
-                (p for p in reversed(purchases) if p.get("steam_id") == steam_id and str(p.get("status", "")).upper() == "UNCLAIMED"),
-                None,
-            )
-            if not purchase_ref:
-                await ctx.send("❌ You do not have any active dinosaur purchases.")
-                return
-            purchase_time_key = purchase_ref.get("time")
-            purchase_ref["claim_state"] = None
-            purchase_ref["delivery_note"] = "Verifying your dinosaur..."
-            save_purchases(purchases)
-
-        with ECONOMY_LOCK:
-            player_data = load_json(DATA_FILE, {})
-            player_record = player_data.get(steam_id, {})
-        await run_simple_claim_flow(ctx, purchase_ref, steam_id, player_record, player_data)
-        with ECONOMY_LOCK:
-            purchases = load_purchases()
-            target = next(
-                (p for p in purchases if p.get("steam_id") == steam_id and p.get("time") == purchase_time_key),
-                None,
-            )
-            if target:
-                target.update(purchase_ref)
-            save_purchases(purchases)
+            purchase_index = get_latest_unclaimed_purchase_index(purchases, steam_id)
+        if purchase_index is None:
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        await run_simple_claim_flow(ctx, purchase_index, steam_id)
 
 
 @bot.command()
