@@ -175,6 +175,8 @@ def process_group(commands_data, claim_group_id: str) -> bool:
     group_cmds.sort(key=lambda c: (int(c.get("claim_step", 9999)), str(c.get("id", ""))))
 
     for command_entry in group_cmds:
+        step = command_entry.get("claim_step")
+        command_text = command_entry.get("command", "")
         if is_command_expired(command_entry):
             command_entry["status"] = "EXPIRED"
             command_entry["completed_at"] = now_iso()
@@ -189,9 +191,9 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             print("[EXECUTOR] processing sustain command skipped (bot not in game)")
             continue
 
-        command_text = command_entry.get("command", "")
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
+        print(f"[EXECUTOR] dispatched group={claim_group_id} step={step} cmd={command_text}")
         save_commands(commands_data)
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
 
@@ -215,12 +217,15 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
+            print(f"[EXECUTOR] completed group={claim_group_id} step={step}")
             changed = True
             save_commands(commands_data)
+            break
         except Exception as e:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
+            print(f"[EXECUTOR] failed group={claim_group_id} step={step} error={e}")
             changed = True
             save_commands(commands_data)
             write_heartbeat("error", {"group": claim_group_id, "error": str(e)})

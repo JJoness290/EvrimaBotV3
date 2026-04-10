@@ -33,7 +33,7 @@ EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 CONFIG_DEBUG_LOGGED = False
 
 PURCHASE_TIMEOUT_MINUTES = 15
-CLAIM_QUEUE_TIMEOUT_MINUTES = 2
+CLAIM_QUEUE_TIMEOUT_MINUTES = 5
 
 DEFAULT_SCAN_INTERVAL = 5
 DEFAULT_REWARD_INTERVAL_MINUTES = 60
@@ -1198,7 +1198,7 @@ def expire_claim_commands_for_purchase(game_commands: list, purchase: dict):
             continue
         cmd["status"] = "EXPIRED"
         cmd["completed_at"] = str(datetime.now())
-        cmd["error"] = "Claim queue timed out after 2 minutes."
+        cmd["error"] = f"Claim queue timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes."
         expired_count += 1
     return expired_count
 
@@ -1211,13 +1211,37 @@ def refund_timed_out_claim_purchase(purchase: dict, data: dict):
     price, _ = find_shop_price(item)
     if price is None or steam_id not in data:
         return False
-    _, _ = adjust_energy_in_data(data, steam_id, int(price))
+    before_energy, after_energy = adjust_energy_in_data(data, steam_id, int(price))
     purchase["refund_applied"] = True
     purchase["refund_amount"] = int(price)
     purchase["refunded_at"] = str(datetime.now())
-    purchase["refund_note"] = "Claim timed out after 2 minutes. Energy refunded automatically."
+    purchase["refund_note"] = f"Claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. Energy refunded automatically."
     purchase["timeout_reason"] = "claim_queue_timeout"
+    print(
+        f"[CLAIM REFUND] timeout refund steam={steam_id} item={item} amount={int(price)} "
+        f"energy_before={before_energy} energy_after={after_energy}"
+    )
     return True
+
+
+def get_claim_group_command_summary(game_commands: list, claim_group_id: str):
+    summary = {
+        "pending_or_executing": False,
+        "failed_or_skipped": False,
+        "status_counts": {},
+    }
+    if not claim_group_id:
+        return summary
+    for command_entry in game_commands:
+        if str(command_entry.get("claim_group_id", "")).strip() != str(claim_group_id).strip():
+            continue
+        status = str(command_entry.get("status", "")).upper()
+        summary["status_counts"][status] = int(summary["status_counts"].get(status, 0)) + 1
+        if status in {"PENDING", "EXECUTING"}:
+            summary["pending_or_executing"] = True
+        if status in {"FAILED", "SKIPPED"}:
+            summary["failed_or_skipped"] = True
+    return summary
 
 
 def expire_old_purchases():
@@ -1263,7 +1287,17 @@ def expire_old_purchases():
                 if now - claimed_at >= timedelta(minutes=CLAIM_QUEUE_TIMEOUT_MINUTES):
                     if purchase.get("timeout_reason") == "claim_queue_timeout":
                         continue
-                    log_info("CLAIM TIMEOUT", f"purchase timed out steam={steam_id} item={item}")
+                    claim_group_id = str(purchase.get("claim_group_id", "")).strip()
+                    age_seconds = int((now - claimed_at).total_seconds())
+                    command_summary = get_claim_group_command_summary(game_commands, claim_group_id)
+                    log_info(
+                        "CLAIM TIMEOUT",
+                        f"state={status} group={claim_group_id or 'none'} purchase_id={purchase.get('id', 'unknown')} "
+                        f"steam={steam_id} item={item} age_seconds={age_seconds} "
+                        f"pending_commands={command_summary['pending_or_executing']} "
+                        f"failed_or_skipped={command_summary['failed_or_skipped']} "
+                        f"status_counts={command_summary['status_counts']}",
+                    )
                     expired_count = expire_claim_commands_for_purchase(game_commands, purchase)
                     if expired_count > 0:
                         changed_commands = True
@@ -1274,7 +1308,10 @@ def expire_old_purchases():
                         changed_data = True
                         log_info("CLAIM TIMEOUT", f"refunded {int(purchase.get('refund_amount', 0) or 0)} energy steam={steam_id}")
 
-                    timeout_note = "⚠️ Claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
+                    timeout_note = (
+                        f"⚠️ Claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. "
+                        "Your energy has been refunded. Please run !claim again."
+                    )
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = timeout_note
                     purchase["failure_note"] = timeout_note
@@ -3066,11 +3103,22 @@ def find_existing_active_claim_group_id(commands_data, steam_id: str, item: str)
     return None
 
 
-def all_group_steps_done(commands_data, claim_group_id: str, expected_phase: str):
-    group_cmds = [
+def _normalize_phase_set(phases):
+    if isinstance(phases, str):
+        return {phases}
+    return {str(phase) for phase in phases}
+
+
+def get_group_phase_commands(commands_data, claim_group_id: str, phases):
+    expected_phases = _normalize_phase_set(phases)
+    return [
         c for c in commands_data
-        if c.get("claim_group_id") == claim_group_id and c.get("claim_phase") == expected_phase
+        if c.get("claim_group_id") == claim_group_id and c.get("claim_phase") in expected_phases
     ]
+
+
+def all_group_steps_done(commands_data, claim_group_id: str, expected_phase):
+    group_cmds = get_group_phase_commands(commands_data, claim_group_id, expected_phase)
     if not group_cmds:
         return False
 
@@ -3194,8 +3242,10 @@ def process_claim_orchestration():
             claim_group_id = purchase.get("claim_group_id")
             steam_id = purchase.get("steam_id")
             item = str(purchase.get("item", "")).lower().strip()
+            purchase_id = purchase.get("id", "unknown")
 
             if status == "PRECHECK_QUEUED" and claim_group_id:
+                print(f"[CLAIM] phase=PRECHECK_QUEUED group={claim_group_id} purchase_id={purchase_id}")
                 if any_group_step_failed(game_commands, claim_group_id):
                     fail_purchase_with_refund(
                         purchase,
@@ -3206,14 +3256,18 @@ def process_claim_orchestration():
                     changed_purchases = True
                     continue
 
-                if has_pending_group_commands(game_commands, claim_group_id):
+                precheck_pending = any(
+                    cmd.get("status") in {"PENDING", "EXECUTING"}
+                    for cmd in get_group_phase_commands(game_commands, claim_group_id, "PRECHECK")
+                )
+                if precheck_pending:
                     continue
 
-                if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
-                    set_purchase_status(purchase, "PRECHECK_VERIFYING")
-                    purchase["precheck_verify_started_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Verification in progress — 35% complete."
-                    changed_purchases = True
+                set_purchase_status(purchase, "PRECHECK_VERIFYING")
+                purchase["precheck_verify_started_at"] = str(datetime.now())
+                purchase["delivery_note"] = "Verification in progress — 35% complete."
+                print(f"[CLAIM] phase=PRECHECK_VERIFYING group={claim_group_id} waiting_for=health_log")
+                changed_purchases = True
                 continue
 
             if status == "PRECHECK_VERIFYING" and claim_group_id:
@@ -3227,7 +3281,7 @@ def process_claim_orchestration():
                 print(f"[CLAIM] precheck verify attempt {attempt_no}/{max_attempts}")
                 precheck_log = get_latest_health_log_for_steam(steam_id)
                 if not precheck_log:
-                    print(f"[CLAIM] waiting for health log for steam_id={steam_id}")
+                    print(f"[CLAIM] phase=PRECHECK_VERIFYING group={claim_group_id} waiting_for=health_log steam={steam_id}")
                     if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -3262,14 +3316,20 @@ def process_claim_orchestration():
                     "Verification passed. Growth queued — 75% complete."
                 )
                 purchase["failure_note"] = "Verification passed. Growth queued."
-                print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
+                print(
+                    f"[CLAIM] precheck passed group={claim_group_id} class={precheck_log['class_name']} steam={steam_id}"
+                )
                 print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
                 changed_purchases = True
+                continue
 
+            if status == "PRECHECK_PASSED" and claim_group_id:
                 player_name = purchase.get("player") or "Unknown"
+                queued_steps = []
                 if ConfigManager.get_bool("claim_use_recovery_chain", "CLAIM_USE_RECOVERY_CHAIN", True):
-                    queue_claim_phase_commands(purchase, player_name, "RECOVERY")
-                queue_claim_phase_commands(purchase, player_name, "CLAIM")
+                    queued_steps.extend(queue_claim_phase_commands(purchase, player_name, "RECOVERY"))
+                queued_steps.extend(queue_claim_phase_commands(purchase, player_name, "CLAIM"))
+                print(f"[CLAIM] queued claim sequence group={claim_group_id} steps={len(queued_steps)}")
                 set_purchase_status(purchase, "CLAIM_SEQUENCE_QUEUED")
                 purchase["delivery_note"] = "Growth queued — 75% complete."
                 changed_purchases = True
@@ -3277,6 +3337,7 @@ def process_claim_orchestration():
                 continue
 
             if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
+                print(f"[CLAIM] phase=CLAIM_SEQUENCE_QUEUED group={claim_group_id} purchase_id={purchase_id}")
                 if any_group_step_failed(game_commands, claim_group_id):
                     fail_purchase_with_refund(
                         purchase,
@@ -3287,13 +3348,18 @@ def process_claim_orchestration():
                     changed_purchases = True
                     continue
 
-                if has_pending_group_commands(game_commands, claim_group_id):
+                sequence_pending = any(
+                    cmd.get("status") in {"PENDING", "EXECUTING"}
+                    for cmd in get_group_phase_commands(game_commands, claim_group_id, {"RECOVERY", "CLAIM"})
+                )
+                if sequence_pending:
                     continue
 
-                if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
+                if all_group_steps_done(game_commands, claim_group_id, {"RECOVERY", "CLAIM"}):
                     set_purchase_status(purchase, "FINAL_VERIFY_PENDING")
                     purchase["final_verify_started_at"] = str(datetime.now())
                     purchase["delivery_note"] = "Final verification in progress — 90% complete."
+                    print(f"[CLAIM] phase=FINAL_VERIFY_PENDING group={claim_group_id}")
                     changed_purchases = True
                     continue
 
@@ -3308,7 +3374,7 @@ def process_claim_orchestration():
                 print(f"[CLAIM] final grow verify attempt {final_attempt}/{final_max_attempts}")
                 grow_log = get_latest_grow_log_for_steam(steam_id)
                 if not grow_log:
-                    print(f"[CLAIM] waiting for grow log for steam_id={steam_id}")
+                    print(f"[CLAIM] phase=FINAL_VERIFY_PENDING group={claim_group_id} waiting_for=grow_log steam={steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -3343,6 +3409,7 @@ def process_claim_orchestration():
                     continue
 
                 set_purchase_status(purchase, "DELIVERED", growth_note, "Growth confirmed — 100% complete.")
+                print(f"[CLAIM] final verify passed group={claim_group_id}")
                 print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
                 changed_purchases = True
 
