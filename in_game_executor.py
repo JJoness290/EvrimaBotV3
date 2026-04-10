@@ -175,7 +175,9 @@ def process_group(commands_data, claim_group_id: str) -> bool:
     group_cmds.sort(key=lambda c: (int(c.get("claim_step", 9999)), str(c.get("id", ""))))
 
     for command_entry in group_cmds:
-        step = command_entry.get("claim_step")
+        cmd_id = command_entry.get("id")
+        step = command_entry.get("step_index", command_entry.get("claim_step"))
+        phase = command_entry.get("phase") or command_entry.get("claim_phase")
         command_text = command_entry.get("command", "")
         if is_command_expired(command_entry):
             command_entry["status"] = "EXPIRED"
@@ -194,8 +196,8 @@ def process_group(commands_data, claim_group_id: str) -> bool:
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
         print(
-            f"[EXECUTOR] dispatched group={claim_group_id} step={step} "
-            f"cmd={command_text} started_at={command_entry.get('started_at')}"
+            f"[EXECUTOR] dispatched group={claim_group_id} cmd_id={cmd_id} step={step} "
+            f"phase={phase} cmd={command_text} started_at={command_entry.get('started_at')}"
         )
         save_commands(commands_data)
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
@@ -220,7 +222,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
-            print(f"[EXECUTOR] completed group={claim_group_id} step={step}")
+            print(f"[EXECUTOR] completed group={claim_group_id} cmd_id={cmd_id} step={step} phase={phase}")
             changed = True
             save_commands(commands_data)
             break
@@ -228,7 +230,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
-            print(f"[EXECUTOR] failed group={claim_group_id} step={step} error={e}")
+            print(f"[EXECUTOR] failed group={claim_group_id} cmd_id={cmd_id} step={step} phase={phase} error={e}")
             changed = True
             save_commands(commands_data)
             write_heartbeat("error", {"group": claim_group_id, "error": str(e)})
