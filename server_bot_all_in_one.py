@@ -811,6 +811,7 @@ def parse_health_command_log_line(line: str):
         "new_value": new_value,
         "command": "SetHealth",
         "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
+        "event_dt": event_dt,
         "raw_line": line.strip(),
     }
 
@@ -846,8 +847,47 @@ def parse_grow_command_log_line(line: str):
         "new_value": new_value,
         "command": "Grow",
         "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
+        "event_dt": event_dt,
         "raw_line": line.strip(),
     }
+
+
+def clear_cached_health_log_for_steam(steam_id: str):
+    sid = str(steam_id or "").strip()
+    if not sid:
+        return
+    last_remote_log_match.pop(sid, None)
+    last_remote_log_match_raw_line_by_steam.pop(sid, None)
+
+
+def clear_cached_grow_log_for_steam(steam_id: str):
+    sid = str(steam_id or "").strip()
+    if not sid:
+        return
+    last_remote_grow_match.pop(sid, None)
+
+
+def get_log_event_dt(log_entry: dict):
+    if not isinstance(log_entry, dict):
+        return None
+    event_dt = log_entry.get("event_dt")
+    if isinstance(event_dt, datetime):
+        return event_dt
+    event_time = log_entry.get("event_time")
+    if event_time:
+        return parse_dt(str(event_time))
+    return None
+
+
+def is_fresh_log_for_anchor(log_entry: dict, anchor_dt: datetime | None):
+    if not log_entry:
+        return False, None
+    event_dt = get_log_event_dt(log_entry)
+    if anchor_dt is None:
+        return True, event_dt
+    if event_dt is None:
+        return False, None
+    return event_dt >= anchor_dt, event_dt
 
 
 def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
@@ -906,7 +946,7 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
             pass
 
 
-def get_latest_health_log_for_steam(steam_id: str):
+def get_latest_health_log_for_steam(steam_id: str, allow_cached: bool = True):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         print(f"[CLAIM] waiting for health log for steam_id={steam_id} err={err}")
@@ -930,10 +970,12 @@ def get_latest_health_log_for_steam(steam_id: str):
         return newest_match
 
     print(f"[CLAIM] parser found no valid health line for steam_id={steam_id}")
-    return last_remote_log_match.get(str(steam_id))
+    if allow_cached:
+        return last_remote_log_match.get(str(steam_id))
+    return None
 
 
-def get_latest_grow_log_for_steam(steam_id: str):
+def get_latest_grow_log_for_steam(steam_id: str, allow_cached: bool = True):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         print(f"[CLAIM] waiting for grow log for steam_id={steam_id} err={err}")
@@ -955,7 +997,9 @@ def get_latest_grow_log_for_steam(steam_id: str):
         return newest_match
 
     print(f"[CLAIM] parser found no valid grow line for steam_id={steam_id}")
-    return last_remote_grow_match.get(str(steam_id))
+    if allow_cached:
+        return last_remote_grow_match.get(str(steam_id))
+    return None
 
 
 def verify_growth_log_for_purchase(purchase, grow_log):
@@ -3265,6 +3309,7 @@ def process_claim_orchestration():
 
                 set_purchase_status(purchase, "PRECHECK_VERIFYING")
                 purchase["precheck_verify_started_at"] = str(datetime.now())
+                purchase["precheck_log_anchor_at"] = purchase["precheck_verify_started_at"]
                 purchase["delivery_note"] = "Verification in progress — 35% complete."
                 print(f"[CLAIM] phase=PRECHECK_VERIFYING group={claim_group_id} waiting_for=health_log")
                 changed_purchases = True
@@ -3272,6 +3317,7 @@ def process_claim_orchestration():
 
             if status == "PRECHECK_VERIFYING" and claim_group_id:
                 verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
+                precheck_anchor_at = parse_dt(purchase.get("precheck_log_anchor_at")) or verify_started_at
                 verify_start_ts = time.time()
                 elapsed_secs = 0
                 if verify_started_at:
@@ -3279,9 +3325,9 @@ def process_claim_orchestration():
                 max_attempts = max(1, PRECHECK_VERIFY_TIMEOUT_SECONDS)
                 attempt_no = min(max_attempts, elapsed_secs + 1)
                 print(f"[CLAIM] precheck verify attempt {attempt_no}/{max_attempts}")
-                precheck_log = get_latest_health_log_for_steam(steam_id)
+                precheck_log = get_latest_health_log_for_steam(steam_id, allow_cached=False)
                 if not precheck_log:
-                    print(f"[CLAIM] phase=PRECHECK_VERIFYING group={claim_group_id} waiting_for=health_log steam={steam_id}")
+                    print(f"[CLAIM] waiting for fresh health log steam={steam_id}")
                     if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -3293,6 +3339,28 @@ def process_claim_orchestration():
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
                         changed_purchases = True
                     continue
+                health_is_fresh, health_event_dt = is_fresh_log_for_anchor(precheck_log, precheck_anchor_at)
+                if not health_is_fresh:
+                    print(
+                        f"[CLAIM] ignoring stale health log steam={steam_id} "
+                        f"log_ts={health_event_dt} anchor_ts={precheck_anchor_at}"
+                    )
+                    print(f"[CLAIM] waiting for fresh health log steam={steam_id}")
+                    if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
+                        fail_purchase_with_refund(
+                            purchase,
+                            "FAILED",
+                            "Verification timed out. Points refunded.",
+                            "Verification timed out. Points refunded.",
+                        )
+                        print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
+                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
+                        changed_purchases = True
+                    continue
+                print(
+                    f"[CLAIM] accepted fresh health log steam={steam_id} "
+                    f"log_ts={health_event_dt} anchor_ts={precheck_anchor_at}"
+                )
 
                 if not classes_match(item, precheck_log["class_name"]):
                     reason = f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}."
@@ -3358,6 +3426,7 @@ def process_claim_orchestration():
                 if all_group_steps_done(game_commands, claim_group_id, {"RECOVERY", "CLAIM"}):
                     set_purchase_status(purchase, "FINAL_VERIFY_PENDING")
                     purchase["final_verify_started_at"] = str(datetime.now())
+                    purchase["final_verify_log_anchor_at"] = purchase["final_verify_started_at"]
                     purchase["delivery_note"] = "Final verification in progress — 90% complete."
                     print(f"[CLAIM] phase=FINAL_VERIFY_PENDING group={claim_group_id}")
                     changed_purchases = True
@@ -3365,6 +3434,7 @@ def process_claim_orchestration():
 
             if status == "FINAL_VERIFY_PENDING":
                 final_started_at = parse_dt(purchase.get("final_verify_started_at"))
+                final_anchor_at = parse_dt(purchase.get("final_verify_log_anchor_at")) or final_started_at
                 final_start_ts = time.time()
                 final_elapsed_secs = 0
                 if final_started_at:
@@ -3372,9 +3442,9 @@ def process_claim_orchestration():
                 final_max_attempts = max(1, FINAL_VERIFY_TIMEOUT_SECONDS)
                 final_attempt = min(final_max_attempts, final_elapsed_secs + 1)
                 print(f"[CLAIM] final grow verify attempt {final_attempt}/{final_max_attempts}")
-                grow_log = get_latest_grow_log_for_steam(steam_id)
+                grow_log = get_latest_grow_log_for_steam(steam_id, allow_cached=False)
                 if not grow_log:
-                    print(f"[CLAIM] phase=FINAL_VERIFY_PENDING group={claim_group_id} waiting_for=grow_log steam={steam_id}")
+                    print(f"[CLAIM] waiting for fresh grow log steam={steam_id}")
                     if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
                         fail_purchase_with_refund(
                             purchase,
@@ -3386,6 +3456,28 @@ def process_claim_orchestration():
                         print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
                         changed_purchases = True
                     continue
+                grow_is_fresh, grow_event_dt = is_fresh_log_for_anchor(grow_log, final_anchor_at)
+                if not grow_is_fresh:
+                    print(
+                        f"[CLAIM] ignoring stale grow log steam={steam_id} "
+                        f"log_ts={grow_event_dt} anchor_ts={final_anchor_at}"
+                    )
+                    print(f"[CLAIM] waiting for fresh grow log steam={steam_id}")
+                    if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
+                        fail_purchase_with_refund(
+                            purchase,
+                            "FAILED",
+                            "Verification timed out. Points refunded.",
+                            "Verification timed out. Points refunded.",
+                        )
+                        print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
+                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
+                        changed_purchases = True
+                    continue
+                print(
+                    f"[CLAIM] accepted fresh grow log steam={steam_id} "
+                    f"log_ts={grow_event_dt} anchor_ts={final_anchor_at}"
+                )
 
                 growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
                 if not growth_ok:
@@ -3910,7 +4002,10 @@ async def claim(ctx):
                 )
             elif latest_mine and latest_mine.get("status") == "FAILED":
                 if latest_mine.get("timeout_reason") == "claim_queue_timeout":
-                    response = "⚠️ Your claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
+                    response = (
+                        f"⚠️ Your claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. "
+                        "Your energy has been refunded. Please run !claim again."
+                    )
                 else:
                     note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
                     response = f"⚠️ {note}"
@@ -3936,6 +4031,10 @@ async def claim(ctx):
                     purchase["status"] = "PRECHECK_QUEUED"
                     purchase["claim_started_at"] = purchase.get("claim_started_at") or str(datetime.now())
                     purchase["claimed_at"] = str(datetime.now())
+                    if not purchase.get("precheck_log_anchor_at"):
+                        purchase["precheck_log_anchor_at"] = purchase["claimed_at"]
+                    if not purchase.get("final_verify_log_anchor_at"):
+                        purchase["final_verify_log_anchor_at"] = None
                     purchase["delivery_note"] = "Existing pending command found"
                     purchase["claim_group_id"] = existing_group_id
                     save_purchases(purchases)
@@ -3943,10 +4042,17 @@ async def claim(ctx):
                 else:
                     if not purchase.get("claim_group_id"):
                         purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
+                    clear_cached_health_log_for_steam(steam_id)
+                    clear_cached_grow_log_for_steam(steam_id)
+                    print(f"[CLAIM] cleared cached verification logs steam={steam_id}")
                     queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
                     purchase["status"] = "PRECHECK_QUEUED"
                     purchase["claim_started_at"] = str(datetime.now())
                     purchase["claimed_at"] = str(datetime.now())
+                    purchase["precheck_log_anchor_at"] = purchase["claimed_at"]
+                    purchase["precheck_verify_started_at"] = None
+                    purchase["final_verify_started_at"] = None
+                    purchase["final_verify_log_anchor_at"] = None
                     purchase["delivery_note"] = "Pre-check queued. Awaiting health/class verification."
                     purchase["failure_note"] = None
                     save_purchases(purchases)

@@ -193,7 +193,10 @@ def process_group(commands_data, claim_group_id: str) -> bool:
 
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
-        print(f"[EXECUTOR] dispatched group={claim_group_id} step={step} cmd={command_text}")
+        print(
+            f"[EXECUTOR] dispatched group={claim_group_id} step={step} "
+            f"cmd={command_text} started_at={command_entry.get('started_at')}"
+        )
         save_commands(commands_data)
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
 
