@@ -1930,12 +1930,12 @@ def get_bot_presence_config():
 
 def get_bot_sustain_config():
     section = ConfigManager.get_section("bot_sustain")
-    commands = section.get("commands", ["/heal 100", "/hunger 100", "/thirst 100"])
+    commands = section.get("commands", ["/health 100", "/hunger 100", "/thirst 100"])
     if not isinstance(commands, list) or not commands:
-        commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+        commands = ["/health 100", "/hunger 100", "/thirst 100"]
     normalized = [str(x).strip() for x in commands if str(x).strip()]
     if len(normalized) != 3:
-        normalized = ["/heal 100", "/hunger 100", "/thirst 100"]
+        normalized = ["/health 100", "/hunger 100", "/thirst 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
         "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
@@ -2181,9 +2181,7 @@ def queue_priority_commands(commands: list[dict]):
 def queue_sustain_commands():
     cfg = get_bot_sustain_config()
     now_iso = datetime.now(timezone.utc).isoformat()
-    sustain_commands = cfg["commands"]
-    if len(sustain_commands) != 3:
-        sustain_commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+    sustain_commands = ["/health 100", "/hunger 100", "/thirst 100"]
     batch_id = f"sustain_{int(time.time())}"
     payload = []
     for i, cmd in enumerate(sustain_commands, start=1):
@@ -2199,20 +2197,21 @@ def queue_sustain_commands():
             "claim_step": i,
             "claim_final": i == len(sustain_commands),
             "claim_phase": "SUSTAIN",
-            "command_type": "sustain",
+            "command_type": "sustain_command",
+            "sustain_batch_id": batch_id,
             "priority": 10,
             "requires_bot_in_game": True,
             "max_age_seconds": cfg["interval_seconds"] * 2,
         })
     queue_priority_commands(payload)
-    log_info("BOT SUSTAIN", f"queued {len(payload)} commands")
+    print(f"[SUSTAIN] queued batch id={batch_id} count={len(payload)}")
 
 
 def has_pending_sustain_commands() -> bool:
     with ECONOMY_LOCK:
         commands = load_game_commands()
     for entry in commands:
-        if str(entry.get("command_type", "")).lower() != "sustain":
+        if str(entry.get("command_type", "")).lower() not in {"sustain", "sustain_command"}:
             continue
         status = str(entry.get("status", "")).upper()
         if status in {"PENDING", "EXECUTING"}:
@@ -2221,6 +2220,9 @@ def has_pending_sustain_commands() -> bool:
 
 
 def try_queue_sustain(now_ts: float, cfg_sustain: dict, immediate: bool = False) -> bool:
+    if str(load_json(STATE_FILE, {}).get("bot_presence_state", "")).upper() != BOT_STATE_IN_GAME:
+        log_limited("sustain_skipped_presence", 30, "BOT SUSTAIN", "skipped (bot not in game)")
+        return False
     if has_pending_sustain_commands():
         log_limited("sustain_skipped_pending", 30, "BOT SUSTAIN", "skipped (already pending)")
         return False
@@ -2229,6 +2231,7 @@ def try_queue_sustain(now_ts: float, cfg_sustain: dict, immediate: bool = False)
     if (not immediate) and last_sustain_at > 0 and (now_ts - last_sustain_at) < interval:
         log_limited("sustain_skipped_interval", 30, "BOT SUSTAIN", "skipped (interval not reached)")
         return False
+    print("[SUSTAIN] due")
     queue_sustain_commands()
     bot_runtime_state["last_sustain_at"] = now_ts
     return True
