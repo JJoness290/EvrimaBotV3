@@ -248,6 +248,15 @@ def process_legacy(commands_data):
 
     for command_entry in legacy_pending:
         command_text = command_entry.get("command", "")
+        if (
+            str(command_entry.get("command_type", "")).lower() == "claim_command"
+            or command_entry.get("phase")
+            or command_entry.get("claim_phase")
+        ):
+            print(
+                f"[EXECUTOR ERROR] claim command fell into legacy path "
+                f"cmd_id={command_entry.get('id')} command={command_text}"
+            )
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
         save_commands(commands_data)
