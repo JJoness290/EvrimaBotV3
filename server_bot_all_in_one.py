@@ -172,6 +172,7 @@ SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
 SERVER_STATE_SUSPECTED_DOWN = "SERVER_SUSPECTED_DOWN"
 SERVER_STATE_DOWN = "SERVER_DOWN"
 SERVER_STATE_RECOVERING = "SERVER_RECOVERING"
+PRESENCE_STALE_SECONDS = 120
 
 SERVER_RESTART_MARKERS = (
     "shutting down",
@@ -2787,9 +2788,31 @@ async def process_bot_presence_and_recovery(snapshot: dict):
     if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
         log_startup_warmup_banner_once()
 
-    effective = get_effective_admin_bot_status(snapshot=snapshot, poll_success=poll_success, now_ts=now)
-    effective_status = str(effective.get("status", "OFFLINE")).upper()
-    source_label = str(effective.get("source", poll_source) or poll_source)
+    last_success = float(bot_runtime_state.get("last_player_poll_success_at", 0) or 0)
+    last_players = normalize_players_map(bot_runtime_state.get("last_successful_players", {}))
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    bot_steam = ADMIN_BOT_STEAM_ID
+    bot_in_last_snapshot = bot_steam in last_players
+    time_since_success = now - last_success if last_success else 999999
+
+    if last_poll_ok:
+        if bot_in_last_snapshot:
+            effective_status = "ONLINE"
+            print("[ADMIN BOT] confirmed ONLINE via successful poll")
+        else:
+            effective_status = "OFFLINE"
+            print("[ADMIN BOT] confirmed OFFLINE via successful poll (bot missing)")
+    else:
+        if bot_in_last_snapshot and time_since_success <= PRESENCE_STALE_SECONDS:
+            effective_status = "ONLINE"
+            print(f"[ADMIN BOT] poll failed; keeping ONLINE (last seen {int(time_since_success)}s ago)")
+        elif bot_in_last_snapshot:
+            effective_status = "UNKNOWN"
+            print(f"[ADMIN BOT] presence stale ({int(time_since_success)}s); state=UNKNOWN")
+        else:
+            effective_status = "UNKNOWN"
+            print("[ADMIN BOT] poll failed with no recent confirmation; state=UNKNOWN")
+    source_label = poll_source
 
     if effective_status == "ONLINE":
         bot_runtime_state["admin_bot_state"] = "ONLINE"
@@ -2811,18 +2834,16 @@ async def process_bot_presence_and_recovery(snapshot: dict):
             log_info("BOT SUSTAIN", "immediate sustain on ONLINE transition")
             try_queue_sustain(now, cfg_sustain, immediate=True)
             await refresh_admin_dashboard(force=True)
-        if effective.get("matched_steam_id"):
-            log_debug("PRESENCE", f"matched steam_id={effective.get('matched_steam_id')} name={effective.get('matched_name')}", flag="debug_presence")
     else:
-        if effective_status == "GRACE":
-            bot_runtime_state["admin_bot_state"] = "GRACE"
-            bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+        if effective_status == "UNKNOWN":
+            bot_runtime_state["admin_bot_state"] = "UNKNOWN"
+            bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
             bot_runtime_state["missing_since"] = None
             bot_runtime_state["last_detection_source"] = "Unknown"
-            admin_runtime_state["last_alert_summary"] = "Grace period active"
-            if previous_state != "GRACE":
+            admin_runtime_state["last_alert_summary"] = "Admin bot state unknown"
+            if previous_state != "UNKNOWN":
                 await refresh_admin_dashboard(force=True)
-            log_limited("presence_grace", 30, "ADMIN BOT", "GRACE period active")
+            log_limited("presence_unknown", 30, "ADMIN BOT", "state UNKNOWN (poll failure / stale snapshot)", level="warn")
         else:
             bot_runtime_state["admin_bot_state"] = "OFFLINE"
             bot_runtime_state["presence_state"] = BOT_STATE_MISSING
