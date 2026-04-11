@@ -61,6 +61,7 @@ DINO_CLASS_MAP = {
     "herrera": ["Herrerasaurus"],
     "omni": ["Omniraptor", "Omni"],
     "dilo": ["Dilophosaurus"],
+    "allo": ["Allosaurus", "Allo"],
     "carno": ["Carnotaurus"],
     "cera": ["Ceratosaurus"],
     "deino": ["Deinosuchus"],
@@ -4287,12 +4288,16 @@ async def buy(ctx, item: str):
             else:
                 _, after = adjust_energy_in_data(data, steam_id, -int(price))
                 save_json(DATA_FILE, data)
+                if item == "allo":
+                    print(f"[SHOP] allo purchase steam={steam_id} cost={int(price)}")
                 new_purchase = {
                     "player": player["name"],
                     "steam_id": steam_id,
                     "item": item,
+                    "dino_type": item,
                     "status": "UNCLAIMED",
                     "time": str(datetime.now()),
+                    "timestamp": str(datetime.now()),
                     "claimed_at": None,
                     "delivered_at": None,
                     "failed_at": None,
@@ -4306,6 +4311,8 @@ async def buy(ctx, item: str):
                     "economy_note": f"Buy deducted {price} energy @ {datetime.now()}",
                 }
                 purchases.append(new_purchase)
+                if item == "allo":
+                    print(f"[CLAIM] allo created steam={steam_id}")
                 try:
                     save_purchases(purchases)
                     response_message = (

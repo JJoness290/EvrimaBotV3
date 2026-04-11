@@ -252,6 +252,7 @@ def process_group(commands_data, claim_group_id: str) -> bool:
         step = command_entry.get("step_index", command_entry.get("claim_step"))
         phase = command_entry.get("phase") or command_entry.get("claim_phase")
         command_text = command_entry.get("command", "")
+        item = str(command_entry.get("item", "")).lower().strip()
         if is_command_expired(command_entry):
             command_entry["status"] = "EXPIRED"
             command_entry["completed_at"] = now_iso()
@@ -293,6 +294,8 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
             print(f"[DONE] {command_text}")
+            if item == "allo":
+                print(f"[EXECUTOR] allo executed cmd_id={cmd_id} step={step} phase={phase}")
             changed = True
             save_commands(commands_data)
             break
