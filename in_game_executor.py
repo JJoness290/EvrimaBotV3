@@ -85,35 +85,67 @@ def write_heartbeat(state: str, extra: dict | None = None):
     save_json(EXECUTOR_HEARTBEAT_FILE, payload)
 
 
-def type_command(cmd: str):
+def find_game_window():
     try:
         import pygetwindow as gw
+        titles = gw.getAllTitles()
+        for title in titles:
+            t = str(title or "").strip()
+            if not t:
+                continue
+            lowered = t.lower()
+            if ("theisle" in lowered) or ("isle" in lowered):
+                matches = gw.getWindowsWithTitle(t)
+                if matches:
+                    print(f"[WINDOW FOUND] {t}")
+                    return matches[0]
+    except Exception:
+        pass
+    print("[ERROR] Game window not found")
+    return None
+
+
+def send_chat_command(command: str):
+    try:
         import time
         import pyautogui
 
-        print(f"[CHAT CMD] {cmd}")
-
-        windows = [w for w in gw.getAllTitles() if "The Isle" in w]
-        if not windows:
-            print("[ERROR] Game window not found")
+        win = find_game_window()
+        if not win:
             return
 
-        win = gw.getWindowsWithTitle(windows[0])[0]
-        win.activate()
-        time.sleep(0.5)
+        try:
+            win.activate()
+            time.sleep(0.5)
+        except Exception:
+            try:
+                win.restore()
+                time.sleep(0.2)
+                win.activate()
+                time.sleep(0.5)
+            except Exception:
+                pass
 
+        try:
+            pyautogui.click(win.left + 100, win.top + 100)
+            time.sleep(0.2)
+        except Exception:
+            pass
+
+        print(f"[CHAT CMD] {command}")
         pyautogui.press("enter")
         time.sleep(0.3)
-
-        pyautogui.write(cmd, interval=0.03)
+        pyautogui.write(command, interval=0.02)
         time.sleep(0.2)
-
         pyautogui.press("enter")
-
+        time.sleep(0.2)
         print("[CHAT CMD SENT]")
-
     except Exception as e:
         print("[CHAT ERROR]", e)
+
+
+def type_command(cmd: str):
+    send_chat_command(cmd)
 
 
 def is_bot_in_game():
