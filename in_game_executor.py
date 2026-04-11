@@ -22,6 +22,7 @@ DEFAULT_POST_SEND_DELAYS = {
     "/thirst": 1,
     "/health": 1,
 }
+KEEP_ALIVE_INTERVAL = 600  # seconds (easy to change)
 
 
 def load_json(path: Path, default):
@@ -85,16 +86,56 @@ def write_heartbeat(state: str, extra: dict | None = None):
 
 
 def type_command(cmd: str):
-    pyautogui.press("enter")
-    time.sleep(0.25)
-    pyautogui.write(cmd)
-    time.sleep(0.25)
-    pyautogui.press("enter")
+    try:
+        import pygetwindow as gw
+        import time
+        import pyautogui
+
+        print(f"[CHAT CMD] {cmd}")
+
+        windows = [w for w in gw.getAllTitles() if "The Isle" in w]
+        if not windows:
+            print("[ERROR] Game window not found")
+            return
+
+        win = gw.getWindowsWithTitle(windows[0])[0]
+        win.activate()
+        time.sleep(0.5)
+
+        pyautogui.press("enter")
+        time.sleep(0.3)
+
+        pyautogui.write(cmd, interval=0.03)
+        time.sleep(0.2)
+
+        pyautogui.press("enter")
+
+        print("[CHAT CMD SENT]")
+
+    except Exception as e:
+        print("[CHAT ERROR]", e)
 
 
 def is_bot_in_game():
     state = load_json(PLAYER_STATE_FILE, {})
     return str(state.get("bot_presence_state", "")).strip().upper() == "BOT_IN_GAME"
+
+
+def keep_alive_commands():
+    if not is_bot_in_game():
+        print("[KEEPALIVE] Skipped (bot not in game)")
+        return
+
+    print("[KEEPALIVE] Running sustain commands")
+
+    type_command("/health 100")
+    time.sleep(1)
+
+    type_command("/hunger 100")
+    time.sleep(1)
+
+    type_command("/thirst 100")
+    time.sleep(1)
 
 
 def get_delay_overrides():
@@ -287,8 +328,14 @@ def main():
         print("[EXECUTOR] stale command recovered on startup")
 
     loop_delay = max(1, int(load_config().get("executor_loop_delay_seconds", 2)))
+    last_keep_alive = 0
 
     while True:
+        now = time.time()
+        if now - last_keep_alive >= KEEP_ALIVE_INTERVAL:
+            keep_alive_commands()
+            last_keep_alive = now
+
         write_heartbeat("idle")
         commands_data = load_commands()
         changed = False
