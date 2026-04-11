@@ -2887,52 +2887,86 @@ def parse_rcon_playerlist(raw_text: str):
             return True
         noise_prefixes = (
             "[debug]",
+            "[info",
+            "[warn",
+            "[error",
             "tcp connection established with server",
             "sending:",
             "password accepted",
             "connected to",
-            "[info",
+            "auth success",
+            "response length",
         )
         return any(lowered.startswith(prefix) for prefix in noise_prefixes)
 
+    def _is_valid_steam_id(value: str) -> bool:
+        v = str(value or "").strip()
+        return v.isdigit() and len(v) >= 17
+
+    def _split_csv_tokens(line: str) -> list[str]:
+        return [token.strip() for token in str(line or "").strip().strip(",").split(",") if token.strip()]
+
     cleaned_lines = []
     for raw_line in str(raw_text or "").splitlines():
-        line = str(raw_line or "").strip().rstrip(",").strip()
+        line = str(raw_line or "").strip()
         if not line:
-            continue
-        if line.lower() == "playerlist":
             continue
         if _is_noise_line(line):
             continue
-        cleaned_lines.append(line)
+        if line.lower().strip(",") == "playerlist":
+            continue
+        cleaned_lines.append(line.strip())
 
-    players = {}
+    # FORMAT A: line pairs
+    players_line_pairs: dict[str, str] = {}
     pending_steam_id = None
-
     for line in cleaned_lines:
-        line = line.strip().rstrip(",")
-
-        if not line or line.lower() == "playerlist":
+        normalized = line.strip().strip(",")
+        if not normalized:
             continue
-
-        # Steam ID line
-        if line.isdigit() and len(line) >= 17:
-            pending_steam_id = line
+        if _is_valid_steam_id(normalized):
+            pending_steam_id = normalized
             continue
-
-        # Name line
         if pending_steam_id:
-            players[pending_steam_id] = line
-            log_debug("RCON", f"paired steam_id={pending_steam_id} with name={line}", flag="debug_rcon")
+            # Skip likely CSV name rows so we don't false-parse format B here.
+            csv_name_tokens = _split_csv_tokens(normalized)
+            if len(csv_name_tokens) >= 2:
+                pending_steam_id = None
+                continue
+            players_line_pairs[pending_steam_id] = normalized
             pending_steam_id = None
 
-    log_debug("RCON", f"parsed players: {players}", flag="debug_rcon")
-    if not players:
-        log_debug("RCON", "playerlist parsed empty", flag="debug_rcon")
-        for i, l in enumerate(cleaned_lines[:10]):
-            log_debug("RCON", f"cleaned[{i}]={l}", flag="debug_rcon")
+    if players_line_pairs:
+        print("[RCON PARSE] detected format=line_pairs")
+        log_debug("RCON", f"parsed players: {players_line_pairs}", flag="debug_rcon")
+        return players_line_pairs
 
-    return players
+    # FORMAT B: CSV (ids row, names row)
+    for i in range(len(cleaned_lines) - 1):
+        id_tokens = _split_csv_tokens(cleaned_lines[i])
+        if not id_tokens:
+            continue
+        if not all(_is_valid_steam_id(token) for token in id_tokens):
+            continue
+        name_tokens = _split_csv_tokens(cleaned_lines[i + 1])
+        if not name_tokens:
+            continue
+        players_csv = {}
+        for steam_id, player_name in zip(id_tokens, name_tokens):
+            sid = str(steam_id).strip()
+            pname = str(player_name).strip()
+            if _is_valid_steam_id(sid) and pname:
+                players_csv[sid] = pname
+        if players_csv:
+            print("[RCON PARSE] detected format=csv")
+            log_debug("RCON", f"parsed players: {players_csv}", flag="debug_rcon")
+            return players_csv
+
+    print("[RCON PARSE WARNING] no players parsed")
+    log_debug("RCON", "playerlist parsed empty", flag="debug_rcon")
+    for i, l in enumerate(cleaned_lines[:10]):
+        log_debug("RCON", f"cleaned[{i}]={l}", flag="debug_rcon")
+    return {}
 
 
 def is_usable_rcon_playerlist_output(raw_text: str) -> bool:
@@ -2994,8 +3028,6 @@ def get_rcon_playerlist():
     raw_players = parse_rcon_playerlist("\n".join(raw_cleaned_lines)) if raw_cleaned_lines else {}
     if raw_players:
         return _build_success(raw_players, "RCON_RAW")
-    if raw_cleaned_lines and (not _has_transport_error(raw_text)):
-        return _build_success({}, "RCON_RAW")
 
     fallback_text = ""
     fallback_error = ""
