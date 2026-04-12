@@ -4353,7 +4353,7 @@ async def shop(interaction: discord.Interaction):
 async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
     try:
         if not is_higher_up(interaction):
-            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
             return
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
@@ -4383,7 +4383,7 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
 async def remove(interaction: discord.Interaction, user: discord.Member, amount: int):
     try:
         if not is_higher_up(interaction):
-            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
             return
         if amount <= 0:
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
