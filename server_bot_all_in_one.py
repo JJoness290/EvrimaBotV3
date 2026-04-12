@@ -165,7 +165,7 @@ GROW_LOG_PATTERN = re.compile(
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
 
 invite_cache = {}
 online_since = {}
