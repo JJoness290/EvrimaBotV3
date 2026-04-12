@@ -4672,6 +4672,8 @@ async def invites(interaction: discord.Interaction):
 async def leaderboard(interaction: discord.Interaction):
     try:
         data = load_json(DATA_FILE, {})
+        links = load_json(LINK_FILE, {})
+        steam_to_discord = {v: k for k, v in links.items()}
         sorted_players = sorted(
             data.items(),
             key=lambda x: int(x[1].get("energy", 0)),
@@ -4680,10 +4682,27 @@ async def leaderboard(interaction: discord.Interaction):
         if not sorted_players:
             await interaction.response.send_message("📭 No players found.")
             return
-        msg = "🏆 Top Players:\n"
-        for i, (steam_id, p) in enumerate(sorted_players, 1):
-            msg += f"{i}. {steam_id} - {int(p.get('energy', 0))}\n"
-        await interaction.response.send_message(msg)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, (steam_id, pdata) in enumerate(sorted_players):
+            energy = int(pdata.get("energy", 0))
+            discord_id = steam_to_discord.get(str(steam_id))
+            if discord_id:
+                try:
+                    user = await bot.fetch_user(int(discord_id))
+                    name = user.name
+                except Exception:
+                    name = f"User({discord_id})"
+            else:
+                name = "Unlinked"
+            prefix = medals[i] if i < 3 else f"#{i+1}"
+            lines.append(f"{prefix} **{name}** — {energy} ⚡")
+        embed = discord.Embed(
+            title="🏆 Primal Abyss Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
         logger.error("leaderboard command failed: %s", e)
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
