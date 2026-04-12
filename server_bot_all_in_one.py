@@ -26,6 +26,7 @@ import paramiko
 
 TOKEN = ""
 GUILD_ID = 1485808244524974243
+GUILD = discord.Object(id=1485808244524974243)
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -4091,13 +4092,10 @@ async def on_ready():
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
     try:
-        guild = discord.Object(id=GUILD_ID)
-        print("Clearing old commands...")
-        bot.tree.clear_commands(guild=guild)
-        print("Syncing commands to guild...")
-        synced = await bot.tree.sync(guild=guild)
-        logger.info("Synced %s guild commands for %s", len(synced), GUILD_ID)
-        print("Commands synced instantly")
+        print("Syncing commands...")
+        synced = await bot.tree.sync(guild=GUILD)
+        logger.info("Synced %s commands", len(synced))
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
         print(f"Sync error: {e}")
         logger.error("Sync error: %s", e)
@@ -4252,7 +4250,7 @@ class InteractionContextAdapter:
             await self.interaction.followup.send(*args, **kwargs)
 
 
-@bot.tree.command(name="link", description="Link your Steam ID")
+@bot.tree.command(name="link", description="Link your Steam ID", guild=GUILD)
 async def link(interaction: discord.Interaction, steam_id: str):
     ctx = InteractionContextAdapter(interaction)
     links = load_json(LINK_FILE, {})
@@ -4273,7 +4271,7 @@ async def link(interaction: discord.Interaction, steam_id: str):
     await ctx.send(embed=build_action_embed("Account Linked", "Your Steam account has been linked.", ctx.author.display_name, int(data.get(steam_id, {}).get("energy", get_starting_energy())), discord.Color.green()))
 
 
-@bot.tree.command(name="stats", description="Show your stats")
+@bot.tree.command(name="stats", description="Show your stats", guild=GUILD)
 async def stats(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
@@ -4300,7 +4298,7 @@ async def stats(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="online", description="Show online players")
+@bot.tree.command(name="online", description="Show online players", guild=GUILD)
 async def online(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
@@ -4322,7 +4320,7 @@ async def online(interaction: discord.Interaction):
     await ctx.send("\n".join(lines))
 
 
-@bot.tree.command(name="shop", description="Show shop")
+@bot.tree.command(name="shop", description="Show shop", guild=GUILD)
 async def shop(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
@@ -4339,7 +4337,7 @@ async def shop(interaction: discord.Interaction):
     await ctx.send(msg)
 
 
-@bot.tree.command(name="pay", description="Give energy to a player")
+@bot.tree.command(name="pay", description="Give energy to a player", guild=GUILD)
 @app_commands.describe(user="User to give energy to", amount="Amount of energy")
 async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
     try:
@@ -4369,7 +4367,7 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.tree.command(name="remove", description="Remove energy from a player")
+@bot.tree.command(name="remove", description="Remove energy from a player", guild=GUILD)
 @app_commands.describe(user="User to remove energy from", amount="Amount of energy")
 async def remove(interaction: discord.Interaction, user: discord.Member, amount: int):
     try:
@@ -4399,7 +4397,7 @@ async def remove(interaction: discord.Interaction, user: discord.Member, amount:
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.tree.command(name="balance", description="Check your energy")
+@bot.tree.command(name="balance", description="Check your energy", guild=GUILD)
 async def balance(interaction: discord.Interaction):
     try:
         player, _steam_id = get_player(interaction)
@@ -4413,7 +4411,7 @@ async def balance(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.tree.command(name="giveall", description="Give energy to all players")
+@bot.tree.command(name="giveall", description="Give energy to all players", guild=GUILD)
 @app_commands.describe(amount="Amount of energy")
 async def giveall(interaction: discord.Interaction, amount: int):
     try:
@@ -4436,7 +4434,7 @@ async def giveall(interaction: discord.Interaction, amount: int):
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.tree.command(name="buy", description="Buy a dinosaur")
+@bot.tree.command(name="buy", description="Buy a dinosaur", guild=GUILD)
 @app_commands.describe(dino="Choose dinosaur")
 @cooldown(10)
 async def buy(interaction: discord.Interaction, dino: str):
@@ -4547,7 +4545,7 @@ async def buy_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
-@bot.tree.command(name="claim", description="Claim latest purchase")
+@bot.tree.command(name="claim", description="Claim latest purchase", guild=GUILD)
 async def claim(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
@@ -4600,7 +4598,7 @@ async def claim(interaction: discord.Interaction):
         await run_simple_claim_flow(ctx, purchase_index, steam_id)
 
 
-@bot.tree.command(name="myclaims", description="List your purchases")
+@bot.tree.command(name="myclaims", description="List your purchases", guild=GUILD)
 async def myclaims(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
@@ -4644,7 +4642,7 @@ async def myclaims(interaction: discord.Interaction):
     await ctx.send("\n".join(lines))
 
 
-@bot.tree.command(name="invites", description="Show your invite count")
+@bot.tree.command(name="invites", description="Show your invite count", guild=GUILD)
 async def invites(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     referrals = load_referrals()
@@ -4659,7 +4657,7 @@ async def invites(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="leaderboard", description="Top players")
+@bot.tree.command(name="leaderboard", description="Top players", guild=GUILD)
 async def leaderboard(interaction: discord.Interaction):
     try:
         data = load_json(DATA_FILE, {})
@@ -4699,7 +4697,7 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.tree.command(name="patreon", description="Show Patreon benefits")
+@bot.tree.command(name="patreon", description="Show Patreon benefits", guild=GUILD)
 async def patreon(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     embed = discord.Embed(
@@ -4714,12 +4712,12 @@ async def patreon(interaction: discord.Interaction):
     await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="tiers", description="Alias for patreon")
+@bot.tree.command(name="tiers", description="Alias for patreon", guild=GUILD)
 async def tiers(interaction: discord.Interaction):
     await patreon(interaction)
 
 
-@bot.tree.command(name="checktier", description="Check your Patreon tier")
+@bot.tree.command(name="checktier", description="Check your Patreon tier", guild=GUILD)
 async def checktier(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     await refresh_patreon_role_cache(force=True)
@@ -4743,7 +4741,7 @@ async def checktier(interaction: discord.Interaction):
     await ctx.send(embed=embed)
 
 
-@bot.tree.command(name="botstatus", description="Admin bot status dashboard")
+@bot.tree.command(name="botstatus", description="Admin bot status dashboard", guild=GUILD)
 async def botstatus(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
@@ -4753,7 +4751,7 @@ async def botstatus(interaction: discord.Interaction):
     await ctx.send(embed=build_admin_dashboard_embed())
 
 
-@bot.tree.command(name="botissues", description="List blocked requests during outage")
+@bot.tree.command(name="botissues", description="List blocked requests during outage", guild=GUILD)
 async def botissues(interaction: discord.Interaction):
     ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
