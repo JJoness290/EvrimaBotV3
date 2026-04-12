@@ -18,6 +18,7 @@ import threading
 import tempfile
 import logging
 import traceback
+from functools import wraps
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -56,6 +57,7 @@ SHOP_FILE = Path("shop.json")
 PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
+HISTORY_FILE = Path("history.json")
 CONFIG_FILE = Path("config.json")
 EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 CONFIG_DEBUG_LOGGED = False
@@ -95,6 +97,10 @@ DINO_CLASS_MAP = {
     "deino": ["Deinosuchus"],
     "rex": ["Tyrannosaurus", "TRex", "Rex"],
 }
+DINO_OPTIONS = [
+    "rex", "carno", "cera", "deino", "allo",
+    "omni", "troodon", "herrera", "ptera",
+]
 
 REMOTE_LOG_TAIL_BYTES = 16 * 1024
 
@@ -105,6 +111,7 @@ last_remote_grow_match = {}
 last_sftp_eof_warn_at = 0.0
 CLAIM_STARTUP_CLEANUP_DONE = False
 SIMPLE_CLAIM_LOCKS: dict[str, asyncio.Lock] = {}
+cooldowns = {}
 
 
 def get_simple_claim_lock(steam_id: str) -> asyncio.Lock:
@@ -339,6 +346,39 @@ def save_json(path: Path, data) -> None:
             os.fsync(tmp.fileno())
             tmp_path = tmp.name
         os.replace(tmp_path, path)
+
+
+def log_transaction(user, action: str, amount: int):
+    history = load_json(HISTORY_FILE, [])
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "user": str(user),
+        "action": str(action),
+        "amount": int(amount),
+        "time": str(datetime.now()),
+    })
+    save_json(HISTORY_FILE, history)
+
+
+def cooldown(seconds: int):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+            user_id = int(getattr(interaction.user, "id", 0) or 0)
+            now = time.time()
+            last = float(cooldowns.get((func.__name__, user_id), 0.0) or 0.0)
+            if now - last < seconds:
+                wait_for = int(seconds - (now - last))
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"⏳ Wait {wait_for}s", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"⏳ Wait {wait_for}s", ephemeral=True)
+                return
+            cooldowns[(func.__name__, user_id)] = now
+            return await func(interaction, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def load_config():
@@ -659,7 +699,8 @@ def get_player(ctx):
     links = load_json(LINK_FILE, {})
     data = load_json(DATA_FILE, {})
 
-    steam_id = links.get(str(ctx.author.id))
+    user_obj = getattr(ctx, "author", None) or getattr(ctx, "user", None)
+    steam_id = links.get(str(getattr(user_obj, "id", "") or ""))
     if not steam_id:
         return None, None
 
@@ -4314,6 +4355,7 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
             before = int(data[steam_id].get("energy", 0))
             data[steam_id]["energy"] = before + int(amount)
             save_json(DATA_FILE, data)
+            log_transaction(user.id, "pay", int(amount))
         logger.info("[ADMIN ENERGY] pay user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
         await interaction.response.send_message(
             f"✅ Gave {amount} energy to {user.mention} (Now: {data[steam_id]['energy']})"
@@ -4343,6 +4385,7 @@ async def remove(interaction: discord.Interaction, user: discord.Member, amount:
             before = int(data[steam_id].get("energy", 0))
             data[steam_id]["energy"] = max(0, before - int(amount))
             save_json(DATA_FILE, data)
+            log_transaction(user.id, "remove", int(amount))
         logger.info("[ADMIN ENERGY] remove user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
         await interaction.response.send_message(
             f"➖ Removed {amount} energy from {user.mention} (Now: {data[steam_id]['energy']})"
@@ -4352,10 +4395,54 @@ async def remove(interaction: discord.Interaction, user: discord.Member, amount:
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
+@bot.tree.command(name="balance", description="Check your energy")
+async def balance(interaction: discord.Interaction):
+    try:
+        player, _steam_id = get_player(interaction)
+        if not player:
+            await interaction.response.send_message("❌ You are not linked.", ephemeral=True)
+            return
+        energy = int(player.get("energy", 0))
+        await interaction.response.send_message(f"💰 You have {energy} Primal Energy")
+    except Exception as e:
+        logger.error("balance command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="giveall", description="Give energy to all players")
+@app_commands.describe(amount="Amount of energy")
+async def giveall(interaction: discord.Interaction, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ No permission", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Invalid amount", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            for steam_id in data:
+                data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + int(amount)
+            save_json(DATA_FILE, data)
+            log_transaction(interaction.user.id, "giveall", int(amount))
+        logger.info("[ADMIN ENERGY] giveall by=%s amount=%s", interaction.user.id, amount)
+        await interaction.response.send_message(f"✅ Gave {amount} energy to ALL players")
+    except Exception as e:
+        logger.error("giveall command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
 @bot.tree.command(name="buy", description="Buy a dinosaur")
-async def buy(interaction: discord.Interaction, item: str):
+@app_commands.describe(dino="Choose dinosaur")
+@cooldown(10)
+async def buy(interaction: discord.Interaction, dino: str):
     ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
+    logger.info("%s used /buy %s", interaction.user, dino)
+    item = str(dino or "").lower().strip()
+    if item not in DINO_OPTIONS:
+        await interaction.response.send_message("❌ Invalid dinosaur option.", ephemeral=True)
+        return
     if is_admin_bot_offline():
         print("[BUY BLOCKED] admin bot offline")
         record_manual_issue(ctx, "/buy", item)
@@ -4364,7 +4451,6 @@ async def buy(interaction: discord.Interaction, item: str):
     if str(bot_runtime_state.get("admin_bot_state", "")).upper() == "GRACE":
         await ctx.send("⚠️ Admin bot temporarily unavailable (grace period active). Request may be delayed.")
 
-    item = item.lower().strip()
     price, category = find_shop_price(item)
 
     if price is None:
@@ -4404,6 +4490,7 @@ async def buy(interaction: discord.Interaction, item: str):
             else:
                 _, after = adjust_energy_in_data(data, steam_id, -int(price))
                 save_json(DATA_FILE, data)
+                log_transaction(interaction.user.id, "buy", int(price))
                 if item == "allo":
                     print(f"[SHOP] allo purchase steam={steam_id} cost={int(price)}")
                 new_purchase = {
@@ -4445,6 +4532,15 @@ async def buy(interaction: discord.Interaction, item: str):
                     response_message = "❌ Purchase failed to save. Your energy was restored."
 
     await ctx.send(response_message or "❌ Purchase failed unexpectedly.")
+
+
+@buy.autocomplete("dino")
+async def buy_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=d, value=d)
+        for d in DINO_OPTIONS
+        if current.lower() in d.lower()
+    ][:25]
 
 
 @bot.tree.command(name="claim", description="Claim latest purchase")
@@ -4559,29 +4655,25 @@ async def invites(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="leaderboard", description="Show top inviters")
+@bot.tree.command(name="leaderboard", description="Top players")
 async def leaderboard(interaction: discord.Interaction):
-    ctx = InteractionContextAdapter(interaction)
-    referrals = load_referrals()
-
-    leaderboard_rows = []
-    for discord_id, record in referrals.items():
-        leaderboard_rows.append((discord_id, int(record.get("count", 0))))
-
-    if not leaderboard_rows:
-        await ctx.send("📭 No invite referrals tracked yet.")
-        return
-
-    leaderboard_rows.sort(key=lambda x: x[1], reverse=True)
-    top_five = leaderboard_rows[:5]
-
-    lines = ["🏆 **Top Inviters**\n"]
-    for idx, (discord_id, count) in enumerate(top_five, start=1):
-        user = bot.get_user(int(discord_id))
-        display_name = user.name if user else f"User {discord_id}"
-        lines.append(f"{idx}. **{display_name}** — {count} invites")
-
-    await ctx.send("\n".join(lines))
+    try:
+        data = load_json(DATA_FILE, {})
+        sorted_players = sorted(
+            data.items(),
+            key=lambda x: int(x[1].get("energy", 0)),
+            reverse=True,
+        )[:10]
+        if not sorted_players:
+            await interaction.response.send_message("📭 No players found.")
+            return
+        msg = "🏆 Top Players:\n"
+        for i, (steam_id, p) in enumerate(sorted_players, 1):
+            msg += f"{i}. {steam_id} - {int(p.get('energy', 0))}\n"
+        await interaction.response.send_message(msg)
+    except Exception as e:
+        logger.error("leaderboard command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
 @bot.tree.command(name="patreon", description="Show Patreon benefits")
