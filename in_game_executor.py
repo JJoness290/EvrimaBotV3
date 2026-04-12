@@ -1,11 +1,25 @@
 import json
+import logging
 import os
 import tempfile
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyautogui
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "executor.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 GAME_COMMANDS_FILE = Path("game_commands.json")
 CONFIG_FILE = Path("config.json")
@@ -97,11 +111,11 @@ def find_game_window():
             if ("theisle" in lowered) or ("isle" in lowered):
                 matches = gw.getWindowsWithTitle(t)
                 if matches:
-                    print(f"[WINDOW FOUND] {t}")
+                    logger.info("[WINDOW FOUND] %s", t)
                     return matches[0]
-    except Exception:
-        pass
-    print("[ERROR] Game window not found")
+    except Exception as e:
+        logger.error("WINDOW LOOKUP ERROR: %s", e)
+    logger.warning("Game window not found")
     return None
 
 
@@ -129,23 +143,45 @@ def send_chat_command(command: str):
         try:
             pyautogui.click(win.left + 100, win.top + 100)
             time.sleep(0.2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
 
-        print(f"[CHAT CMD] {command}")
-        pyautogui.press("enter")
+        logger.info("[CHAT CMD] %s", command)
+        try:
+            pyautogui.press("enter")
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
         time.sleep(0.3)
-        pyautogui.write(command, interval=0.02)
+        try:
+            pyautogui.write(command, interval=0.02)
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
         time.sleep(0.2)
-        pyautogui.press("enter")
+        try:
+            pyautogui.press("enter")
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
         time.sleep(0.2)
-        print("[CHAT CMD SENT]")
+        logger.info("[CHAT CMD SENT]")
     except Exception as e:
-        print("[CHAT ERROR]", e)
+        logger.error("[CHAT ERROR] %s", e)
+
+
+def safe_command(cmd: str):
+    try:
+        logger.info("SENDING: %s", cmd)
+        send_chat_command(cmd)
+        logger.info("SENT: %s", cmd)
+    except Exception as e:
+        logger.error("FAILED: %s -> %s", cmd, e)
 
 
 def type_command(cmd: str):
-    send_chat_command(cmd)
+    safe_command(cmd)
 
 
 def is_bot_in_game():
@@ -284,11 +320,11 @@ def process_group(commands_data, claim_group_id: str) -> bool:
                 continue
             elif ctype in {"sustain", "sustain_command"}:
                 print("[EXECUTOR] processing sustain command")
-                type_command(command_text)
+                safe_command(command_text)
                 time.sleep(get_delay_for_command(command_text))
             else:
                 print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
-                type_command(command_text)
+                safe_command(command_text)
                 time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
@@ -334,7 +370,7 @@ def process_legacy(commands_data):
 
         try:
             print(f"[EXEC] {command_text}")
-            type_command(command_text)
+            safe_command(command_text)
             time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
@@ -389,4 +425,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            logger.info("EXECUTOR LOOP START")
+            main()
+        except Exception as e:
+            logger.critical("CRASH: %s", e)
+            logger.critical(traceback.format_exc())
+            time.sleep(5)
