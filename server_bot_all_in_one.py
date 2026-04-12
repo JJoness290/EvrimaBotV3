@@ -1,5 +1,6 @@
 import asyncio
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import json
 from pathlib import Path
@@ -14,12 +15,26 @@ import struct
 import stat
 import threading
 import tempfile
+import logging
+import traceback
 from zoneinfo import ZoneInfo
 from typing import Any
 
 import paramiko
 
 TOKEN = ""
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "bot.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 DATA_FILE = Path("player_data.json")
 STATE_FILE = Path("player_state.json")
@@ -84,6 +99,11 @@ def get_simple_claim_lock(steam_id: str) -> asyncio.Lock:
     if key not in SIMPLE_CLAIM_LOCKS:
         SIMPLE_CLAIM_LOCKS[key] = asyncio.Lock()
     return SIMPLE_CLAIM_LOCKS[key]
+
+
+def is_higher_up(interaction: discord.Interaction):
+    roles = getattr(interaction.user, "roles", []) or []
+    return any(getattr(role, "name", "") == "Higher Ups" for role in roles)
 
 
 def is_server_claimable_now() -> tuple[bool, str]:
@@ -4015,6 +4035,13 @@ async def on_ready():
     global MAIN_LOOP
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands")
+        logger.info("Synced %s slash commands", len(synced))
+    except Exception as e:
+        print(f"Sync failed: {e}")
+        logger.error("Sync failed: %s", e)
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
     if bot_runtime_state.get("startup_initialized"):
@@ -4235,6 +4262,64 @@ async def shop(ctx):
         msg += "\n"
 
     await ctx.send(msg)
+
+
+@bot.tree.command(name="pay", description="Give energy to a player")
+@app_commands.describe(user="User to give energy to", amount="Amount of energy")
+async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            links = load_json(LINK_FILE, {})
+            steam_id = links.get(str(user.id))
+            if not steam_id or steam_id not in data:
+                await interaction.response.send_message("❌ User not linked.", ephemeral=True)
+                return
+            before = int(data[steam_id].get("energy", 0))
+            data[steam_id]["energy"] = before + int(amount)
+            save_json(DATA_FILE, data)
+        logger.info("[ADMIN ENERGY] pay user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
+        await interaction.response.send_message(
+            f"✅ Gave {amount} energy to {user.mention} (Now: {data[steam_id]['energy']})"
+        )
+    except Exception as e:
+        logger.error("pay command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="remove", description="Remove energy from a player")
+@app_commands.describe(user="User to remove energy from", amount="Amount of energy")
+async def remove(interaction: discord.Interaction, user: discord.Member, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            links = load_json(LINK_FILE, {})
+            steam_id = links.get(str(user.id))
+            if not steam_id or steam_id not in data:
+                await interaction.response.send_message("❌ User not linked.", ephemeral=True)
+                return
+            before = int(data[steam_id].get("energy", 0))
+            data[steam_id]["energy"] = max(0, before - int(amount))
+            save_json(DATA_FILE, data)
+        logger.info("[ADMIN ENERGY] remove user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
+        await interaction.response.send_message(
+            f"➖ Removed {amount} energy from {user.mention} (Now: {data[steam_id]['energy']})"
+        )
+    except Exception as e:
+        logger.error("remove command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
 @bot.command()
@@ -4535,4 +4620,11 @@ async def botissues(ctx):
 
 if __name__ == "__main__":
     hydrate_runtime_secrets()
-    bot.run(TOKEN)
+    while True:
+        try:
+            logger.info("Starting bot...")
+            bot.run(TOKEN)
+        except Exception as e:
+            logger.critical(f"Bot crashed: {e}")
+            logger.critical(traceback.format_exc())
+            time.sleep(5)
