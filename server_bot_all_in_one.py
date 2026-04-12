@@ -25,7 +25,7 @@ from typing import Any
 import paramiko
 
 TOKEN = ""
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
+GUILD_ID = 1485808244524974243
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -4091,22 +4091,13 @@ async def on_ready():
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
     try:
+        guild = discord.Object(id=GUILD_ID)
         print("Clearing old commands...")
-        bot.tree.clear_commands(guild=None)
-        print("Syncing commands globally...")
-        synced_global = await bot.tree.sync()
-        logger.info("Synced %s global slash commands", len(synced_global))
-        if GUILD_ID > 0:
-            guild = discord.Object(id=GUILD_ID)
-            print("Clearing guild commands...")
-            bot.tree.clear_commands(guild=guild)
-            print("Syncing to guild...")
-            synced_guild = await bot.tree.sync(guild=guild)
-            logger.info("Synced %s guild slash commands (guild=%s)", len(synced_guild), GUILD_ID)
-            print("Guild commands synced instantly")
-        print("Commands fully refreshed")
-        # If commands show outdated:
-        # Press CTRL+R in Discord to refresh client
+        bot.tree.clear_commands(guild=guild)
+        print("Syncing commands to guild...")
+        synced = await bot.tree.sync(guild=guild)
+        logger.info("Synced %s guild commands for %s", len(synced), GUILD_ID)
+        print("Commands synced instantly")
     except Exception as e:
         print(f"Sync error: {e}")
         logger.error("Sync error: %s", e)
