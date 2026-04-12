@@ -25,6 +25,7 @@ from typing import Any
 import paramiko
 
 TOKEN = ""
+GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -4090,13 +4091,25 @@ async def on_ready():
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands")
-        print("Slash commands synced")
-        logger.info("Synced %s slash commands", len(synced))
+        print("Clearing old commands...")
+        bot.tree.clear_commands(guild=None)
+        print("Syncing commands globally...")
+        synced_global = await bot.tree.sync()
+        logger.info("Synced %s global slash commands", len(synced_global))
+        if GUILD_ID > 0:
+            guild = discord.Object(id=GUILD_ID)
+            print("Clearing guild commands...")
+            bot.tree.clear_commands(guild=guild)
+            print("Syncing to guild...")
+            synced_guild = await bot.tree.sync(guild=guild)
+            logger.info("Synced %s guild slash commands (guild=%s)", len(synced_guild), GUILD_ID)
+            print("Guild commands synced instantly")
+        print("Commands fully refreshed")
+        # If commands show outdated:
+        # Press CTRL+R in Discord to refresh client
     except Exception as e:
-        print(f"Sync failed: {e}")
-        logger.error("Sync failed: %s", e)
+        print(f"Sync error: {e}")
+        logger.error("Sync error: %s", e)
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
     if bot_runtime_state.get("startup_initialized"):
