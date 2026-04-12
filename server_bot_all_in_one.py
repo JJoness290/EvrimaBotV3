@@ -103,6 +103,7 @@ DINO_OPTIONS = [
     "rex", "carno", "cera", "deino", "allo",
     "omni", "troodon", "herrera", "ptera",
 ]
+EXCLUDED_SHOP_CATEGORIES = {"extras", "extra", "misc", "other"}
 
 REMOTE_LOG_TAIL_BYTES = 16 * 1024
 
@@ -404,6 +405,25 @@ def get_scan_interval_seconds() -> int:
     config = load_config()
     value = int(config.get("scan_interval", DEFAULT_SCAN_INTERVAL))
     return max(1, value)
+
+
+def get_valid_shop_categories(shop_data: dict | None = None) -> dict:
+    shop = shop_data if isinstance(shop_data, dict) else load_shop()
+    return {
+        str(k): v for k, v in shop.items()
+        if isinstance(v, dict) and str(k).lower() not in EXCLUDED_SHOP_CATEGORIES
+    }
+
+
+def get_dino_choices_from_shop() -> list[str]:
+    valid_categories = get_valid_shop_categories()
+    dino_choices = []
+    for category in valid_categories.values():
+        for dino_name in category.keys():
+            name = str(dino_name).strip().lower()
+            if name:
+                dino_choices.append(name)
+    return sorted(set(dino_choices))
 
 
 def get_reward_interval_minutes() -> int:
@@ -4326,9 +4346,10 @@ async def shop(interaction: discord.Interaction):
     expire_old_purchases()
 
     shop_data = load_shop()
+    valid_categories = get_valid_shop_categories(shop_data)
     msg = "🛒 **Primal Abyss Shop**\n\n"
 
-    for cat, items in shop_data.items():
+    for cat, items in valid_categories.items():
         msg += f"**{cat.upper()}**\n"
         for item, price in items.items():
             msg += f"{item} — ⚡ {price}\n"
@@ -4442,7 +4463,8 @@ async def buy(interaction: discord.Interaction, dino: str):
     expire_old_purchases()
     logger.info("%s used /buy %s", interaction.user, dino)
     item = str(dino or "").lower().strip()
-    if item not in DINO_OPTIONS:
+    dino_choices = get_dino_choices_from_shop()
+    if item not in dino_choices:
         await interaction.response.send_message("❌ Invalid dinosaur option.", ephemeral=True)
         return
     if is_admin_bot_offline():
@@ -4538,9 +4560,15 @@ async def buy(interaction: discord.Interaction, dino: str):
 
 @buy.autocomplete("dino")
 async def buy_autocomplete(interaction: discord.Interaction, current: str):
+    shop = load_shop()
+    valid_categories = get_valid_shop_categories(shop)
+    choices = []
+    for category in valid_categories.values():
+        for dino_name in category.keys():
+            choices.append(str(dino_name).strip().lower())
     return [
         app_commands.Choice(name=d, value=d)
-        for d in DINO_OPTIONS
+        for d in choices
         if current.lower() in d.lower()
     ][:25]
 
