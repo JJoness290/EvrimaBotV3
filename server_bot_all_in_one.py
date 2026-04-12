@@ -165,7 +165,7 @@ GROW_LOG_PATTERN = re.compile(
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="/", intents=intents)
+bot = commands.Bot(intents=intents)
 
 invite_cache = {}
 online_since = {}
@@ -3569,7 +3569,7 @@ def run_claim_cleanup_pass(purchases: list, game_commands: list):
 
 
 def process_claim_orchestration():
-    # Retired for simplified direct !claim flow.
+    # Retired for simplified direct /claim flow.
     return
     global CLAIM_STARTUP_CLEANUP_DONE
     with ECONOMY_LOCK:
@@ -3731,7 +3731,7 @@ def process_claim_orchestration():
 
 
 def process_game_command_queue():
-    # Old queued claim orchestration is retired for simplified direct !claim flow.
+    # Old queued claim orchestration is retired for simplified direct /claim flow.
     return
 
 
@@ -4051,6 +4051,7 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands")
+        print("Slash commands synced")
         logger.info("Synced %s slash commands", len(synced))
     except Exception as e:
         print(f"Sync failed: {e}")
