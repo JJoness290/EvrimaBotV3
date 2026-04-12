@@ -10,6 +10,7 @@ import time
 import re
 import uuid
 import os
+import sys
 import socket
 import struct
 import stat
@@ -35,6 +36,18 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    LOG_DIR.mkdir(exist_ok=True)
+    crash_log = LOG_DIR / "crash.log"
+    with crash_log.open("a", encoding="utf-8") as f:
+        f.write("\n===== CRASH =====\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    print("CRASH DETECTED - CHECK logs/crash.log")
+
+
+sys.excepthook = global_exception_handler
 
 DATA_FILE = Path("player_data.json")
 STATE_FILE = Path("player_state.json")
