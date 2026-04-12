@@ -123,7 +123,7 @@ def is_server_claimable_now() -> tuple[bool, str]:
     return True, "online"
 
 announcement_messages = [
-    "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
+    "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • /buy & /claim PRIME\ndiscord.gg/HpJVNa69Ww"
 ]
 
 RCON_SCRIPT = r"C:\Users\joshu\Downloads\The-Isle-Evrima-Server-Tools-main\TheIsle_RCON.py"
@@ -152,7 +152,7 @@ GROW_LOG_PATTERN = re.compile(
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(intents=intents)
 
 invite_cache = {}
 online_since = {}
@@ -1466,7 +1466,7 @@ def expire_old_purchases():
                         changed_data = True
                         log_info("CLAIM TIMEOUT", f"refunded {int(purchase.get('refund_amount', 0) or 0)} energy steam={steam_id}")
 
-                    timeout_note = "⚠️ Claim timed out while processing. Your energy has been refunded. Please run !claim again."
+                    timeout_note = "⚠️ Claim timed out while processing. Your energy has been refunded. Please run /claim again."
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = timeout_note
                     purchase["failure_note"] = timeout_note
@@ -1478,7 +1478,7 @@ def expire_old_purchases():
                     changed_purchases = True
             elif str(status).upper() in {"READY_TO_CLAIM", "PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_SEND", "CLAIM_WAIT", "FINAL_VERIFY"}:
                 purchase["status"] = "FAILED"
-                purchase["delivery_note"] = "Old claim flow retired. Please use !claim again."
+                purchase["delivery_note"] = "Old claim flow retired. Please use /claim again."
                 changed_purchases = True
 
         # Timeout behavior examples:
@@ -3545,7 +3545,7 @@ def normalize_legacy_claim_purchase(purchase: dict):
     elif status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
         purchase["claim_state"] = "FAILED"
         purchase["status"] = "FAILED"
-        purchase["delivery_note"] = purchase.get("delivery_note") or "Legacy claim state normalized. Please run !claim again."
+        purchase["delivery_note"] = purchase.get("delivery_note") or "Legacy claim state normalized. Please run /claim again."
     elif status in {"DELIVERED", "FAILED", "WRONG_DINO_REFUNDED"}:
         purchase["claim_state"] = status
 
@@ -3604,7 +3604,7 @@ def process_claim_orchestration():
                     queued_at = parse_dt(purchase.get("precheck_queued_at")) or parse_dt(purchase.get("precheck_started_at"))
                     if queued_at and (datetime.now() - queued_at).total_seconds() > 3:
                         print(f"[CLAIM ERROR] no grouped commands found for active purchase purchase_id={purchase_id} state={status}")
-                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run !claim again.", "broken_precheck_group_missing")
+                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run /claim again.", "broken_precheck_group_missing")
                         purchase["timeout_reason"] = "broken_precheck_group_missing"
                         changed_purchases = True
                     continue
@@ -3668,7 +3668,7 @@ def process_claim_orchestration():
                     queued_at = parse_dt(purchase.get("claim_queued_at")) or parse_dt(purchase.get("claim_started_at"))
                     if queued_at and (datetime.now() - queued_at).total_seconds() > 3:
                         print(f"[CLAIM ERROR] no grouped commands found for active purchase purchase_id={purchase_id} state={status}")
-                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run !claim again.", "broken_claim_group_missing")
+                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run /claim again.", "broken_claim_group_missing")
                         purchase["timeout_reason"] = "broken_claim_group_missing"
                         changed_purchases = True
                     continue
@@ -3732,7 +3732,7 @@ def retire_old_claim_flow_purchases(purchases: list):
         purchase["claim_state"] = None
         purchase["status"] = "FAILED"
         purchase["failed_at"] = str(datetime.now())
-        purchase["delivery_note"] = "Old claim flow retired. Please use !claim again."
+        purchase["delivery_note"] = "Old claim flow retired. Please use /claim again."
         if not purchase.get("refund_applied"):
             refund_purchase_energy_if_needed(purchase, "old_flow_retired")
         changed = True
@@ -4126,7 +4126,7 @@ async def on_member_join(member):
         await general_channel.send(
             f"👋 Welcome {member.mention} to Primal Abyss!\n"
             f"⚡ Earn energy by playing\n"
-            f"🔗 Use !link <steamid>"
+            f"🔗 Use /link <steamid>"
         )
 
     if datetime.now(timezone.utc) - member.created_at < timedelta(days=1):
@@ -4181,8 +4181,21 @@ async def on_command_error(ctx, error):
     raise error
 
 
-@bot.command()
-async def link(ctx, steam_id: str):
+class InteractionContextAdapter:
+    def __init__(self, interaction: discord.Interaction):
+        self.interaction = interaction
+        self.author = interaction.user
+
+    async def send(self, *args, **kwargs):
+        if not self.interaction.response.is_done():
+            await self.interaction.response.send_message(*args, **kwargs)
+        else:
+            await self.interaction.followup.send(*args, **kwargs)
+
+
+@bot.tree.command(name="link", description="Link your Steam ID")
+async def link(interaction: discord.Interaction, steam_id: str):
+    ctx = InteractionContextAdapter(interaction)
     links = load_json(LINK_FILE, {})
     links[str(ctx.author.id)] = steam_id
     save_json(LINK_FILE, links)
@@ -4201,13 +4214,14 @@ async def link(ctx, steam_id: str):
     await ctx.send(embed=build_action_embed("Account Linked", "Your Steam account has been linked.", ctx.author.display_name, int(data.get(steam_id, {}).get("energy", get_starting_energy())), discord.Color.green()))
 
 
-@bot.command()
-async def stats(ctx):
+@bot.tree.command(name="stats", description="Show your stats")
+async def stats(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     player, steam_id, data, _ = get_latest_player_record_by_discord_id(str(ctx.author.id))
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
     player = data.get(steam_id, player)
@@ -4227,8 +4241,9 @@ async def stats(ctx):
     )
 
 
-@bot.command()
-async def online(ctx):
+@bot.tree.command(name="online", description="Show online players")
+async def online(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     players = get_online_players_from_data()
@@ -4248,8 +4263,9 @@ async def online(ctx):
     await ctx.send("\n".join(lines))
 
 
-@bot.command()
-async def shop(ctx):
+@bot.tree.command(name="shop", description="Show shop")
+async def shop(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     shop_data = load_shop()
@@ -4322,12 +4338,13 @@ async def remove(interaction: discord.Interaction, user: discord.Member, amount:
         await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
 
-@bot.command()
-async def buy(ctx, item: str):
+@bot.tree.command(name="buy", description="Buy a dinosaur")
+async def buy(interaction: discord.Interaction, item: str):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
     if is_admin_bot_offline():
         print("[BUY BLOCKED] admin bot offline")
-        record_manual_issue(ctx, "!buy", item)
+        record_manual_issue(ctx, "/buy", item)
         await ctx.send("⚠️ Purchases are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
     if str(bot_runtime_state.get("admin_bot_state", "")).upper() == "GRACE":
@@ -4353,12 +4370,12 @@ async def buy(ctx, item: str):
         steam_id = get_steam_id_for_discord(str(ctx.author.id), links)
         player = data.get(steam_id) if steam_id else None
         if not player:
-            response_message = "❌ Use !link first"
+            response_message = "❌ Use /link first"
         elif any(
             p.get("steam_id") == steam_id and str(p.get("status", "")).upper() in {"UNCLAIMED", "CLAIMING"}
             for p in purchases
         ):
-            response_message = "❌ You already have an active purchase. Use `!claim` first."
+            response_message = "❌ You already have an active purchase. Use `/claim` first."
         elif int(player.get("energy", 0)) < int(price):
             response_message = "❌ Not enough energy"
         else:
@@ -4369,7 +4386,7 @@ async def buy(ctx, item: str):
                 for p in purchases
             )
             if duplicate_unclaimed:
-                response_message = "❌ You already have an active purchase for this dino. Use `!claim` first."
+                response_message = "❌ You already have an active purchase for this dino. Use `/claim` first."
             else:
                 _, after = adjust_energy_in_data(data, steam_id, -int(price))
                 save_json(DATA_FILE, data)
@@ -4406,7 +4423,7 @@ async def buy(ctx, item: str):
                         f"💰 Remaining energy: {after}\n"
                         f"📦 Claim saved\n"
                         f"⏳ Expires in {PURCHASE_TIMEOUT_MINUTES} minutes if not claimed\n\n"
-                        f"Use `!claim` when you are ready to be primed."
+                        f"Use `/claim` when you are ready to be primed."
                     )
                 except Exception:
                     adjust_energy_in_data(data, steam_id, int(price))
@@ -4416,8 +4433,9 @@ async def buy(ctx, item: str):
     await ctx.send(response_message or "❌ Purchase failed unexpectedly.")
 
 
-@bot.command()
-async def claim(ctx):
+@bot.tree.command(name="claim", description="Claim latest purchase")
+async def claim(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
     current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
     admin_state = str(bot_runtime_state.get("admin_bot_state", "")).upper()
@@ -4441,7 +4459,7 @@ async def claim(ctx):
         return
     if is_admin_bot_offline():
         print("[CLAIM BLOCKED] admin bot offline")
-        record_manual_issue(ctx, "!claim", "")
+        record_manual_issue(ctx, "/claim", "")
         await ctx.send("⚠️ Claims are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
     if str(bot_runtime_state.get("admin_bot_state", "")).upper() == "GRACE":
@@ -4450,7 +4468,7 @@ async def claim(ctx):
     player, steam_id = get_player(ctx)
 
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
     lock = get_simple_claim_lock(steam_id)
@@ -4468,14 +4486,15 @@ async def claim(ctx):
         await run_simple_claim_flow(ctx, purchase_index, steam_id)
 
 
-@bot.command()
-async def myclaims(ctx):
+@bot.tree.command(name="myclaims", description="List your purchases")
+async def myclaims(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     player, steam_id = get_player(ctx)
 
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
     purchases = load_purchases()
@@ -4511,8 +4530,9 @@ async def myclaims(ctx):
     await ctx.send("\n".join(lines))
 
 
-@bot.command()
-async def invites(ctx):
+@bot.tree.command(name="invites", description="Show your invite count")
+async def invites(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     referrals = load_referrals()
     discord_id = str(ctx.author.id)
     ensure_referral_record(referrals, discord_id)
@@ -4525,8 +4545,9 @@ async def invites(ctx):
     )
 
 
-@bot.command()
-async def leaderboard(ctx):
+@bot.tree.command(name="leaderboard", description="Show top inviters")
+async def leaderboard(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     referrals = load_referrals()
 
     leaderboard_rows = []
@@ -4549,8 +4570,9 @@ async def leaderboard(ctx):
     await ctx.send("\n".join(lines))
 
 
-@bot.command()
-async def patreon(ctx):
+@bot.tree.command(name="patreon", description="Show Patreon benefits")
+async def patreon(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     embed = discord.Embed(
         title="Patreon Benefits",
         description="Support the server and unlock higher passive energy rates.",
@@ -4563,18 +4585,19 @@ async def patreon(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command()
-async def tiers(ctx):
-    await patreon(ctx)
+@bot.tree.command(name="tiers", description="Alias for patreon")
+async def tiers(interaction: discord.Interaction):
+    await patreon(interaction)
 
 
-@bot.command()
-async def checktier(ctx):
+@bot.tree.command(name="checktier", description="Check your Patreon tier")
+async def checktier(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     await refresh_patreon_role_cache(force=True)
     links = load_json(LINK_FILE, {})
     steam_id = links.get(str(ctx.author.id))
     if not steam_id:
-        await ctx.send(embed=build_action_embed("Tier Check", "Use `!link <steamid>` first.", ctx.author.display_name, None, discord.Color.red()))
+        await ctx.send(embed=build_action_embed("Tier Check", "Use `/link <steamid>` first.", ctx.author.display_name, None, discord.Color.red()))
         return
     info = patreon_role_cache.get(str(steam_id), {})
     tier = info.get("tier", "Default")
@@ -4591,8 +4614,9 @@ async def checktier(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command()
-async def botstatus(ctx):
+@bot.tree.command(name="botstatus", description="Admin bot status dashboard")
+async def botstatus(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
         await ctx.send("❌ Admin only.")
         return
@@ -4600,8 +4624,9 @@ async def botstatus(ctx):
     await ctx.send(embed=build_admin_dashboard_embed())
 
 
-@bot.command()
-async def botissues(ctx):
+@bot.tree.command(name="botissues", description="List blocked requests during outage")
+async def botissues(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
         await ctx.send("❌ Admin only.")
         return
