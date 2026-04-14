@@ -60,6 +60,7 @@ PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
 HISTORY_FILE = Path("history.json")
+EVENTERS_SNAPSHOTS_FILE = Path("eventers_snapshots.json")
 CONFIG_FILE = Path("config.json")
 EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 CONFIG_DEBUG_LOGGED = False
@@ -752,6 +753,100 @@ def get_player_by_discord_id(discord_id: str):
         return None, None, data
 
     return data.get(steam_id), steam_id, data
+
+
+def is_eventers(member) -> bool:
+    roles = getattr(member, "roles", []) or []
+    return any(str(getattr(role, "name", "")).strip().lower() == "eventers" for role in roles)
+
+
+def load_eventers_snapshots() -> dict:
+    payload = load_json(EVENTERS_SNAPSHOTS_FILE, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_eventers_snapshots(snapshots: dict) -> None:
+    save_json(EVENTERS_SNAPSHOTS_FILE, snapshots if isinstance(snapshots, dict) else {})
+
+
+def get_real_energy(user_id):
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+    steam_id = links.get(str(user_id))
+    if not steam_id or steam_id not in data:
+        return None
+    return int(data[steam_id].get("energy", 0))
+
+
+def set_energy(user_id, amount) -> bool:
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+    steam_id = links.get(str(user_id))
+    if not steam_id or steam_id not in data:
+        return False
+    data[steam_id]["energy"] = int(amount)
+    save_json(DATA_FILE, data)
+    return True
+
+
+def apply_eventers_override(member) -> None:
+    user_id = str(getattr(member, "id", "") or "")
+    if not user_id:
+        return
+    snapshots = load_eventers_snapshots()
+    if user_id not in snapshots:
+        original = get_real_energy(user_id)
+        if original is None:
+            print(f"[EVENTERS WARNING] snapshot skipped user={user_id} reason=not_linked")
+            return
+        snapshots[user_id] = {
+            "original_energy": int(original),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_eventers_snapshots(snapshots)
+        print(f"[EVENTERS] snapshot created user={user_id} balance={int(original)}")
+    if set_energy(user_id, 1000000):
+        print(f"[EVENTERS] override applied user={user_id} balance=1000000")
+    else:
+        print(f"[EVENTERS WARNING] override failed user={user_id} reason=not_linked")
+
+
+def restore_eventers_balance(member) -> None:
+    user_id = str(getattr(member, "id", "") or "")
+    if not user_id:
+        return
+    snapshots = load_eventers_snapshots()
+    snap = snapshots.get(user_id)
+    if not isinstance(snap, dict):
+        print(f"[EVENTERS WARNING] restore skipped user={user_id} reason=no_snapshot")
+        return
+    original = int(snap.get("original_energy", 0) or 0)
+    if set_energy(user_id, original):
+        print(f"[EVENTERS] restored user={user_id} balance={original}")
+        snapshots.pop(user_id, None)
+        save_eventers_snapshots(snapshots)
+    else:
+        print(f"[EVENTERS WARNING] restore failed user={user_id} reason=not_linked")
+
+
+async def reconcile_eventers_overrides() -> None:
+    snapshots = load_eventers_snapshots()
+    seen_users = set()
+    for guild in bot.guilds:
+        for member in guild.members:
+            if getattr(member, "bot", False):
+                continue
+            user_id = str(member.id)
+            seen_users.add(user_id)
+            if is_eventers(member):
+                apply_eventers_override(member)
+            elif user_id in snapshots:
+                restore_eventers_balance(member)
+    # Cleanup snapshots for users no longer visible in guild member cache.
+    stale_ids = [uid for uid in snapshots.keys() if uid not in seen_users]
+    if stale_ids:
+        for uid in stale_ids:
+            print(f"[EVENTERS WARNING] stale snapshot retained user={uid} reason=member_not_cached")
 
 
 async def refresh_patreon_role_cache(force: bool = False):
@@ -4174,6 +4269,7 @@ async def on_ready():
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
+    await reconcile_eventers_overrides()
     await send_restart_incident(
         "Recovery Complete",
         "Bot systems reconnected and monitoring has resumed.",
@@ -4249,6 +4345,18 @@ async def on_member_join(member):
     if reward_channel and gained_messages:
         for message in gained_messages:
             await reward_channel.send(message)
+
+
+@bot.event
+async def on_member_update(before, after):
+    if getattr(after, "bot", False):
+        return
+    had_eventers = is_eventers(before)
+    has_eventers = is_eventers(after)
+    if (not had_eventers) and has_eventers:
+        apply_eventers_override(after)
+    elif had_eventers and (not has_eventers):
+        restore_eventers_balance(after)
 
 
 @bot.event
