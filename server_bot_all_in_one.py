@@ -1,5 +1,6 @@
 import asyncio
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import json
 from pathlib import Path
@@ -9,17 +10,54 @@ import time
 import re
 import uuid
 import os
+import sys
 import socket
 import struct
 import stat
 import threading
 import tempfile
+import logging
+import traceback
+from functools import wraps
 from zoneinfo import ZoneInfo
 from typing import Any
 
 import paramiko
 
 TOKEN = ""
+GUILD_ID = 1485808244524974243
+GUILD = discord.Object(id=1485808244524974243)
+ROLE_ID = 0  # TODO: replace with Primalist role ID
+CHANNEL_ID = 0  # TODO: replace with #portal channel ID
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "bot.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+TICKET_CATEGORY_NAME = "Tickets"
+TICKET_STAFF_ROLES = ("Higher Ups", "Ticket Admin")
+LOG_CHANNEL_NAME = "ticket-logs"
+TRANSCRIPTS_DIR = Path("transcripts")
+
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    LOG_DIR.mkdir(exist_ok=True)
+    crash_log = LOG_DIR / "crash.log"
+    with crash_log.open("a", encoding="utf-8") as f:
+        f.write("\n===== CRASH =====\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    print("CRASH DETECTED - CHECK logs/crash.log")
+
+
+sys.excepthook = global_exception_handler
 
 DATA_FILE = Path("player_data.json")
 STATE_FILE = Path("player_state.json")
@@ -28,12 +66,14 @@ SHOP_FILE = Path("shop.json")
 PURCHASES_FILE = Path("purchases.json")
 GAME_COMMANDS_FILE = Path("game_commands.json")
 REFERRALS_FILE = Path("referrals.json")
+HISTORY_FILE = Path("history.json")
+EVENTERS_SNAPSHOTS_FILE = Path("eventers_snapshots.json")
 CONFIG_FILE = Path("config.json")
 EXECUTOR_HEARTBEAT_FILE = Path("executor_heartbeat.json")
 CONFIG_DEBUG_LOGGED = False
 
 PURCHASE_TIMEOUT_MINUTES = 15
-CLAIM_QUEUE_TIMEOUT_MINUTES = 2
+CLAIM_QUEUE_TIMEOUT_MINUTES = 5
 
 DEFAULT_SCAN_INTERVAL = 5
 DEFAULT_REWARD_INTERVAL_MINUTES = 60
@@ -61,35 +101,60 @@ DINO_CLASS_MAP = {
     "herrera": ["Herrerasaurus"],
     "omni": ["Omniraptor", "Omni"],
     "dilo": ["Dilophosaurus"],
+    "allo": ["Allosaurus", "Allo"],
     "carno": ["Carnotaurus"],
     "cera": ["Ceratosaurus"],
     "deino": ["Deinosuchus"],
     "rex": ["Tyrannosaurus", "TRex", "Rex"],
 }
+DINO_OPTIONS = [
+    "rex", "carno", "cera", "deino", "allo",
+    "omni", "troodon", "herrera", "ptera",
+]
+EXCLUDED_SHOP_CATEGORIES = {"extras", "extra", "misc", "other"}
 
-CLAIM_PRECHECK_STATES = {"PRECHECK_QUEUED"}
-CLAIM_OPEN_STATES = {
-    "UNCLAIMED",
-    "PRECHECK_QUEUED",
-    "PRECHECK_VERIFYING",
-    "PRECHECK_PASSED",
-    "CLAIM_SEQUENCE_QUEUED",
-    "FINAL_VERIFY_PENDING",
-}
-
-PRECHECK_VERIFY_TIMEOUT_SECONDS = 20
-FINAL_VERIFY_TIMEOUT_SECONDS = 20
 REMOTE_LOG_TAIL_BYTES = 16 * 1024
-CLAIM_ACTIVE_TIMEOUT_SECONDS = 90
 
 last_remote_log_match = {}
 cached_resolved_remote_log_path = None
 last_remote_log_match_raw_line_by_steam = {}
 last_remote_grow_match = {}
 last_sftp_eof_warn_at = 0.0
+CLAIM_STARTUP_CLEANUP_DONE = False
+SIMPLE_CLAIM_LOCKS: dict[str, asyncio.Lock] = {}
+cooldowns = {}
+
+
+def get_simple_claim_lock(steam_id: str) -> asyncio.Lock:
+    key = str(steam_id or "").strip()
+    if key not in SIMPLE_CLAIM_LOCKS:
+        SIMPLE_CLAIM_LOCKS[key] = asyncio.Lock()
+    return SIMPLE_CLAIM_LOCKS[key]
+
+
+def is_higher_up(interaction: discord.Interaction):
+    roles = getattr(interaction.user, "roles", []) or []
+    return any(getattr(role, "name", "") == "Higher Ups" for role in roles)
+
+
+def is_server_claimable_now() -> tuple[bool, str]:
+    current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
+    admin_state = str(bot_runtime_state.get("admin_bot_state", "")).upper()
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    _last_player_count = int(bot_runtime_state.get("last_player_poll_player_count", 0) or 0)
+
+    if current_server_state in {SERVER_STATE_DOWN, SERVER_STATE_SUSPECTED_DOWN}:
+        return False, "server_down"
+    if current_server_state == SERVER_STATE_RESTARTING:
+        return False, "server_restarting"
+    if current_server_state == SERVER_STATE_RECOVERING:
+        if admin_state == "ONLINE" and last_poll_ok:
+            return True, "recovering_but_usable"
+        return False, "server_recovering"
+    return True, "online"
 
 announcement_messages = [
-    "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • !buy & !claim PRIME\ndiscord.gg/HpJVNa69Ww"
+    "=== PRIMAL ABYSS ===\nNew Survival Universe\nEarn Energy • /buy & /claim PRIME\ndiscord.gg/HpJVNa69Ww"
 ]
 
 RCON_SCRIPT = r"C:\Users\joshu\Downloads\The-Isle-Evrima-Server-Tools-main\TheIsle_RCON.py"
@@ -118,7 +183,7 @@ GROW_LOG_PATTERN = re.compile(
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(intents=intents)
 
 invite_cache = {}
 online_since = {}
@@ -151,12 +216,15 @@ PATREON_TIER_RATES = {
 BOT_STATE_IN_GAME = "BOT_IN_GAME"
 BOT_STATE_MISSING = "BOT_MISSING"
 BOT_STATE_WAITING_SERVER = "BOT_WAITING_FOR_SERVER"
+ADMIN_BOT_PLAYER_NAME = "Primal Abyss Bot"
+ADMIN_BOT_STEAM_ID = "76561198721331299"
 
 SERVER_STATE_ONLINE = "SERVER_ONLINE"
 SERVER_STATE_RESTARTING = "SERVER_RESTARTING"
 SERVER_STATE_SUSPECTED_DOWN = "SERVER_SUSPECTED_DOWN"
 SERVER_STATE_DOWN = "SERVER_DOWN"
 SERVER_STATE_RECOVERING = "SERVER_RECOVERING"
+PRESENCE_STALE_SECONDS = 120
 
 SERVER_RESTART_MARKERS = (
     "shutting down",
@@ -291,6 +359,39 @@ def save_json(path: Path, data) -> None:
         os.replace(tmp_path, path)
 
 
+def log_transaction(user, action: str, amount: int):
+    history = load_json(HISTORY_FILE, [])
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "user": str(user),
+        "action": str(action),
+        "amount": int(amount),
+        "time": str(datetime.now()),
+    })
+    save_json(HISTORY_FILE, history)
+
+
+def cooldown(seconds: int):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+            user_id = int(getattr(interaction.user, "id", 0) or 0)
+            now = time.time()
+            last = float(cooldowns.get((func.__name__, user_id), 0.0) or 0.0)
+            if now - last < seconds:
+                wait_for = int(seconds - (now - last))
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"⏳ Wait {wait_for}s", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"⏳ Wait {wait_for}s", ephemeral=True)
+                return
+            cooldowns[(func.__name__, user_id)] = now
+            return await func(interaction, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def load_config():
     global CONFIG_DEBUG_LOGGED
     config = load_json(CONFIG_FILE, {})
@@ -312,6 +413,25 @@ def get_scan_interval_seconds() -> int:
     config = load_config()
     value = int(config.get("scan_interval", DEFAULT_SCAN_INTERVAL))
     return max(1, value)
+
+
+def get_valid_shop_categories(shop_data: dict | None = None) -> dict:
+    shop = shop_data if isinstance(shop_data, dict) else load_shop()
+    return {
+        str(k): v for k, v in shop.items()
+        if isinstance(v, dict) and str(k).lower() not in EXCLUDED_SHOP_CATEGORIES
+    }
+
+
+def get_dino_choices_from_shop() -> list[str]:
+    valid_categories = get_valid_shop_categories()
+    dino_choices = []
+    for category in valid_categories.values():
+        for dino_name in category.keys():
+            name = str(dino_name).strip().lower()
+            if name:
+                dino_choices.append(name)
+    return sorted(set(dino_choices))
 
 
 def get_reward_interval_minutes() -> int:
@@ -609,7 +729,8 @@ def get_player(ctx):
     links = load_json(LINK_FILE, {})
     data = load_json(DATA_FILE, {})
 
-    steam_id = links.get(str(ctx.author.id))
+    user_obj = getattr(ctx, "author", None) or getattr(ctx, "user", None)
+    steam_id = links.get(str(getattr(user_obj, "id", "") or ""))
     if not steam_id:
         return None, None
 
@@ -639,6 +760,100 @@ def get_player_by_discord_id(discord_id: str):
         return None, None, data
 
     return data.get(steam_id), steam_id, data
+
+
+def is_eventers(member) -> bool:
+    roles = getattr(member, "roles", []) or []
+    return any(str(getattr(role, "name", "")).strip().lower() == "eventers" for role in roles)
+
+
+def load_eventers_snapshots() -> dict:
+    payload = load_json(EVENTERS_SNAPSHOTS_FILE, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_eventers_snapshots(snapshots: dict) -> None:
+    save_json(EVENTERS_SNAPSHOTS_FILE, snapshots if isinstance(snapshots, dict) else {})
+
+
+def get_real_energy(user_id):
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+    steam_id = links.get(str(user_id))
+    if not steam_id or steam_id not in data:
+        return None
+    return int(data[steam_id].get("energy", 0))
+
+
+def set_energy(user_id, amount) -> bool:
+    links = load_json(LINK_FILE, {})
+    data = load_json(DATA_FILE, {})
+    steam_id = links.get(str(user_id))
+    if not steam_id or steam_id not in data:
+        return False
+    data[steam_id]["energy"] = int(amount)
+    save_json(DATA_FILE, data)
+    return True
+
+
+def apply_eventers_override(member) -> None:
+    user_id = str(getattr(member, "id", "") or "")
+    if not user_id:
+        return
+    snapshots = load_eventers_snapshots()
+    if user_id not in snapshots:
+        original = get_real_energy(user_id)
+        if original is None:
+            print(f"[EVENTERS WARNING] snapshot skipped user={user_id} reason=not_linked")
+            return
+        snapshots[user_id] = {
+            "original_energy": int(original),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_eventers_snapshots(snapshots)
+        print(f"[EVENTERS] snapshot created user={user_id} balance={int(original)}")
+    if set_energy(user_id, 1000000):
+        print(f"[EVENTERS] override applied user={user_id} balance=1000000")
+    else:
+        print(f"[EVENTERS WARNING] override failed user={user_id} reason=not_linked")
+
+
+def restore_eventers_balance(member) -> None:
+    user_id = str(getattr(member, "id", "") or "")
+    if not user_id:
+        return
+    snapshots = load_eventers_snapshots()
+    snap = snapshots.get(user_id)
+    if not isinstance(snap, dict):
+        print(f"[EVENTERS WARNING] restore skipped user={user_id} reason=no_snapshot")
+        return
+    original = int(snap.get("original_energy", 0) or 0)
+    if set_energy(user_id, original):
+        print(f"[EVENTERS] restored user={user_id} balance={original}")
+        snapshots.pop(user_id, None)
+        save_eventers_snapshots(snapshots)
+    else:
+        print(f"[EVENTERS WARNING] restore failed user={user_id} reason=not_linked")
+
+
+async def reconcile_eventers_overrides() -> None:
+    snapshots = load_eventers_snapshots()
+    seen_users = set()
+    for guild in bot.guilds:
+        for member in guild.members:
+            if getattr(member, "bot", False):
+                continue
+            user_id = str(member.id)
+            seen_users.add(user_id)
+            if is_eventers(member):
+                apply_eventers_override(member)
+            elif user_id in snapshots:
+                restore_eventers_balance(member)
+    # Cleanup snapshots for users no longer visible in guild member cache.
+    stale_ids = [uid for uid in snapshots.keys() if uid not in seen_users]
+    if stale_ids:
+        for uid in stale_ids:
+            print(f"[EVENTERS WARNING] stale snapshot retained user={uid} reason=member_not_cached")
 
 
 async def refresh_patreon_role_cache(force: bool = False):
@@ -811,6 +1026,7 @@ def parse_health_command_log_line(line: str):
         "new_value": new_value,
         "command": "SetHealth",
         "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
+        "event_dt": event_dt,
         "raw_line": line.strip(),
     }
 
@@ -846,8 +1062,47 @@ def parse_grow_command_log_line(line: str):
         "new_value": new_value,
         "command": "Grow",
         "event_time": event_dt.isoformat(sep=" ") if event_dt else None,
+        "event_dt": event_dt,
         "raw_line": line.strip(),
     }
+
+
+def clear_cached_health_log_for_steam(steam_id: str):
+    sid = str(steam_id or "").strip()
+    if not sid:
+        return
+    last_remote_log_match.pop(sid, None)
+    last_remote_log_match_raw_line_by_steam.pop(sid, None)
+
+
+def clear_cached_grow_log_for_steam(steam_id: str):
+    sid = str(steam_id or "").strip()
+    if not sid:
+        return
+    last_remote_grow_match.pop(sid, None)
+
+
+def get_log_event_dt(log_entry: dict):
+    if not isinstance(log_entry, dict):
+        return None
+    event_dt = log_entry.get("event_dt")
+    if isinstance(event_dt, datetime):
+        return event_dt
+    event_time = log_entry.get("event_time")
+    if event_time:
+        return parse_dt(str(event_time))
+    return None
+
+
+def is_fresh_log_for_anchor(log_entry: dict, anchor_dt: datetime | None):
+    if not log_entry:
+        return False, None
+    event_dt = get_log_event_dt(log_entry)
+    if anchor_dt is None:
+        return True, event_dt
+    if event_dt is None:
+        return False, None
+    return event_dt >= anchor_dt, event_dt
 
 
 def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
@@ -906,7 +1161,7 @@ def read_remote_log_tail(tail_bytes: int = REMOTE_LOG_TAIL_BYTES):
             pass
 
 
-def get_latest_health_log_for_steam(steam_id: str):
+def get_latest_health_log_for_steam(steam_id: str, allow_cached: bool = True):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         print(f"[CLAIM] waiting for health log for steam_id={steam_id} err={err}")
@@ -930,10 +1185,12 @@ def get_latest_health_log_for_steam(steam_id: str):
         return newest_match
 
     print(f"[CLAIM] parser found no valid health line for steam_id={steam_id}")
-    return last_remote_log_match.get(str(steam_id))
+    if allow_cached:
+        return last_remote_log_match.get(str(steam_id))
+    return None
 
 
-def get_latest_grow_log_for_steam(steam_id: str):
+def get_latest_grow_log_for_steam(steam_id: str, allow_cached: bool = True):
     lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
     if err:
         print(f"[CLAIM] waiting for grow log for steam_id={steam_id} err={err}")
@@ -955,7 +1212,68 @@ def get_latest_grow_log_for_steam(steam_id: str):
         return newest_match
 
     print(f"[CLAIM] parser found no valid grow line for steam_id={steam_id}")
-    return last_remote_grow_match.get(str(steam_id))
+    if allow_cached:
+        return last_remote_grow_match.get(str(steam_id))
+    return None
+
+
+def get_fresh_health_log_for_steam(steam_id: str, since_dt: datetime | None):
+    candidate = get_latest_health_log_for_steam(steam_id, allow_cached=False)
+    is_fresh, event_dt = is_fresh_log_for_anchor(candidate, since_dt)
+    if candidate and is_fresh:
+        print(f"[CLAIM] fresh health log accepted steam={steam_id} class={candidate.get('class_name')}")
+        return candidate
+    if candidate and not is_fresh:
+        print(f"[CLAIM] ignoring stale health log steam={steam_id} log_ts={event_dt} anchor_ts={since_dt}")
+    return None
+
+
+def get_fresh_grow_log_for_steam(steam_id: str, since_dt: datetime | None):
+    candidate = get_latest_grow_log_for_steam(steam_id, allow_cached=False)
+    is_fresh, event_dt = is_fresh_log_for_anchor(candidate, since_dt)
+    if candidate and is_fresh:
+        print(
+            f"[CLAIM] fresh grow log accepted steam={steam_id} "
+            f"class={candidate.get('class_name')} growth={candidate.get('new_value')}"
+        )
+        return candidate
+    if candidate and not is_fresh:
+        print(f"[CLAIM] ignoring stale grow log steam={steam_id} log_ts={event_dt} anchor_ts={since_dt}")
+    return None
+
+
+def get_latest_health_log_raw_for_steam(steam_id: str):
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
+        return None
+    for line in reversed(lines):
+        parsed = parse_health_command_log_line(line)
+        if parsed and str(parsed.get("steam_id")) == str(steam_id):
+            return str(parsed.get("raw_line") or "").strip()
+    return None
+
+
+def get_fresh_health_log_for_claim(steam_id: str, previous_raw_line: str | None = None):
+    lines, err = read_remote_log_tail(REMOTE_LOG_TAIL_BYTES)
+    if err:
+        print(f"[CLAIM] waiting for fresh health log steam={steam_id} err={err}")
+        return None
+    saw_matching_line = False
+    for line in reversed(lines):
+        parsed = parse_health_command_log_line(line)
+        if not parsed:
+            continue
+        if str(parsed.get("steam_id")) != str(steam_id):
+            continue
+        saw_matching_line = True
+        raw_line = str(parsed.get("raw_line") or "").strip()
+        if previous_raw_line and raw_line == previous_raw_line:
+            print(f"[CLAIM] health log rejected steam={steam_id} reason=baseline_match")
+            continue
+        print(f"[CLAIM] fresh health log accepted steam={steam_id} class={parsed.get('class_name')}")
+        return parsed
+    print(f"[CLAIM] waiting for fresh health log steam={steam_id} matching_found={saw_matching_line}")
+    return None
 
 
 def verify_growth_log_for_purchase(purchase, grow_log):
@@ -982,7 +1300,23 @@ def verify_growth_log_for_purchase(purchase, grow_log):
     return True, f"Growth confirmed at {new_value:.6f}% for {grow_log.get('class_name', 'Unknown')}."
 
 
-def get_claim_status_display(status: str):
+def get_claim_status_display(status: str, claim_state: str | None = None):
+    state = str(claim_state or "").strip().upper()
+    if state:
+        claim_state_mapping = {
+            "READY_TO_CLAIM": ("Not started", 0),
+            "PRECHECK_SEND": ("Verification in progress", 20),
+            "PRECHECK_WAIT": ("Verification in progress", 30),
+            "PRECHECK_VERIFY": ("Verification in progress", 40),
+            "CLAIM_SEND": ("Growth queued/in progress", 60),
+            "CLAIM_WAIT": ("Growth queued/in progress", 80),
+            "FINAL_VERIFY": ("Final verification", 90),
+            "DELIVERED": ("Claim completed", 100),
+            "FAILED": ("Failed / Refunded", None),
+            "WRONG_DINO_REFUNDED": ("Failed / Refunded", None),
+        }
+        if state in claim_state_mapping:
+            return claim_state_mapping[state]
     mapping = {
         "UNCLAIMED": ("Not claimed yet", 0),
         "PRECHECK_QUEUED": ("Pre-check queued", 20),
@@ -1029,7 +1363,7 @@ def render_progress_bar(pct: int | None):
 
 def build_claim_progress_embed(purchase):
     status = purchase.get("status")
-    label, pct = get_claim_status_display(status)
+    label, pct = get_claim_status_display(status, purchase.get("claim_state"))
     item = str(purchase.get("item", "dino")).upper()
     result = clean_claim_note_for_user(
         purchase.get("failure_note") or purchase.get("delivery_note") or label
@@ -1198,7 +1532,7 @@ def expire_claim_commands_for_purchase(game_commands: list, purchase: dict):
             continue
         cmd["status"] = "EXPIRED"
         cmd["completed_at"] = str(datetime.now())
-        cmd["error"] = "Claim queue timed out after 2 minutes."
+        cmd["error"] = f"Claim queue timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes."
         expired_count += 1
     return expired_count
 
@@ -1211,13 +1545,37 @@ def refund_timed_out_claim_purchase(purchase: dict, data: dict):
     price, _ = find_shop_price(item)
     if price is None or steam_id not in data:
         return False
-    _, _ = adjust_energy_in_data(data, steam_id, int(price))
+    before_energy, after_energy = adjust_energy_in_data(data, steam_id, int(price))
     purchase["refund_applied"] = True
     purchase["refund_amount"] = int(price)
     purchase["refunded_at"] = str(datetime.now())
-    purchase["refund_note"] = "Claim timed out after 2 minutes. Energy refunded automatically."
+    purchase["refund_note"] = f"Claim timed out after {CLAIM_QUEUE_TIMEOUT_MINUTES} minutes. Energy refunded automatically."
     purchase["timeout_reason"] = "claim_queue_timeout"
+    print(
+        f"[CLAIM REFUND] timeout refund steam={steam_id} item={item} amount={int(price)} "
+        f"energy_before={before_energy} energy_after={after_energy}"
+    )
     return True
+
+
+def get_claim_group_command_summary(game_commands: list, claim_group_id: str):
+    summary = {
+        "pending_or_executing": False,
+        "failed_or_skipped": False,
+        "status_counts": {},
+    }
+    if not claim_group_id:
+        return summary
+    for command_entry in game_commands:
+        if str(command_entry.get("claim_group_id", "")).strip() != str(claim_group_id).strip():
+            continue
+        status = str(command_entry.get("status", "")).upper()
+        summary["status_counts"][status] = int(summary["status_counts"].get(status, 0)) + 1
+        if status in {"PENDING", "EXECUTING"}:
+            summary["pending_or_executing"] = True
+        if status in {"FAILED", "SKIPPED"}:
+            summary["failed_or_skipped"] = True
+    return summary
 
 
 def expire_old_purchases():
@@ -1225,6 +1583,8 @@ def expire_old_purchases():
         purchases = load_purchases()
         data = load_json(DATA_FILE, {})
         game_commands = load_game_commands()
+        if retire_old_claim_flow_purchases(purchases) or run_claim_cleanup_pass(purchases, game_commands):
+            save_purchases(purchases)
 
         now = datetime.now()
         changed_purchases = False
@@ -1255,15 +1615,25 @@ def expire_old_purchases():
                     purchase["delivery_note"] = f"Expired after {PURCHASE_TIMEOUT_MINUTES} minutes"
                     changed_purchases = True
 
-            elif status in {"CLAIM_SEQUENCE_QUEUED", "PRECHECK_QUEUED", "PRECHECK_VERIFYING", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}:
+            elif str(status).upper() == "CLAIMING":
                 claimed_at = parse_dt(purchase.get("claimed_at", "")) or parse_dt(purchase.get("time", ""))
                 if not claimed_at:
                     continue
 
-                if now - claimed_at >= timedelta(minutes=CLAIM_QUEUE_TIMEOUT_MINUTES):
-                    if purchase.get("timeout_reason") == "claim_queue_timeout":
+                if now - claimed_at >= timedelta(minutes=3):
+                    if purchase.get("timeout_reason") == "simple_claim_timeout":
                         continue
-                    log_info("CLAIM TIMEOUT", f"purchase timed out steam={steam_id} item={item}")
+                    claim_group_id = str(purchase.get("claim_group_id", "")).strip()
+                    age_seconds = int((now - claimed_at).total_seconds())
+                    command_summary = get_claim_group_command_summary(game_commands, claim_group_id)
+                    log_info(
+                        "CLAIM TIMEOUT",
+                        f"state={status} group={claim_group_id or 'none'} purchase_id={purchase.get('id', 'unknown')} "
+                        f"steam={steam_id} item={item} age_seconds={age_seconds} "
+                        f"pending_commands={command_summary['pending_or_executing']} "
+                        f"failed_or_skipped={command_summary['failed_or_skipped']} "
+                        f"status_counts={command_summary['status_counts']}",
+                    )
                     expired_count = expire_claim_commands_for_purchase(game_commands, purchase)
                     if expired_count > 0:
                         changed_commands = True
@@ -1274,16 +1644,20 @@ def expire_old_purchases():
                         changed_data = True
                         log_info("CLAIM TIMEOUT", f"refunded {int(purchase.get('refund_amount', 0) or 0)} energy steam={steam_id}")
 
-                    timeout_note = "⚠️ Claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
+                    timeout_note = "⚠️ Claim timed out while processing. Your energy has been refunded. Please run /claim again."
                     purchase["status"] = "FAILED"
                     purchase["delivery_note"] = timeout_note
                     purchase["failure_note"] = timeout_note
-                    purchase["timeout_reason"] = "claim_queue_timeout"
+                    purchase["timeout_reason"] = "simple_claim_timeout"
 
                     if not purchase.get("timeout_notified"):
                         notify_claim_timeout_refund(steam_id, timeout_note)
                         purchase["timeout_notified"] = True
                     changed_purchases = True
+            elif str(status).upper() in {"READY_TO_CLAIM", "PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_SEND", "CLAIM_WAIT", "FINAL_VERIFY"}:
+                purchase["status"] = "FAILED"
+                purchase["delivery_note"] = "Old claim flow retired. Please use /claim again."
+                changed_purchases = True
 
         # Timeout behavior examples:
         # - queued claim >2 minutes -> FAILED + refunded + notified + related commands expired.
@@ -1302,23 +1676,21 @@ def expire_old_purchases():
 def has_open_purchase(steam_id: str) -> bool:
     purchases = load_purchases()
     return any(
-        p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES
+        p.get("steam_id") == steam_id and is_simple_open_purchase_status(p.get("status", ""))
         for p in purchases
     )
 
 
-def get_claimable_purchase_index(purchases, steam_id: str):
+def get_latest_unclaimed_purchase_index(purchases, steam_id: str):
     for i in range(len(purchases) - 1, -1, -1):
         p = purchases[i]
-        if p.get("steam_id") == steam_id and p.get("status") in {"UNCLAIMED", "WRONG_DINO"}:
-            return i, p.get("status")
+        if str(p.get("steam_id")) == str(steam_id) and str(p.get("status", "")).upper() == "UNCLAIMED":
+            return i
+    return None
 
-    for i in range(len(purchases) - 1, -1, -1):
-        p = purchases[i]
-        if p.get("steam_id") == steam_id and p.get("status") in CLAIM_PRECHECK_STATES.union({"PRECHECK_VERIFYING", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING", "PRECHECK_PASSED"}):
-            return i, p.get("status")
 
-    return None, None
+def is_simple_open_purchase_status(status: str) -> bool:
+    return str(status or "").upper() in {"UNCLAIMED", "CLAIMING"}
 
 
 def get_online_players_from_data():
@@ -1726,7 +2098,7 @@ def log_limited(key: str, interval_seconds: float, tag: str, msg: str, level: st
 # [STARTUP] Bot logged in
 # [ADMIN BOT] ONLINE
 # [TRACKING] Players online: 1
-# JJoness290 | 76561198798435427 | session=43 mins | total=570 mins | energy=1666
+# JJoness290 | 76561198721331299 | session=43 mins | total=570 mins | energy=1666
 # [CLAIM TIMEOUT] refunded 25 energy steam=...
 
 
@@ -1738,10 +2110,14 @@ def get_bot_presence_config():
     if not isinstance(section, dict):
         section = {}
 
-    env_player_name = str(os.getenv("BOT_PLAYER_NAME", "") or "").strip()
-    env_steam_id = str(os.getenv("BOT_STEAM_ID", "") or "").strip()
-    cfg_player_name = str(section.get("player_name", config.get("bot_player_name", "")) or "").strip()
-    cfg_steam_id = str(section.get("steam_id", config.get("bot_steam_id", "")) or "").strip()
+    bot_presence = {
+        "player_name": ADMIN_BOT_PLAYER_NAME,
+        "steam_id": ADMIN_BOT_STEAM_ID,
+    }
+    env_player_name = str(os.getenv("BOT_PLAYER_NAME", bot_presence["player_name"]) or "").strip()
+    env_steam_id = str(os.getenv("BOT_STEAM_ID", bot_presence["steam_id"]) or "").strip()
+    cfg_player_name = str(section.get("player_name", config.get("bot_player_name", bot_presence["player_name"])) or "").strip()
+    cfg_steam_id = str(section.get("steam_id", config.get("bot_steam_id", bot_presence["steam_id"])) or "").strip()
 
     return {
         "player_name": env_player_name if env_player_name else cfg_player_name,
@@ -1760,12 +2136,12 @@ def get_bot_presence_config():
 
 def get_bot_sustain_config():
     section = ConfigManager.get_section("bot_sustain")
-    commands = section.get("commands", ["/heal 100", "/hunger 100", "/thirst 100"])
+    commands = section.get("commands", ["/health 100", "/hunger 100", "/thirst 100"])
     if not isinstance(commands, list) or not commands:
-        commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+        commands = ["/health 100", "/hunger 100", "/thirst 100"]
     normalized = [str(x).strip() for x in commands if str(x).strip()]
     if len(normalized) != 3:
-        normalized = ["/heal 100", "/hunger 100", "/thirst 100"]
+        normalized = ["/health 100", "/hunger 100", "/thirst 100"]
     return {
         "enabled": bool(section.get("enabled", True)),
         "interval_seconds": int(os.getenv("BOT_SUSTAIN_INTERVAL_SECONDS", section.get("interval_seconds", 600)) or 600),
@@ -1849,13 +2225,13 @@ def _fmt_ts(ts_value):
 def is_any_claim_waiting_for_precheck() -> bool:
     with ECONOMY_LOCK:
         purchases = load_purchases()
-    return any(str(p.get("status", "")).upper() == "PRECHECK_VERIFYING" for p in purchases)
+    return any(str(p.get("claim_state") or p.get("status", "")).upper() == "PRECHECK_VERIFY" for p in purchases)
 
 
 def is_any_claim_waiting_for_final_verify() -> bool:
     with ECONOMY_LOCK:
         purchases = load_purchases()
-    return any(str(p.get("status", "")).upper() == "FINAL_VERIFY_PENDING" for p in purchases)
+    return any(str(p.get("claim_state") or p.get("status", "")).upper() == "FINAL_VERIFY" for p in purchases)
 
 
 def has_active_claim_verification_work() -> bool:
@@ -2011,9 +2387,7 @@ def queue_priority_commands(commands: list[dict]):
 def queue_sustain_commands():
     cfg = get_bot_sustain_config()
     now_iso = datetime.now(timezone.utc).isoformat()
-    sustain_commands = cfg["commands"]
-    if len(sustain_commands) != 3:
-        sustain_commands = ["/heal 100", "/hunger 100", "/thirst 100"]
+    sustain_commands = ["/health 100", "/hunger 100", "/thirst 100"]
     batch_id = f"sustain_{int(time.time())}"
     payload = []
     for i, cmd in enumerate(sustain_commands, start=1):
@@ -2029,20 +2403,21 @@ def queue_sustain_commands():
             "claim_step": i,
             "claim_final": i == len(sustain_commands),
             "claim_phase": "SUSTAIN",
-            "command_type": "sustain",
+            "command_type": "sustain_command",
+            "sustain_batch_id": batch_id,
             "priority": 10,
             "requires_bot_in_game": True,
             "max_age_seconds": cfg["interval_seconds"] * 2,
         })
     queue_priority_commands(payload)
-    log_info("BOT SUSTAIN", f"queued {len(payload)} commands")
+    print(f"[SUSTAIN] queued batch id={batch_id} count={len(payload)}")
 
 
 def has_pending_sustain_commands() -> bool:
     with ECONOMY_LOCK:
         commands = load_game_commands()
     for entry in commands:
-        if str(entry.get("command_type", "")).lower() != "sustain":
+        if str(entry.get("command_type", "")).lower() not in {"sustain", "sustain_command"}:
             continue
         status = str(entry.get("status", "")).upper()
         if status in {"PENDING", "EXECUTING"}:
@@ -2050,15 +2425,52 @@ def has_pending_sustain_commands() -> bool:
     return False
 
 
+def cleanup_stale_sustain_commands(max_age_seconds: int = 30) -> int:
+    cleaned = 0
+    now = datetime.now(timezone.utc)
+    with ECONOMY_LOCK:
+        commands = load_game_commands()
+        changed = False
+        for entry in commands:
+            if str(entry.get("command_type", "")).lower() not in {"sustain", "sustain_command"}:
+                continue
+            if str(entry.get("status", "")).upper() not in {"PENDING", "EXECUTING"}:
+                continue
+            base_dt = parse_dt(str(entry.get("started_at") or entry.get("created_at") or ""))
+            if not base_dt:
+                continue
+            if base_dt.tzinfo is None:
+                age_seconds = (datetime.now() - base_dt).total_seconds()
+            else:
+                age_seconds = (now - base_dt).total_seconds()
+            if age_seconds <= max_age_seconds:
+                continue
+            entry["status"] = "FAILED"
+            entry["completed_at"] = now.isoformat()
+            entry["error"] = "Stale sustain command cleaned up automatically"
+            cleaned += 1
+            changed = True
+        if changed:
+            save_game_commands(commands)
+    return cleaned
+
+
 def try_queue_sustain(now_ts: float, cfg_sustain: dict, immediate: bool = False) -> bool:
+    cleaned_count = cleanup_stale_sustain_commands(max_age_seconds=30)
+    if cleaned_count > 0:
+        print(f"[SUSTAIN] cleaned stale commands count={cleaned_count}")
+    if str(load_json(STATE_FILE, {}).get("bot_presence_state", "")).upper() != BOT_STATE_IN_GAME:
+        print("[SUSTAIN] skipped (bot not in game)")
+        return False
     if has_pending_sustain_commands():
-        log_limited("sustain_skipped_pending", 30, "BOT SUSTAIN", "skipped (already pending)")
+        print("[SUSTAIN] skipped (already pending)")
         return False
     interval = int(cfg_sustain.get("interval_seconds", 600) or 600)
     last_sustain_at = float(bot_runtime_state.get("last_sustain_at", 0.0) or 0.0)
     if (not immediate) and last_sustain_at > 0 and (now_ts - last_sustain_at) < interval:
-        log_limited("sustain_skipped_interval", 30, "BOT SUSTAIN", "skipped (interval not reached)")
+        print("[SUSTAIN] skipped (interval not reached)")
         return False
+    print("[SUSTAIN] due")
     queue_sustain_commands()
     bot_runtime_state["last_sustain_at"] = now_ts
     return True
@@ -2575,9 +2987,31 @@ async def process_bot_presence_and_recovery(snapshot: dict):
     if warmup_active and (not bot_runtime_state.get("startup_warmup_complete_logged", False)):
         log_startup_warmup_banner_once()
 
-    effective = get_effective_admin_bot_status(snapshot=snapshot, poll_success=poll_success, now_ts=now)
-    effective_status = str(effective.get("status", "OFFLINE")).upper()
-    source_label = str(effective.get("source", poll_source) or poll_source)
+    last_success = float(bot_runtime_state.get("last_player_poll_success_at", 0) or 0)
+    last_players = normalize_players_map(bot_runtime_state.get("last_successful_players", {}))
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    bot_steam = ADMIN_BOT_STEAM_ID
+    bot_in_last_snapshot = bot_steam in last_players
+    time_since_success = now - last_success if last_success else 999999
+
+    if last_poll_ok:
+        if bot_in_last_snapshot:
+            effective_status = "ONLINE"
+            print("[ADMIN BOT] confirmed ONLINE via successful poll")
+        else:
+            effective_status = "OFFLINE"
+            print("[ADMIN BOT] confirmed OFFLINE via successful poll (bot missing)")
+    else:
+        if bot_in_last_snapshot and time_since_success <= PRESENCE_STALE_SECONDS:
+            effective_status = "ONLINE"
+            print(f"[ADMIN BOT] poll failed; keeping ONLINE (last seen {int(time_since_success)}s ago)")
+        elif bot_in_last_snapshot:
+            effective_status = "UNKNOWN"
+            print(f"[ADMIN BOT] presence stale ({int(time_since_success)}s); state=UNKNOWN")
+        else:
+            effective_status = "UNKNOWN"
+            print("[ADMIN BOT] poll failed with no recent confirmation; state=UNKNOWN")
+    source_label = poll_source
 
     if effective_status == "ONLINE":
         bot_runtime_state["admin_bot_state"] = "ONLINE"
@@ -2599,18 +3033,16 @@ async def process_bot_presence_and_recovery(snapshot: dict):
             log_info("BOT SUSTAIN", "immediate sustain on ONLINE transition")
             try_queue_sustain(now, cfg_sustain, immediate=True)
             await refresh_admin_dashboard(force=True)
-        if effective.get("matched_steam_id"):
-            log_debug("PRESENCE", f"matched steam_id={effective.get('matched_steam_id')} name={effective.get('matched_name')}", flag="debug_presence")
     else:
-        if effective_status == "GRACE":
-            bot_runtime_state["admin_bot_state"] = "GRACE"
-            bot_runtime_state["presence_state"] = BOT_STATE_IN_GAME
+        if effective_status == "UNKNOWN":
+            bot_runtime_state["admin_bot_state"] = "UNKNOWN"
+            bot_runtime_state["presence_state"] = BOT_STATE_WAITING_SERVER
             bot_runtime_state["missing_since"] = None
             bot_runtime_state["last_detection_source"] = "Unknown"
-            admin_runtime_state["last_alert_summary"] = "Grace period active"
-            if previous_state != "GRACE":
+            admin_runtime_state["last_alert_summary"] = "Admin bot state unknown"
+            if previous_state != "UNKNOWN":
                 await refresh_admin_dashboard(force=True)
-            log_limited("presence_grace", 30, "ADMIN BOT", "GRACE period active")
+            log_limited("presence_unknown", 30, "ADMIN BOT", "state UNKNOWN (poll failure / stale snapshot)", level="warn")
         else:
             bot_runtime_state["admin_bot_state"] = "OFFLINE"
             bot_runtime_state["presence_state"] = BOT_STATE_MISSING
@@ -2654,52 +3086,86 @@ def parse_rcon_playerlist(raw_text: str):
             return True
         noise_prefixes = (
             "[debug]",
+            "[info",
+            "[warn",
+            "[error",
             "tcp connection established with server",
             "sending:",
             "password accepted",
             "connected to",
-            "[info",
+            "auth success",
+            "response length",
         )
         return any(lowered.startswith(prefix) for prefix in noise_prefixes)
 
+    def _is_valid_steam_id(value: str) -> bool:
+        v = str(value or "").strip()
+        return v.isdigit() and len(v) >= 17
+
+    def _split_csv_tokens(line: str) -> list[str]:
+        return [token.strip() for token in str(line or "").strip().strip(",").split(",") if token.strip()]
+
     cleaned_lines = []
     for raw_line in str(raw_text or "").splitlines():
-        line = str(raw_line or "").strip().rstrip(",").strip()
+        line = str(raw_line or "").strip()
         if not line:
-            continue
-        if line.lower() == "playerlist":
             continue
         if _is_noise_line(line):
             continue
-        cleaned_lines.append(line)
+        if line.lower().strip(",") == "playerlist":
+            continue
+        cleaned_lines.append(line.strip())
 
-    players = {}
+    # FORMAT A: line pairs
+    players_line_pairs: dict[str, str] = {}
     pending_steam_id = None
-
     for line in cleaned_lines:
-        line = line.strip().rstrip(",")
-
-        if not line or line.lower() == "playerlist":
+        normalized = line.strip().strip(",")
+        if not normalized:
             continue
-
-        # Steam ID line
-        if line.isdigit() and len(line) >= 17:
-            pending_steam_id = line
+        if _is_valid_steam_id(normalized):
+            pending_steam_id = normalized
             continue
-
-        # Name line
         if pending_steam_id:
-            players[pending_steam_id] = line
-            log_debug("RCON", f"paired steam_id={pending_steam_id} with name={line}", flag="debug_rcon")
+            # Skip likely CSV name rows so we don't false-parse format B here.
+            csv_name_tokens = _split_csv_tokens(normalized)
+            if len(csv_name_tokens) >= 2:
+                pending_steam_id = None
+                continue
+            players_line_pairs[pending_steam_id] = normalized
             pending_steam_id = None
 
-    log_debug("RCON", f"parsed players: {players}", flag="debug_rcon")
-    if not players:
-        log_debug("RCON", "playerlist parsed empty", flag="debug_rcon")
-        for i, l in enumerate(cleaned_lines[:10]):
-            log_debug("RCON", f"cleaned[{i}]={l}", flag="debug_rcon")
+    if players_line_pairs:
+        print("[RCON PARSE] detected format=line_pairs")
+        log_debug("RCON", f"parsed players: {players_line_pairs}", flag="debug_rcon")
+        return players_line_pairs
 
-    return players
+    # FORMAT B: CSV (ids row, names row)
+    for i in range(len(cleaned_lines) - 1):
+        id_tokens = _split_csv_tokens(cleaned_lines[i])
+        if not id_tokens:
+            continue
+        if not all(_is_valid_steam_id(token) for token in id_tokens):
+            continue
+        name_tokens = _split_csv_tokens(cleaned_lines[i + 1])
+        if not name_tokens:
+            continue
+        players_csv = {}
+        for steam_id, player_name in zip(id_tokens, name_tokens):
+            sid = str(steam_id).strip()
+            pname = str(player_name).strip()
+            if _is_valid_steam_id(sid) and pname:
+                players_csv[sid] = pname
+        if players_csv:
+            print("[RCON PARSE] detected format=csv")
+            log_debug("RCON", f"parsed players: {players_csv}", flag="debug_rcon")
+            return players_csv
+
+    print("[RCON PARSE WARNING] no players parsed")
+    log_debug("RCON", "playerlist parsed empty", flag="debug_rcon")
+    for i, l in enumerate(cleaned_lines[:10]):
+        log_debug("RCON", f"cleaned[{i}]={l}", flag="debug_rcon")
+    return {}
 
 
 def is_usable_rcon_playerlist_output(raw_text: str) -> bool:
@@ -2761,8 +3227,6 @@ def get_rcon_playerlist():
     raw_players = parse_rcon_playerlist("\n".join(raw_cleaned_lines)) if raw_cleaned_lines else {}
     if raw_players:
         return _build_success(raw_players, "RCON_RAW")
-    if raw_cleaned_lines and (not _has_transport_error(raw_text)):
-        return _build_success({}, "RCON_RAW")
 
     fallback_text = ""
     fallback_error = ""
@@ -3043,14 +3507,18 @@ def find_purchase_by_group(purchases, claim_group_id: str):
     return None
 
 
-def has_pending_group_commands(commands_data, claim_group_id: str):
+def get_group_commands(game_commands, claim_group_id: str, claim_attempt_id: str | None = None):
     if not claim_group_id:
-        return False
-    return any(
-        c.get("claim_group_id") == claim_group_id
-        and c.get("status") in {"PENDING", "EXECUTING"}
-        for c in commands_data
-    )
+        return []
+    selected = []
+    for command_entry in game_commands:
+        if command_entry.get("claim_group_id") != claim_group_id:
+            continue
+        if claim_attempt_id and str(command_entry.get("claim_attempt_id", "")) != str(claim_attempt_id):
+            continue
+        selected.append(command_entry)
+    selected.sort(key=lambda c: (int(c.get("step_index", c.get("claim_step", 9999))), str(c.get("id", ""))))
+    return selected
 
 
 def find_existing_active_claim_group_id(commands_data, steam_id: str, item: str):
@@ -3066,34 +3534,47 @@ def find_existing_active_claim_group_id(commands_data, steam_id: str, item: str)
     return None
 
 
-def all_group_steps_done(commands_data, claim_group_id: str, expected_phase: str):
-    group_cmds = [
-        c for c in commands_data
-        if c.get("claim_group_id") == claim_group_id and c.get("claim_phase") == expected_phase
-    ]
+def group_has_pending(game_commands, claim_group_id: str, claim_attempt_id: str | None = None):
+    return any(c.get("status") in {"PENDING", "EXECUTING"} for c in get_group_commands(game_commands, claim_group_id, claim_attempt_id))
+
+
+def group_all_done(game_commands, claim_group_id: str, claim_attempt_id: str | None = None):
+    group_cmds = get_group_commands(game_commands, claim_group_id, claim_attempt_id)
     if not group_cmds:
         return False
-
     return all(c.get("status") == "DONE" for c in group_cmds)
 
 
-def any_group_step_failed(commands_data, claim_group_id: str):
+def group_any_failed(game_commands, claim_group_id: str, claim_attempt_id: str | None = None):
     return any(
-        c.get("claim_group_id") == claim_group_id and c.get("status") == "FAILED"
-        for c in commands_data
+        c.get("status") in {"FAILED", "SKIPPED", "EXPIRED", "CANCELLED"}
+        for c in get_group_commands(game_commands, claim_group_id, claim_attempt_id)
     )
 
 
-def cancel_claim_group_commands(commands_data, claim_group_id: str, reason: str):
+def clear_stale_claim_commands_for_attempt(commands_data, claim_group_id: str, claim_attempt_id: str, reason: str):
     changed = False
     for command_entry in commands_data:
         if command_entry.get("claim_group_id") != claim_group_id:
             continue
-        if command_entry.get("status") in {"PENDING", "EXECUTING"}:
+        if str(command_entry.get("claim_attempt_id", "")) != str(claim_attempt_id):
+            continue
+        if command_entry.get("status") in {"PENDING", "EXECUTING", "FAILED", "SKIPPED", "EXPIRED"}:
             command_entry["status"] = "CANCELLED"
             command_entry["completed_at"] = str(datetime.now())
             command_entry["error"] = reason
             changed = True
+    return changed
+
+
+def recover_orphaned_executing_commands(commands_data):
+    changed = False
+    for command_entry in commands_data:
+        if str(command_entry.get("status", "")).upper() != "EXECUTING":
+            continue
+        command_entry["status"] = "PENDING"
+        command_entry["error"] = "Recovered stale EXECUTING command during startup/orchestration."
+        changed = True
     return changed
 
 
@@ -3107,9 +3588,13 @@ def refund_purchase_energy_if_needed(purchase, reason_suffix: str):
     if price is None:
         return False
 
-    ok, _, _ = refund_player_energy(steam_id, int(price), reason=f"Purchase refund ({item})")
+    ok, before_energy, after_energy = refund_player_energy(steam_id, int(price), reason=f"Purchase refund ({item})")
     if not ok:
         return False
+    print(
+        f"[CLAIM REFUND] purchase_id={purchase.get('id', 'unknown')} reason={reason_suffix} "
+        f"steam={steam_id} amount={int(price)} before={before_energy} after={after_energy}"
+    )
 
     purchase["refund_applied"] = True
     purchase["refund_amount"] = int(price)
@@ -3121,229 +3606,287 @@ def refund_purchase_energy_if_needed(purchase, reason_suffix: str):
 def fail_purchase_with_refund(purchase: dict, status: str, delivery_note: str, failure_note: str):
     if purchase.get("status") == "DELIVERED":
         return False
+    print(
+        f"[CLAIM FAIL] purchase_id={purchase.get('id', 'unknown')} "
+        f"state={purchase.get('claim_state') or purchase.get('status')} reason={failure_note}"
+    )
     refund_purchase_energy_if_needed(purchase, delivery_note)
-    if status not in {"FAILED", "CANCELLED_TIMEOUT"}:
+    if status not in {"FAILED", "CANCELLED_TIMEOUT", "WRONG_DINO_REFUNDED"}:
         status = "FAILED"
+    set_claim_state(purchase, status)
     set_purchase_status(purchase, status, delivery_note, failure_note)
     return True
 
 
-def queue_claim_phase_commands(purchase, player_name: str, phase: str):
-    game_commands = load_game_commands()
-    next_id = get_next_command_id(game_commands)
-    steam_id = purchase["steam_id"]
-    item = str(purchase.get("item", "")).lower().strip()
-    claim_group_id = purchase.get("claim_group_id")
-
-    precheck_default = ["/health {steam_id} 100"]
-    pre_grow_default = [
-        "/diet1 {steam_id} 100",
-        "/diet2 {steam_id} 100",
-        "/diet3 {steam_id} 100",
-        "/health {steam_id} 100",
-    ]
-    claim_default = [
-        "/growth {steam_id} 65",
-        "/diet1 {steam_id} 100",
-        "/diet2 {steam_id} 100",
-        "/diet3 {steam_id} 100",
-        "/hunger {steam_id} 100",
-        "/health {steam_id} 100",
-    ]
-
-    if phase == "PRECHECK":
-        raw_sequence = ConfigManager.get("claim_precheck_commands", "CLAIM_PRECHECK_COMMANDS", precheck_default)
-    elif phase == "RECOVERY":
-        raw_sequence = ConfigManager.get("claim_recovery_commands", "CLAIM_RECOVERY_COMMANDS", pre_grow_default)
+def set_claim_state(purchase: dict, new_state: str):
+    old_state = str(purchase.get("claim_state", "") or purchase.get("status", "READY_TO_CLAIM"))
+    purchase["claim_state"] = new_state
+    if new_state in {"DELIVERED", "FAILED", "WRONG_DINO_REFUNDED"}:
+        purchase["status"] = new_state
     else:
-        raw_sequence = ConfigManager.get("claim_commands", "CLAIM_COMMANDS", claim_default)
-    if not isinstance(raw_sequence, list) or not raw_sequence:
-        raw_sequence = precheck_default if phase == "PRECHECK" else claim_default
-    sequence = [str(cmd).format(steam_id=steam_id) for cmd in raw_sequence]
+        purchase["status"] = new_state
+    print(
+        f"[CLAIM] state transition steam={purchase.get('steam_id')} purchase_id={purchase.get('id', 'unknown')} "
+        f"old={old_state} new={new_state}"
+    )
+    queue_claim_progress_message_update(purchase)
 
+
+def ensure_claim_identity(purchase: dict):
+    steam_id = str(purchase.get("steam_id") or "").strip()
+    if not purchase.get("claim_attempt_id"):
+        purchase["claim_attempt_id"] = f"attempt_{uuid.uuid4().hex}"
+    if not purchase.get("claim_group_id"):
+        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
+    if not purchase.get("verify_expected_item"):
+        purchase["verify_expected_item"] = str(purchase.get("item", "")).lower().strip()
+    if not purchase.get("verify_expected_steam_id"):
+        purchase["verify_expected_steam_id"] = steam_id
+
+
+def cleanup_broken_active_purchases(purchases: list, game_commands: list):
+    # Old grouped claim cleanup retired.
+    return False
+
+
+def queue_command(game_commands: list, purchase: dict, player_name: str, phase: str, step_index: int, command_text: str):
+    claim_group_id = purchase.get("claim_group_id")
+    claim_attempt_id = purchase.get("claim_attempt_id")
+    if not claim_group_id or not claim_attempt_id:
+        print(
+            f"[CLAIM ERROR] refusing to queue ungrouped claim command purchase_id={purchase.get('id', 'unknown')} "
+            f"phase={phase} cmd={command_text}"
+        )
+        raise RuntimeError("Missing claim identity for claim command")
+    next_id = get_next_command_id(game_commands)
+    command_id = f"cmd_{next_id:03d}"
+    game_commands.append({
+        "id": command_id,
+        "claim_attempt_id": claim_attempt_id,
+        "claim_group_id": claim_group_id,
+        "phase": phase,
+        "claim_phase": phase,
+        "step_index": step_index,
+        "claim_step": step_index,
+        "steam_id": purchase.get("steam_id"),
+        "player_name": player_name,
+        "item": str(purchase.get("item", "")).lower().strip(),
+        "command": command_text,
+        "status": "PENDING",
+        "created_at": str(datetime.now()),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "command_type": "claim_command",
+    })
+    return command_id
+
+
+def queue_precheck_command(game_commands: list, purchase, player_name: str):
+    steam_id = purchase["steam_id"]
+    command_text = f"/health {steam_id} 100"
+    cmd_id = queue_command(game_commands, purchase, player_name, "PRECHECK", 1, command_text)
+    purchase["active_command_ids"] = [cmd_id]
+    return cmd_id
+
+
+def queue_claim_commands(game_commands: list, purchase, player_name: str):
+    steam_id = purchase["steam_id"]
+    sequence = [
+        f"/growth {steam_id} 65",
+        f"/diet1 {steam_id} 100",
+        f"/diet2 {steam_id} 100",
+        f"/diet3 {steam_id} 100",
+        f"/hunger {steam_id} 100",
+        f"/health {steam_id} 100",
+    ]
+    active_ids = []
     for idx, command_text in enumerate(sequence, start=1):
-        game_commands.append({
-            "id": f"cmd_{next_id + idx - 1:03d}",
-            "steam_id": steam_id,
-            "player_name": player_name,
-            "item": item,
-            "command": command_text,
-            "status": "PENDING",
-            "created_at": str(datetime.now()),
-            "completed_at": None,
-            "claim_group_id": claim_group_id,
-            "claim_step": idx,
-            "claim_final": idx == len(sequence),
-            "claim_phase": phase,
-            "command_type": "recovery_command" if phase == "RECOVERY" else "claim_command",
-        })
+        active_ids.append(queue_command(game_commands, purchase, player_name, "CLAIM", idx, command_text))
+    purchase["active_command_ids"] = active_ids
+    return active_ids
 
-    save_game_commands(game_commands)
-    return sequence
+
+def complete_purchase_success(purchase: dict, note: str):
+    purchase["delivery_note"] = note
+    purchase["failure_note"] = "Growth confirmed — 100% complete."
+    set_claim_state(purchase, "DELIVERED")
+
+
+def normalize_legacy_claim_purchase(purchase: dict):
+    status = str(purchase.get("status") or "").upper()
+    claim_state = str(purchase.get("claim_state") or "").upper()
+    if claim_state:
+        return
+    if status == "UNCLAIMED":
+        purchase["claim_state"] = "READY_TO_CLAIM"
+    elif status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
+        purchase["claim_state"] = "FAILED"
+        purchase["status"] = "FAILED"
+        purchase["delivery_note"] = purchase.get("delivery_note") or "Legacy claim state normalized. Please run /claim again."
+    elif status in {"DELIVERED", "FAILED", "WRONG_DINO_REFUNDED"}:
+        purchase["claim_state"] = status
+
+
+def run_claim_cleanup_pass(purchases: list, game_commands: list):
+    # Old grouped claim cleanup retired.
+    return False
 
 
 def process_claim_orchestration():
+    # Retired for simplified direct /claim flow.
+    return
+    global CLAIM_STARTUP_CLEANUP_DONE
     with ECONOMY_LOCK:
         purchases = load_purchases()
         game_commands = load_game_commands()
         changed_purchases = False
         changed_commands = False
+        if recover_orphaned_executing_commands(game_commands):
+            changed_commands = True
+        if run_claim_cleanup_pass(purchases, game_commands):
+            changed_purchases = True
+        CLAIM_STARTUP_CLEANUP_DONE = True
 
         for purchase in purchases:
-            status = purchase.get("status")
+            status = str(purchase.get("claim_state") or purchase.get("status") or "").upper()
             claim_group_id = purchase.get("claim_group_id")
+            claim_attempt_id = purchase.get("claim_attempt_id")
             steam_id = purchase.get("steam_id")
             item = str(purchase.get("item", "")).lower().strip()
-
-            if status == "PRECHECK_QUEUED" and claim_group_id:
-                if any_group_step_failed(game_commands, claim_group_id):
-                    fail_purchase_with_refund(
-                        purchase,
-                        "FAILED",
-                        "Claim failed. Points refunded.",
-                        "Claim failed. Points refunded.",
-                    )
-                    changed_purchases = True
-                    continue
-
-                if has_pending_group_commands(game_commands, claim_group_id):
-                    continue
-
-                if all_group_steps_done(game_commands, claim_group_id, "PRECHECK"):
-                    set_purchase_status(purchase, "PRECHECK_VERIFYING")
-                    purchase["precheck_verify_started_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Verification in progress — 35% complete."
-                    changed_purchases = True
+            purchase_id = purchase.get("id", "unknown")
+            if status not in CLAIM_ACTIVE_STATES:
                 continue
 
-            if status == "PRECHECK_VERIFYING" and claim_group_id:
-                verify_started_at = parse_dt(purchase.get("precheck_verify_started_at"))
-                verify_start_ts = time.time()
-                elapsed_secs = 0
-                if verify_started_at:
-                    elapsed_secs = max(0, int((datetime.now() - verify_started_at).total_seconds()))
-                max_attempts = max(1, PRECHECK_VERIFY_TIMEOUT_SECONDS)
-                attempt_no = min(max_attempts, elapsed_secs + 1)
-                print(f"[CLAIM] precheck verify attempt {attempt_no}/{max_attempts}")
-                precheck_log = get_latest_health_log_for_steam(steam_id)
-                if not precheck_log:
-                    print(f"[CLAIM] waiting for health log for steam_id={steam_id}")
-                    if verify_started_at and (datetime.now() - verify_started_at).total_seconds() >= PRECHECK_VERIFY_TIMEOUT_SECONDS:
-                        fail_purchase_with_refund(
-                            purchase,
-                            "FAILED",
-                            "Verification timed out. Points refunded.",
-                            "Verification timed out. Points refunded.",
-                        )
-                        print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
-                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (pre-check)")
+            if status == "READY_TO_CLAIM":
+                set_claim_state(purchase, "PRECHECK_SEND")
+                purchase["last_progress_note"] = "Claim queued"
+                changed_purchases = True
+                continue
+
+            if status == "PRECHECK_SEND":
+                player_name = purchase.get("player") or "Unknown"
+                ensure_claim_identity(purchase)
+                purchase["precheck_started_at"] = str(datetime.now())
+                purchase["precheck_queued_at"] = purchase["precheck_started_at"]
+                cmd_id = queue_precheck_command(game_commands, purchase, player_name)
+                print(f"[CLAIM] queued precheck command purchase_id={purchase_id} command_id={cmd_id}")
+                set_claim_state(purchase, "PRECHECK_WAIT")
+                changed_commands = True
+                changed_purchases = True
+                continue
+
+            if status == "PRECHECK_WAIT":
+                group_cmds = get_group_commands(game_commands, claim_group_id, claim_attempt_id)
+                if not group_cmds:
+                    queued_at = parse_dt(purchase.get("precheck_queued_at")) or parse_dt(purchase.get("precheck_started_at"))
+                    if queued_at and (datetime.now() - queued_at).total_seconds() > 3:
+                        print(f"[CLAIM ERROR] no grouped commands found for active purchase purchase_id={purchase_id} state={status}")
+                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run /claim again.", "broken_precheck_group_missing")
+                        purchase["timeout_reason"] = "broken_precheck_group_missing"
                         changed_purchases = True
                     continue
+                pending_count = sum(1 for c in group_cmds if c.get("status") in {"PENDING", "EXECUTING"})
+                if pending_count > 0:
+                    print(f"[CLAIM] waiting on command group={claim_group_id} attempt={claim_attempt_id} pending={pending_count}")
+                    if parse_dt(purchase.get("precheck_started_at")) and (datetime.now() - parse_dt(purchase.get("precheck_started_at"))).total_seconds() > PRECHECK_TOTAL_TIMEOUT_SECONDS:
+                        print(f"[CLAIM TIMEOUT] purchase_id={purchase_id} state={status} reason=precheck_command_timeout")
+                        fail_purchase_with_refund(purchase, "FAILED", "Pre-check timed out. Points refunded.", "Pre-check timed out.")
+                        purchase["timeout_reason"] = "precheck_command_timeout"
+                        changed_purchases = True
+                    continue
+                if group_any_failed(game_commands, claim_group_id, claim_attempt_id):
+                    fail_purchase_with_refund(purchase, "FAILED", "Claim command failed. Points refunded.", "Claim command failed.")
+                    changed_purchases = True
+                    continue
+                set_claim_state(purchase, "PRECHECK_VERIFY")
+                changed_purchases = True
+                continue
 
-                if not classes_match(item, precheck_log["class_name"]):
-                    reason = f"Claim blocked: expected {item}, detected class {precheck_log['class_name']}."
-                    cancel_reason = f"Claim group cancelled: wrong dino detected ({precheck_log['class_name']})"
-                    if cancel_claim_group_commands(game_commands, claim_group_id, cancel_reason):
-                        changed_commands = True
-                    refund_purchase_energy_if_needed(purchase, reason)
-                    set_purchase_status(
+            if status == "PRECHECK_VERIFY":
+                since_dt = parse_dt(purchase.get("precheck_started_at"))
+                precheck_log = get_fresh_health_log_for_steam(steam_id, since_dt)
+                if not precheck_log:
+                    print(f"[CLAIM] waiting for fresh health log steam={steam_id}")
+                    if since_dt and (datetime.now() - since_dt).total_seconds() > PRECHECK_TOTAL_TIMEOUT_SECONDS:
+                        print(f"[CLAIM TIMEOUT] purchase_id={purchase_id} state={status} reason=precheck_verify_timeout")
+                        fail_purchase_with_refund(purchase, "FAILED", "Verification timed out. Points refunded.", "Verification timed out.")
+                        purchase["timeout_reason"] = "precheck_verify_timeout"
+                        changed_purchases = True
+                    continue
+                if not classes_match(item, precheck_log.get("class_name", "")):
+                    print(f"[CLAIM] wrong dino detected expected={item} actual={precheck_log.get('class_name')}")
+                    fail_purchase_with_refund(
                         purchase,
                         "WRONG_DINO_REFUNDED",
                         "Wrong dinosaur detected. Your points were refunded.",
-                        f"{reason} Energy refunded.",
+                        "Wrong dinosaur detected. Your points were refunded.",
                     )
-                    print(f"[CLAIM] wrong dino detected expected={item} actual={precheck_log['class_name']}")
-                    print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
                     changed_purchases = True
                     continue
-
-                set_purchase_status(purchase, "PRECHECK_PASSED")
-                purchase["delivery_note"] = (
-                    "Verification passed. Growth queued — 75% complete."
-                )
-                purchase["failure_note"] = "Verification passed. Growth queued."
-                print(f"[CLAIM VERIFY] Pre-check passed for {steam_id} on class {precheck_log['class_name']}")
-                print(f"[CLAIM] precheck verify duration={time.time() - verify_start_ts:.3f}s")
+                set_claim_state(purchase, "CLAIM_SEND")
                 changed_purchases = True
-
-                player_name = purchase.get("player") or "Unknown"
-                if ConfigManager.get_bool("claim_use_recovery_chain", "CLAIM_USE_RECOVERY_CHAIN", True):
-                    queue_claim_phase_commands(purchase, player_name, "RECOVERY")
-                queue_claim_phase_commands(purchase, player_name, "CLAIM")
-                set_purchase_status(purchase, "CLAIM_SEQUENCE_QUEUED")
-                purchase["delivery_note"] = "Growth queued — 75% complete."
-                changed_purchases = True
-                game_commands = load_game_commands()
                 continue
 
-            if status == "CLAIM_SEQUENCE_QUEUED" and claim_group_id:
-                if any_group_step_failed(game_commands, claim_group_id):
-                    fail_purchase_with_refund(
-                        purchase,
-                        "FAILED",
-                        "Claim failed. Points refunded.",
-                        "Claim failed. Points refunded.",
-                    )
-                    changed_purchases = True
-                    continue
+            if status == "CLAIM_SEND":
+                player_name = purchase.get("player") or "Unknown"
+                ensure_claim_identity(purchase)
+                purchase["claim_started_at"] = str(datetime.now())
+                purchase["claim_queued_at"] = purchase["claim_started_at"]
+                command_ids = queue_claim_commands(game_commands, purchase, player_name)
+                print(f"[CLAIM] queued claim chain purchase_id={purchase_id} count={len(command_ids)}")
+                set_claim_state(purchase, "CLAIM_WAIT")
+                changed_commands = True
+                changed_purchases = True
+                continue
 
-                if has_pending_group_commands(game_commands, claim_group_id):
-                    continue
-
-                if all_group_steps_done(game_commands, claim_group_id, "CLAIM"):
-                    set_purchase_status(purchase, "FINAL_VERIFY_PENDING")
-                    purchase["final_verify_started_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Final verification in progress — 90% complete."
-                    changed_purchases = True
-                    continue
-
-            if status == "FINAL_VERIFY_PENDING":
-                final_started_at = parse_dt(purchase.get("final_verify_started_at"))
-                final_start_ts = time.time()
-                final_elapsed_secs = 0
-                if final_started_at:
-                    final_elapsed_secs = max(0, int((datetime.now() - final_started_at).total_seconds()))
-                final_max_attempts = max(1, FINAL_VERIFY_TIMEOUT_SECONDS)
-                final_attempt = min(final_max_attempts, final_elapsed_secs + 1)
-                print(f"[CLAIM] final grow verify attempt {final_attempt}/{final_max_attempts}")
-                grow_log = get_latest_grow_log_for_steam(steam_id)
-                if not grow_log:
-                    print(f"[CLAIM] waiting for grow log for steam_id={steam_id}")
-                    if final_started_at and (datetime.now() - final_started_at).total_seconds() >= FINAL_VERIFY_TIMEOUT_SECONDS:
-                        fail_purchase_with_refund(
-                            purchase,
-                            "FAILED",
-                            "Verification timed out. Points refunded.",
-                            "Verification timed out. Points refunded.",
-                        )
-                        print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
-                        print(f"[CLAIM VERIFY] Verification timed out for {steam_id} (final verify)")
+            if status == "CLAIM_WAIT":
+                group_cmds = get_group_commands(game_commands, claim_group_id, claim_attempt_id)
+                if not group_cmds:
+                    queued_at = parse_dt(purchase.get("claim_queued_at")) or parse_dt(purchase.get("claim_started_at"))
+                    if queued_at and (datetime.now() - queued_at).total_seconds() > 3:
+                        print(f"[CLAIM ERROR] no grouped commands found for active purchase purchase_id={purchase_id} state={status}")
+                        fail_purchase_with_refund(purchase, "FAILED", "Broken claim state cleaned up. Please run /claim again.", "broken_claim_group_missing")
+                        purchase["timeout_reason"] = "broken_claim_group_missing"
                         changed_purchases = True
                     continue
+                pending_count = sum(1 for c in group_cmds if c.get("status") in {"PENDING", "EXECUTING"})
+                if pending_count > 0:
+                    print(f"[CLAIM] waiting on command group={claim_group_id} attempt={claim_attempt_id} pending={pending_count}")
+                    claim_started_at = parse_dt(purchase.get("claim_started_at"))
+                    if claim_started_at and (datetime.now() - claim_started_at).total_seconds() > CLAIM_COMMAND_TIMEOUT_SECONDS:
+                        print(f"[CLAIM TIMEOUT] purchase_id={purchase_id} state={status} reason=claim_command_timeout")
+                        fail_purchase_with_refund(purchase, "FAILED", "Claim timed out. Points refunded.", "Claim timed out.")
+                        purchase["timeout_reason"] = "claim_command_timeout"
+                        changed_purchases = True
+                    continue
+                if group_any_failed(game_commands, claim_group_id, claim_attempt_id):
+                    fail_purchase_with_refund(purchase, "FAILED", "Claim command failed. Points refunded.", "Claim command failed.")
+                    changed_purchases = True
+                    continue
+                if group_all_done(game_commands, claim_group_id, claim_attempt_id):
+                    purchase["final_verify_started_at"] = str(datetime.now())
+                    set_claim_state(purchase, "FINAL_VERIFY")
+                    changed_purchases = True
+                continue
 
+            if status == "FINAL_VERIFY":
+                final_since = parse_dt(purchase.get("final_verify_started_at"))
+                grow_log = get_fresh_grow_log_for_steam(steam_id, final_since)
+                if not grow_log:
+                    print(f"[CLAIM] waiting for fresh grow log steam={steam_id}")
+                    if final_since and (datetime.now() - final_since).total_seconds() > FINAL_VERIFY_TIMEOUT_SECONDS:
+                        print(f"[CLAIM TIMEOUT] purchase_id={purchase_id} state={status} reason=final_verify_timeout")
+                        fail_purchase_with_refund(purchase, "FAILED", "Final verification timed out. Points refunded.", "Final verification timed out.")
+                        purchase["timeout_reason"] = "final_verify_timeout"
+                        changed_purchases = True
+                    continue
                 growth_ok, growth_note = verify_growth_log_for_purchase(purchase, grow_log)
                 if not growth_ok:
-                    max_retries = ConfigManager.get_int("claim_retry_limit", "CLAIM_RETRY_LIMIT", 1, minimum=0)
-                    retries_used = int(purchase.get("retry_count", 0))
-                    if retries_used < max_retries:
-                        purchase["retry_count"] = retries_used + 1
-                        purchase["retry_reason"] = growth_note
-                        purchase["status"] = "PRECHECK_PASSED"
-                        purchase["delivery_note"] = f"Retrying claim ({purchase['retry_count']}/{max_retries})"
-                        changed_purchases = True
-                        continue
-                    fail_purchase_with_refund(
-                        purchase,
-                        "FAILED",
-                        "Claim failed. Points refunded.",
-                        "Claim failed. Points refunded.",
-                    )
-                    print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
+                    fail_purchase_with_refund(purchase, "FAILED", "Final verification failed. Points refunded.", growth_note)
                     changed_purchases = True
                     continue
-
-                set_purchase_status(purchase, "DELIVERED", growth_note, "Growth confirmed — 100% complete.")
-                print(f"[CLAIM] final verify duration={time.time() - final_start_ts:.3f}s")
+                complete_purchase_success(purchase, growth_note)
                 changed_purchases = True
 
         if changed_commands:
@@ -3353,61 +3896,227 @@ def process_claim_orchestration():
 
 
 def process_game_command_queue():
-    # Command execution ownership is handled exclusively by in_game_executor.py.
-    # This bot-side function only orchestrates claim-state transitions from metadata/logs.
-    process_claim_orchestration()
+    # Old queued claim orchestration is retired for simplified direct /claim flow.
+    return
+
+
+def retire_old_claim_flow_purchases(purchases: list):
+    changed = False
+    retired_states = {"READY_TO_CLAIM", "PRECHECK_SEND", "PRECHECK_WAIT", "PRECHECK_VERIFY", "CLAIM_SEND", "CLAIM_WAIT", "FINAL_VERIFY"}
+    for purchase in purchases:
+        claim_state = str(purchase.get("claim_state") or "").upper()
+        if claim_state not in retired_states:
+            continue
+        purchase["claim_state"] = None
+        purchase["status"] = "FAILED"
+        purchase["failed_at"] = str(datetime.now())
+        purchase["delivery_note"] = "Old claim flow retired. Please use /claim again."
+        if not purchase.get("refund_applied"):
+            refund_purchase_energy_if_needed(purchase, "old_flow_retired")
+        changed = True
+    return changed
+
+
+async def execute_game_command_direct(command_text: str, timeout_seconds: int = 12, delay_after: float = 1.0) -> bool:
+    with ECONOMY_LOCK:
+        commands_data = load_game_commands()
+        cmd_id = f"direct_{uuid.uuid4().hex[:10]}"
+        commands_data.append({
+            "id": cmd_id,
+            "command": command_text,
+            "status": "PENDING",
+            "created_at": str(datetime.now()),
+            "completed_at": None,
+            "command_type": "direct_claim",
+        })
+        save_game_commands(commands_data)
+    deadline = time.time() + max(3, int(timeout_seconds))
+    while time.time() < deadline:
+        await asyncio.sleep(0.4)
+        with ECONOMY_LOCK:
+            current = load_game_commands()
+        target = next((c for c in current if str(c.get("id")) == cmd_id), None)
+        if not target:
+            continue
+        status = str(target.get("status", "")).upper()
+        if status == "DONE":
+            await asyncio.sleep(delay_after)
+            return True
+        if status in {"FAILED", "EXPIRED", "SKIPPED", "CANCELLED"}:
+            return False
+    with ECONOMY_LOCK:
+        current = load_game_commands()
+        for cmd in current:
+            if str(cmd.get("id")) == cmd_id and str(cmd.get("status", "")).upper() in {"PENDING", "EXECUTING"}:
+                cmd["status"] = "FAILED"
+                cmd["completed_at"] = str(datetime.now())
+                cmd["error"] = "Direct command timed out waiting for executor completion."
+                save_game_commands(current)
+                break
+    return False
+
+
+async def run_simple_claim_flow(ctx, purchase_index: int, steam_id: str):
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        data = load_json(DATA_FILE, {})
+        if purchase_index is None or purchase_index < 0 or purchase_index >= len(purchases):
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        purchase = purchases[purchase_index]
+        if str(purchase.get("steam_id")) != str(steam_id) or str(purchase.get("status", "")).upper() != "UNCLAIMED":
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        item = str(purchase.get("item", "")).lower().strip()
+        purchase["status"] = "CLAIMING"
+        purchase["claimed_at"] = purchase.get("claimed_at") or str(datetime.now())
+        purchase["delivery_note"] = "Verification in progress"
+        purchase["failure_note"] = None
+        save_purchases(purchases)
+
+    start_embed = discord.Embed(title="🧬 Dino Claim", description="Verifying your dinosaur...", color=discord.Color.blurple())
+    await ctx.send(embed=start_embed)
+
+    clear_cached_health_log_for_steam(steam_id)
+    previous_health_raw = await asyncio.to_thread(get_latest_health_log_raw_for_steam, steam_id)
+    print(
+        f"[CLAIM] baseline health raw captured steam={steam_id} "
+        f"found={'yes' if previous_health_raw else 'no'}"
+    )
+    if not await execute_game_command_direct(f"/health {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    health_log = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        health_log = await asyncio.to_thread(get_fresh_health_log_for_claim, steam_id, previous_health_raw)
+        if health_log:
+            break
+        print(f"[CLAIM] waiting for fresh health log steam={steam_id}")
+        await asyncio.sleep(1)
+    if not health_log:
+        print(
+            f"[CLAIM] health verify timeout steam={steam_id} "
+            f"baseline_found={'yes' if previous_health_raw else 'no'}"
+        )
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed: could not verify your dinosaur in time.", "health_verify_timeout")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not verify your dinosaur in time", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    detected_class = str(health_log.get("class_name", "Unknown"))
+    if not classes_match(item, detected_class):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Wrong dinosaur detected. Energy refunded.", "wrong_dino_detected")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Wrong dinosaur detected", color=discord.Color.red())
+        fail_embed.add_field(name="Expected", value=item.upper(), inline=True)
+        fail_embed.add_field(name="Detected", value=detected_class, inline=True)
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    print(f"[CLAIM CMD] /growth {steam_id} 65")
+    if not await execute_game_command_direct(f"/growth {steam_id} 65", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "growth_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    print(f"[CLAIM CMD] /hunger {steam_id} 100")
+    if not await execute_game_command_direct(f"/hunger {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "hunger_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    print(f"[CLAIM CMD] /diet1 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet1 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet1_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    print(f"[CLAIM CMD] /diet2 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet2 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet2_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    print(f"[CLAIM CMD] /diet3 {steam_id} 100")
+    if not await execute_game_command_direct(f"/diet3 {steam_id} 100", timeout_seconds=12, delay_after=1.0):
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase = purchases[purchase_index]
+            fail_purchase_with_refund(purchase, "FAILED", "Claim failed while applying growth commands. Energy refunded.", "diet3_command_failed")
+            purchase["failed_at"] = str(datetime.now())
+            save_purchases(purchases)
+        fail_embed = discord.Embed(title="❌ Claim Failed", description="Could not complete growth commands.", color=discord.Color.red())
+        fail_embed.add_field(name="Refund", value=f"+{int(purchase.get('refund_amount', 0) or 0)} energy", inline=False)
+        await ctx.send(embed=fail_embed)
+        return
+
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        purchase = purchases[purchase_index]
+        purchase["status"] = "DELIVERED"
+        purchase["claim_state"] = None
+        purchase["claimed_at"] = purchase.get("claimed_at") or str(datetime.now())
+        purchase["delivered_at"] = str(datetime.now())
+        purchase["delivery_note"] = "Claim completed successfully."
+        purchase["failure_note"] = "Claim completed."
+        save_purchases(purchases)
+    success_embed = discord.Embed(title="✅ Claim Complete", description=f"Your {item} has been primed.", color=discord.Color.green())
+    success_embed.add_field(name="Commands applied", value="- Growth set to 65%\n- Hunger restored\n- Diet fully restored", inline=False)
+    await ctx.send(embed=success_embed)
 
 
 def enforce_claim_watchdog_timeout():
-    active_states = {
-        "PRECHECK_QUEUED",
-        "PRECHECK_VERIFYING",
-        "PRECHECK_PASSED",
-        "CLAIM_SEQUENCE_QUEUED",
-        "FINAL_VERIFY_PENDING",
-    }
-    now = datetime.now()
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        game_commands = load_game_commands()
-        changed_purchases = False
-        changed_commands = False
-
-        for purchase in purchases:
-            if purchase.get("status") not in active_states:
-                continue
-
-            started_at = parse_dt(purchase.get("claim_started_at")) or parse_dt(purchase.get("claimed_at")) or parse_dt(purchase.get("time"))
-            if not started_at:
-                purchase["claim_started_at"] = str(now)
-                changed_purchases = True
-                continue
-
-            if (now - started_at).total_seconds() <= CLAIM_ACTIVE_TIMEOUT_SECONDS:
-                continue
-
-            claim_group_id = purchase.get("claim_group_id")
-            if claim_group_id and cancel_claim_group_commands(
-                game_commands,
-                claim_group_id,
-                f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds.",
-            ):
-                changed_commands = True
-
-            timeout_note = f"Claim timed out after {CLAIM_ACTIVE_TIMEOUT_SECONDS} seconds. Points refunded."
-            fail_purchase_with_refund(
-                purchase,
-                "CANCELLED_TIMEOUT",
-                timeout_note,
-                "Claim timed out — points refunded.",
-            )
-            purchase["timeout_at"] = str(now)
-            changed_purchases = True
-
-        if changed_commands:
-            save_game_commands(game_commands)
-        if changed_purchases:
-            save_purchases(purchases)
+    # Old watchdog retired with old claim queue/state machine flow.
+    return
 
 
 async def cache_guild_invites(guild: discord.Guild):
@@ -3504,6 +4213,17 @@ async def on_ready():
     global MAIN_LOOP
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketView())
+    bot.add_view(CloseTicketView())
+    try:
+        print("Syncing commands...")
+        synced = await bot.tree.sync(guild=GUILD)
+        logger.info("Synced %s commands", len(synced))
+        print(f"Synced {len(synced)} commands")
+    except Exception as e:
+        print(f"Sync error: {e}")
+        logger.error("Sync error: %s", e)
     MAIN_LOOP = asyncio.get_running_loop()
     restore_state()
     if bot_runtime_state.get("startup_initialized"):
@@ -3523,6 +4243,10 @@ async def on_ready():
     bot_runtime_state["startup_warmup_complete_logged"] = False
     bot_runtime_state["startup_warmup_banner_logged"] = False
     bot_runtime_state["startup_initialized"] = True
+    with ECONOMY_LOCK:
+        purchases = load_purchases()
+        if retire_old_claim_flow_purchases(purchases):
+            save_purchases(purchases)
     log_limited("startup_warmup_banner", 120, "STARTUP", "warmup active")
     cfg_presence = get_bot_presence_config()
     log_info("STARTUP", f"Admin bot config loaded (steam_id={str(cfg_presence.get('steam_id', '')).strip() or '(empty)'})")
@@ -3555,6 +4279,7 @@ async def on_ready():
 
     for guild in bot.guilds:
         await cache_guild_invites(guild)
+    await reconcile_eventers_overrides()
     await send_restart_incident(
         "Recovery Complete",
         "Bot systems reconnected and monitoring has resumed.",
@@ -3579,12 +4304,51 @@ async def on_member_join(member):
     if member.bot:
         return
 
+    try:
+        print(f"[JOIN DETECTED] {member.name}")
+        guild = member.guild
+
+        if ROLE_ID != 0:
+            role = guild.get_role(ROLE_ID)
+            if role:
+                try:
+                    await member.add_roles(role)
+                    print("[WELCOME] Role given")
+                except Exception as e:
+                    print(f"[WELCOME ERROR] {e}")
+            else:
+                print("[WELCOME ERROR] Role not found")
+        else:
+            print("[WELCOME ERROR] ROLE_ID not set")
+
+        if CHANNEL_ID != 0:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel:
+                try:
+                    await channel.send(
+                        f"🌑 Welcome to Primal Abyss! 🌑\n\n"
+                        f"Hey {member.mention}!\n"
+                        f"Please check out the rules.\n\n"
+                        f"🔥 Earn Primal Energy\n"
+                        f"🛒 Use it in the shop\n"
+                        f"⚔️ Dominate the server"
+                    )
+                    print("[WELCOME] Message sent")
+                except Exception as e:
+                    print(f"[WELCOME ERROR] {e}")
+            else:
+                print("[WELCOME ERROR] Channel not found")
+        else:
+            print("[WELCOME ERROR] CHANNEL_ID not set")
+    except Exception as e:
+        print(f"[WELCOME ERROR] {e}")
+
     general_channel = discord.utils.get(member.guild.text_channels, name="general")
     if general_channel:
         await general_channel.send(
             f"👋 Welcome {member.mention} to Primal Abyss!\n"
             f"⚡ Earn energy by playing\n"
-            f"🔗 Use !link <steamid>"
+            f"🔗 Use /link <steamid>"
         )
 
     if datetime.now(timezone.utc) - member.created_at < timedelta(days=1):
@@ -3633,14 +4397,364 @@ async def on_member_join(member):
 
 
 @bot.event
+async def on_member_update(before, after):
+    if getattr(after, "bot", False):
+        return
+    had_eventers = is_eventers(before)
+    has_eventers = is_eventers(after)
+    if (not had_eventers) and has_eventers:
+        apply_eventers_override(after)
+    elif had_eventers and (not has_eventers):
+        restore_eventers_balance(after)
+
+
+@bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     raise error
 
 
-@bot.command()
-async def link(ctx, steam_id: str):
+def _sanitize_ticket_username(name: str) -> str:
+    value = re.sub(r"[^a-z0-9-]+", "-", str(name or "").lower()).strip("-")
+    return value[:24] or "user"
+
+
+async def _get_or_create_tickets_category(guild: discord.Guild):
+    category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+    if category:
+        return category
+    try:
+        return await guild.create_category(TICKET_CATEGORY_NAME)
+    except Exception as e:
+        print(f"[TICKETS ERROR] category create failed: {e}")
+        return None
+
+
+def _find_existing_ticket(guild: discord.Guild, user: discord.Member):
+    marker = f"ticket_owner:{user.id}"
+    for channel in guild.text_channels:
+        if not channel.name.startswith("ticket-"):
+            continue
+        if marker in str(channel.topic or ""):
+            return channel
+    return None
+
+
+async def _create_ticket_channel(interaction: discord.Interaction, ticket_type: str):
+    guild = interaction.guild
+    user = interaction.user
+    if not guild or not isinstance(user, discord.Member):
+        return None, "❌ Ticket creation is only available in a server."
+
+    existing = _find_existing_ticket(guild, user)
+    if existing:
+        return existing, f"⚠️ You already have an open ticket: {existing.mention}"
+
+    category = await _get_or_create_tickets_category(guild)
+    if category is None:
+        return None, "❌ Could not access ticket category."
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    for role_name in TICKET_STAFF_ROLES:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    channel_name = f"ticket-{_sanitize_ticket_username(user.name)}"
+    try:
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"ticket_owner:{user.id} ticket_type:{ticket_type}",
+        )
+    except Exception as e:
+        print(f"[TICKETS ERROR] channel create failed: {e}")
+        return None, "❌ Could not create ticket channel."
+
+    return channel, None
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _handle_ticket(self, interaction: discord.Interaction, ticket_type: str):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            channel, err = await _create_ticket_channel(interaction, ticket_type)
+            if err:
+                await interaction.followup.send(err, ephemeral=True)
+                return
+            await channel.send(
+                "🎟️ Ticket Created\n"
+                f"User: {interaction.user.mention}\n"
+                f"Type: {ticket_type}\n\n"
+                "Staff will assist you shortly."
+            )
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            print(f"[TICKETS ERROR] handle ticket failed: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Ticket creation failed.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
+
+    @discord.ui.button(label="Report Admins", style=discord.ButtonStyle.danger, custom_id="ticket_report_admins")
+    async def report_admins(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Report Admins")
+
+    @discord.ui.button(label="Report Players", style=discord.ButtonStyle.primary, custom_id="ticket_report_players")
+    async def report_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Report Players")
+
+    @discord.ui.button(label="Bugs / Help", style=discord.ButtonStyle.success, custom_id="ticket_bugs_help")
+    async def bugs_help(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Bugs / Help")
+
+
+async def _get_or_create_ticket_log_channel(guild: discord.Guild):
+    channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if channel:
+        return channel
+    try:
+        return await guild.create_text_channel(LOG_CHANNEL_NAME)
+    except Exception as e:
+        print(f"[TICKETS ERROR] log channel create failed: {e}")
+        return None
+
+
+async def _save_and_send_ticket_transcript(channel: discord.TextChannel):
+    try:
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        lines = []
+        async for msg in channel.history(limit=100, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            author = getattr(msg.author, "name", "Unknown")
+            content = msg.content or "[no text]"
+            lines.append(f"[{ts}] {author}: {content}")
+
+        transcript_path = TRANSCRIPTS_DIR / f"ticket-{channel.name}.txt"
+        transcript_path.write_text("\n".join(lines), encoding="utf-8")
+
+        log_channel = await _get_or_create_ticket_log_channel(channel.guild)
+        if log_channel:
+            try:
+                await log_channel.send(
+                    f"🧾 Transcript for {channel.name}",
+                    file=discord.File(str(transcript_path)),
+                )
+            except Exception as e:
+                print(f"[TICKETS ERROR] transcript upload failed: {e}")
+    except Exception as e:
+        print(f"[TICKETS ERROR] transcript generation failed: {e}")
+
+
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            channel = interaction.channel
+            guild = interaction.guild
+            user = interaction.user
+            if not isinstance(channel, discord.TextChannel) or not guild or not isinstance(user, discord.Member):
+                await interaction.response.send_message("You cannot close this ticket.", ephemeral=True)
+                return
+
+            owner_id = None
+            if channel.name.startswith("ticket-"):
+                tail = channel.name.split("ticket-", 1)[-1].strip()
+                if tail.isdigit():
+                    owner_id = int(tail)
+            if owner_id is None:
+                topic = str(channel.topic or "")
+                if "ticket_owner:" in topic:
+                    try:
+                        owner_id = int(topic.split("ticket_owner:", 1)[1].split()[0].strip())
+                    except Exception:
+                        owner_id = None
+
+            allowed = (owner_id == user.id)
+            if not allowed:
+                for role_name in ("Higher Ups", "Ticket Admin"):
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role and role in getattr(user, "roles", []):
+                        allowed = True
+                        break
+            if not allowed:
+                await interaction.response.send_message("You cannot close this ticket.", ephemeral=True)
+                return
+
+            await interaction.response.send_message("🔒 Closing ticket... generating transcript.")
+            await _save_and_send_ticket_transcript(channel)
+            await asyncio.sleep(5)
+            await channel.delete(reason=f"Ticket closed by {user}")
+        except Exception as e:
+            print(f"[TICKETS ERROR] close ticket failed: {e}")
+
+
+class TicketButton(discord.ui.Button):
+    def __init__(self, label: str, style: discord.ButtonStyle, custom_id: str, ticket_type: str):
+        super().__init__(label=label, style=style, custom_id=custom_id)
+        self.ticket_type = ticket_type
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            guild = interaction.guild
+            user = interaction.user
+            if not guild or not isinstance(user, discord.Member):
+                await interaction.response.send_message("Ticket creation is only available in a server.", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            existing_name = f"ticket-{user.id}".lower()
+            if discord.utils.get(guild.text_channels, name=existing_name):
+                await interaction.followup.send("You already have an open ticket", ephemeral=True)
+                return
+
+            try:
+                category = discord.utils.get(guild.categories, name="Tickets")
+            except Exception:
+                category = None
+
+            if category is None:
+                try:
+                    category = await guild.create_category("Tickets")
+                except Exception as e:
+                    print(f"[TICKETS ERROR] category create failed: {e}")
+                    await interaction.followup.send("❌ Could not create ticket category", ephemeral=True)
+                    return
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True
+                ),
+            }
+            for role_name in ("Higher Ups", "Ticket Admin"):
+                try:
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role:
+                        overwrites[role] = discord.PermissionOverwrite(
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            manage_messages=True
+                        )
+                except Exception as e:
+                    print(f"[TICKETS ERROR] role lookup failed ({role_name}): {e}")
+
+            try:
+                channel = await guild.create_text_channel(
+                    name=f"ticket-{user.id}",
+                    category=category,
+                    overwrites=overwrites,
+                    topic=f"ticket_owner:{user.id}",
+                )
+            except Exception as e:
+                print(f"[TICKETS ERROR] channel create failed: {e}")
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
+                return
+
+            try:
+                higher_role = discord.utils.get(guild.roles, name="Higher Ups")
+                admin_role = discord.utils.get(guild.roles, name="Ticket Admin")
+                mentions = ""
+                if higher_role:
+                    mentions += higher_role.mention + " "
+                if admin_role:
+                    mentions += admin_role.mention
+                await channel.send(
+                    f"{mentions}\n"
+                    "🎟️ Ticket Created\n\n"
+                    f"User: {user.mention}\n"
+                    "Staff will assist you shortly.",
+                    view=CloseTicketView(),
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            except Exception as e:
+                print(f"[TICKETS ERROR] initial ticket message failed: {e}")
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            print(f"[TICKETS ERROR] persistent button callback failed: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Ticket creation failed.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
+
+
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketButton("Report Admins", discord.ButtonStyle.danger, "ticket_admin", "Report Admins"))
+        self.add_item(TicketButton("Report Players", discord.ButtonStyle.primary, "ticket_player", "Report Players"))
+        self.add_item(TicketButton("Bugs / Help", discord.ButtonStyle.success, "ticket_help", "Bugs / Help"))
+
+
+async def _send_ticket_panel(channel: discord.abc.Messageable):
+    view = TicketPanelView()
+    await channel.send("🎫 **Support Tickets**\nChoose a category below to open a private ticket.", view=view)
+
+
+@bot.tree.command(name="setup", description="Create ticket panel", guild=GUILD)
+async def setup(interaction: discord.Interaction):
+    roles = getattr(interaction.user, "roles", []) or []
+    if not any(str(getattr(role, "name", "")).strip().lower() == "higher ups" for role in roles):
+        await interaction.response.send_message("You do not have permission", ephemeral=True)
+        return
+    try:
+        await interaction.response.send_message("✅ Ticket panel sent.", ephemeral=True)
+        await interaction.channel.send(
+            "🎫 **Support Tickets**\nChoose a category below to open a private ticket.",
+            view=TicketView(),
+        )
+    except Exception as e:
+        print(f"[TICKETS ERROR] setup panel send failed: {e}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    if str(message.content or "").strip().lower() == "!tickets":
+        try:
+            await _send_ticket_panel(message.channel)
+        except Exception as e:
+            print(f"[TICKETS ERROR] panel send failed: {e}")
+
+
+class InteractionContextAdapter:
+    def __init__(self, interaction: discord.Interaction):
+        self.interaction = interaction
+        self.author = interaction.user
+
+    async def send(self, *args, **kwargs):
+        if not self.interaction.response.is_done():
+            await self.interaction.response.send_message(*args, **kwargs)
+        else:
+            await self.interaction.followup.send(*args, **kwargs)
+
+
+@bot.tree.command(name="link", description="Link your Steam ID", guild=GUILD)
+async def link(interaction: discord.Interaction, steam_id: str):
+    ctx = InteractionContextAdapter(interaction)
     links = load_json(LINK_FILE, {})
     links[str(ctx.author.id)] = steam_id
     save_json(LINK_FILE, links)
@@ -3659,13 +4773,14 @@ async def link(ctx, steam_id: str):
     await ctx.send(embed=build_action_embed("Account Linked", "Your Steam account has been linked.", ctx.author.display_name, int(data.get(steam_id, {}).get("energy", get_starting_energy())), discord.Color.green()))
 
 
-@bot.command()
-async def stats(ctx):
+@bot.tree.command(name="stats", description="Show your stats", guild=GUILD)
+async def stats(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     player, steam_id, data, _ = get_latest_player_record_by_discord_id(str(ctx.author.id))
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
     player = data.get(steam_id, player)
@@ -3685,8 +4800,9 @@ async def stats(ctx):
     )
 
 
-@bot.command()
-async def online(ctx):
+@bot.tree.command(name="online", description="Show online players", guild=GUILD)
+async def online(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     players = get_online_players_from_data()
@@ -3706,14 +4822,16 @@ async def online(ctx):
     await ctx.send("\n".join(lines))
 
 
-@bot.command()
-async def shop(ctx):
+@bot.tree.command(name="shop", description="Show shop", guild=GUILD)
+async def shop(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     shop_data = load_shop()
+    valid_categories = get_valid_shop_categories(shop_data)
     msg = "🛒 **Primal Abyss Shop**\n\n"
 
-    for cat, items in shop_data.items():
+    for cat, items in valid_categories.items():
         msg += f"**{cat.upper()}**\n"
         for item, price in items.items():
             msg += f"{item} — ⚡ {price}\n"
@@ -3722,18 +4840,123 @@ async def shop(ctx):
     await ctx.send(msg)
 
 
-@bot.command()
-async def buy(ctx, item: str):
+@bot.tree.command(name="pay", description="Give energy to a player", guild=GUILD)
+@app_commands.describe(user="User to give energy to", amount="Amount of energy")
+async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            links = load_json(LINK_FILE, {})
+            steam_id = links.get(str(user.id))
+            if not steam_id or steam_id not in data:
+                await interaction.response.send_message("❌ User not linked.", ephemeral=True)
+                return
+            before = int(data[steam_id].get("energy", 0))
+            data[steam_id]["energy"] = before + int(amount)
+            save_json(DATA_FILE, data)
+            log_transaction(user.id, "pay", int(amount))
+        logger.info("[ADMIN ENERGY] pay user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
+        await interaction.response.send_message(
+            f"✅ Gave {amount} energy to {user.mention} (Now: {data[steam_id]['energy']})"
+        )
+    except Exception as e:
+        logger.error("pay command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="remove", description="Remove energy from a player", guild=GUILD)
+@app_commands.describe(user="User to remove energy from", amount="Amount of energy")
+async def remove(interaction: discord.Interaction, user: discord.Member, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            links = load_json(LINK_FILE, {})
+            steam_id = links.get(str(user.id))
+            if not steam_id or steam_id not in data:
+                await interaction.response.send_message("❌ User not linked.", ephemeral=True)
+                return
+            before = int(data[steam_id].get("energy", 0))
+            data[steam_id]["energy"] = max(0, before - int(amount))
+            save_json(DATA_FILE, data)
+            log_transaction(user.id, "remove", int(amount))
+        logger.info("[ADMIN ENERGY] remove user=%s steam=%s amount=%s before=%s after=%s", user.id, steam_id, amount, before, data[steam_id]["energy"])
+        await interaction.response.send_message(
+            f"➖ Removed {amount} energy from {user.mention} (Now: {data[steam_id]['energy']})"
+        )
+    except Exception as e:
+        logger.error("remove command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="balance", description="Check your energy", guild=GUILD)
+async def balance(interaction: discord.Interaction):
+    try:
+        player, _steam_id = get_player(interaction)
+        if not player:
+            await interaction.response.send_message("❌ You are not linked.", ephemeral=True)
+            return
+        energy = int(player.get("energy", 0))
+        await interaction.response.send_message(f"💰 You have {energy} Primal Energy")
+    except Exception as e:
+        logger.error("balance command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="giveall", description="Give energy to all players", guild=GUILD)
+@app_commands.describe(amount="Amount of energy")
+async def giveall(interaction: discord.Interaction, amount: int):
+    try:
+        if not is_higher_up(interaction):
+            await interaction.response.send_message("❌ No permission", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("❌ Invalid amount", ephemeral=True)
+            return
+        with ECONOMY_LOCK:
+            data = load_json(DATA_FILE, {})
+            for steam_id in data:
+                data[steam_id]["energy"] = int(data[steam_id].get("energy", 0)) + int(amount)
+            save_json(DATA_FILE, data)
+            log_transaction(interaction.user.id, "giveall", int(amount))
+        logger.info("[ADMIN ENERGY] giveall by=%s amount=%s", interaction.user.id, amount)
+        await interaction.response.send_message(f"✅ Gave {amount} energy to ALL players")
+    except Exception as e:
+        logger.error("giveall command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
+
+
+@bot.tree.command(name="buy", description="Buy a dinosaur", guild=GUILD)
+@app_commands.describe(dino="Choose dinosaur")
+@cooldown(10)
+async def buy(interaction: discord.Interaction, dino: str):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
+    logger.info("%s used /buy %s", interaction.user, dino)
+    item = str(dino or "").lower().strip()
+    dino_choices = get_dino_choices_from_shop()
+    if item not in dino_choices:
+        await interaction.response.send_message("❌ Invalid dinosaur option.", ephemeral=True)
+        return
     if is_admin_bot_offline():
         print("[BUY BLOCKED] admin bot offline")
-        record_manual_issue(ctx, "!buy", item)
+        record_manual_issue(ctx, "/buy", item)
         await ctx.send("⚠️ Purchases are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
     if str(bot_runtime_state.get("admin_bot_state", "")).upper() == "GRACE":
         await ctx.send("⚠️ Admin bot temporarily unavailable (grace period active). Request may be delayed.")
 
-    item = item.lower().strip()
     price, category = find_shop_price(item)
 
     if price is None:
@@ -3753,40 +4976,52 @@ async def buy(ctx, item: str):
         steam_id = get_steam_id_for_discord(str(ctx.author.id), links)
         player = data.get(steam_id) if steam_id else None
         if not player:
-            response_message = "❌ Use !link first"
-        elif any(p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES for p in purchases):
-            response_message = "❌ You already have an active purchase. Use `!claim` first."
+            response_message = "❌ Use /link first"
+        elif any(
+            p.get("steam_id") == steam_id and str(p.get("status", "")).upper() in {"UNCLAIMED", "CLAIMING"}
+            for p in purchases
+        ):
+            response_message = "❌ You already have an active purchase. Use `/claim` first."
         elif int(player.get("energy", 0)) < int(price):
             response_message = "❌ Not enough energy"
         else:
             duplicate_unclaimed = any(
                 p.get("steam_id") == steam_id
                 and str(p.get("item", "")).lower().strip() == item
-                and p.get("status") in CLAIM_OPEN_STATES
+                and str(p.get("status", "")).upper() in {"UNCLAIMED", "CLAIMING"}
                 for p in purchases
             )
             if duplicate_unclaimed:
-                response_message = "❌ You already have an active purchase for this dino. Use `!claim` first."
+                response_message = "❌ You already have an active purchase for this dino. Use `/claim` first."
             else:
                 _, after = adjust_energy_in_data(data, steam_id, -int(price))
                 save_json(DATA_FILE, data)
+                log_transaction(interaction.user.id, "buy", int(price))
+                if item == "allo":
+                    print(f"[SHOP] allo purchase steam={steam_id} cost={int(price)}")
                 new_purchase = {
                     "player": player["name"],
                     "steam_id": steam_id,
                     "item": item,
+                    "dino_type": item,
                     "status": "UNCLAIMED",
                     "time": str(datetime.now()),
+                    "timestamp": str(datetime.now()),
                     "claimed_at": None,
+                    "delivered_at": None,
+                    "failed_at": None,
                     "delivery_note": None,
                     "failure_note": None,
-                    "claim_group_id": None,
                     "refund_applied": False,
                     "refund_amount": 0,
                     "refunded_at": None,
                     "refund_note": None,
+                    "timeout_reason": None,
                     "economy_note": f"Buy deducted {price} energy @ {datetime.now()}",
                 }
                 purchases.append(new_purchase)
+                if item == "allo":
+                    print(f"[CLAIM] allo created steam={steam_id}")
                 try:
                     save_purchases(purchases)
                     response_message = (
@@ -3795,7 +5030,7 @@ async def buy(ctx, item: str):
                         f"💰 Remaining energy: {after}\n"
                         f"📦 Claim saved\n"
                         f"⏳ Expires in {PURCHASE_TIMEOUT_MINUTES} minutes if not claimed\n\n"
-                        f"Use `!claim` when you are ready to be primed."
+                        f"Use `/claim` when you are ready to be primed."
                     )
                 except Exception:
                     adjust_energy_in_data(data, steam_id, int(price))
@@ -3805,16 +5040,48 @@ async def buy(ctx, item: str):
     await ctx.send(response_message or "❌ Purchase failed unexpectedly.")
 
 
-@bot.command()
-async def claim(ctx):
+@buy.autocomplete("dino")
+async def buy_autocomplete(interaction: discord.Interaction, current: str):
+    shop = load_shop()
+    valid_categories = get_valid_shop_categories(shop)
+    choices = []
+    for category in valid_categories.values():
+        for dino_name in category.keys():
+            choices.append(str(dino_name).strip().lower())
+    return [
+        app_commands.Choice(name=d, value=d)
+        for d in choices
+        if current.lower() in d.lower()
+    ][:25]
+
+
+@bot.tree.command(name="claim", description="Claim latest purchase", guild=GUILD)
+async def claim(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
     current_server_state = str(bot_runtime_state.get("server_state", SERVER_STATE_ONLINE))
-    if current_server_state in {SERVER_STATE_RESTARTING, SERVER_STATE_RECOVERING, SERVER_STATE_DOWN, SERVER_STATE_SUSPECTED_DOWN}:
-        await ctx.send("⚠️ Claims are temporarily unavailable while the server is restarting/recovering. Please try again shortly.")
+    admin_state = str(bot_runtime_state.get("admin_bot_state", "")).upper()
+    last_poll_ok = bool(bot_runtime_state.get("last_player_poll_ok", False))
+    player_count = int(bot_runtime_state.get("last_player_poll_player_count", 0) or 0)
+    claimable, reason = is_server_claimable_now()
+    print(
+        f"[CLAIM GATE] state={current_server_state} admin_state={admin_state} "
+        f"last_poll_ok={last_poll_ok} player_count={player_count} "
+        f"result={'allow' if claimable else 'block'} reason={reason}"
+    )
+    if not claimable:
+        if reason == "server_restarting":
+            await ctx.send("⚠️ Claims are temporarily unavailable while the server is restarting. Please try again shortly.")
+        elif reason == "server_recovering":
+            await ctx.send("⚠️ Claims are temporarily unavailable while the server is still recovering. Please try again shortly.")
+        elif reason == "server_down":
+            await ctx.send("⚠️ Claims are temporarily unavailable because the server is currently offline.")
+        else:
+            await ctx.send("⚠️ Claims are temporarily unavailable right now. Please try again shortly.")
         return
     if is_admin_bot_offline():
         print("[CLAIM BLOCKED] admin bot offline")
-        record_manual_issue(ctx, "!claim", "")
+        record_manual_issue(ctx, "/claim", "")
         await ctx.send("⚠️ Claims are temporarily disabled while the admin bot is offline. Please open a support ticket.")
         return
     if str(bot_runtime_state.get("admin_bot_state", "")).upper() == "GRACE":
@@ -3823,92 +5090,33 @@ async def claim(ctx):
     player, steam_id = get_player(ctx)
 
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        purchase_index, purchase_status = get_claimable_purchase_index(purchases, steam_id)
+    lock = get_simple_claim_lock(steam_id)
+    if lock.locked():
+        await ctx.send("⏳ Your claim is already in progress.")
+        return
 
+    async with lock:
+        with ECONOMY_LOCK:
+            purchases = load_purchases()
+            purchase_index = get_latest_unclaimed_purchase_index(purchases, steam_id)
         if purchase_index is None:
-            latest_mine = None
-            for p in reversed(purchases):
-                if p.get("steam_id") == steam_id:
-                    latest_mine = p
-                    break
-            if latest_mine and latest_mine.get("status") == "WRONG_DINO_REFUNDED":
-                response = (
-                    "❌ Claim blocked: wrong dino detected on your last attempt. "
-                    "Your energy has been refunded. Switch dinos and buy again when ready."
-                )
-            elif latest_mine and latest_mine.get("status") == "FAILED":
-                if latest_mine.get("timeout_reason") == "claim_queue_timeout":
-                    response = "⚠️ Your claim timed out after 2 minutes. Your energy has been refunded. Please run !claim again."
-                else:
-                    note = latest_mine.get("delivery_note") or "⚠️ Verification timed out. No grow was applied."
-                    response = f"⚠️ {note}"
-            else:
-                response = "❌ You do not have any active dinosaur purchases."
-        else:
-            purchase = purchases[purchase_index]
-            if purchase_status in {"PRECHECK_QUEUED", "PRECHECK_VERIFYING", "PRECHECK_PASSED", "CLAIM_SEQUENCE_QUEUED", "FINAL_VERIFY_PENDING"}:
-                status_label, pct = get_claim_status_display(purchase.get("status"))
-                pct_text = f"{pct}% complete" if pct is not None else "in progress"
-                response = (
-                    f"⏳ Your claim is already in progress — {pct_text}.\n"
-                    f"Status: {status_label}."
-                )
-            else:
-                game_commands = load_game_commands()
-                existing_group_id = find_existing_active_claim_group_id(
-                    game_commands,
-                    steam_id,
-                    purchase.get("item", ""),
-                )
-                if existing_group_id:
-                    purchase["status"] = "PRECHECK_QUEUED"
-                    purchase["claim_started_at"] = purchase.get("claim_started_at") or str(datetime.now())
-                    purchase["claimed_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Existing pending command found"
-                    purchase["claim_group_id"] = existing_group_id
-                    save_purchases(purchases)
-                    response = "Your claim is already in progress — 20% complete."
-                else:
-                    if not purchase.get("claim_group_id"):
-                        purchase["claim_group_id"] = f"claim_{steam_id}_{uuid.uuid4().hex[:10]}"
-                    queue_claim_phase_commands(purchase, player["name"], "PRECHECK")
-                    purchase["status"] = "PRECHECK_QUEUED"
-                    purchase["claim_started_at"] = str(datetime.now())
-                    purchase["claimed_at"] = str(datetime.now())
-                    purchase["delivery_note"] = "Pre-check queued. Awaiting health/class verification."
-                    purchase["failure_note"] = None
-                    save_purchases(purchases)
-                    response = "Pre-check queued — 20% complete. Stay on the dinosaur you bought."
-
-    sent_message = await ctx.send(response)
-    with ECONOMY_LOCK:
-        purchases = load_purchases()
-        target = None
-        for p in reversed(purchases):
-            if p.get("steam_id") == steam_id and p.get("status") in CLAIM_OPEN_STATES.union({"FAILED", "WRONG_DINO_REFUNDED", "DELIVERED"}):
-                target = p
-                break
-        if target and target.get("claim_group_id"):
-            target["progress_channel_id"] = int(ctx.channel.id)
-            target["progress_message_id"] = int(sent_message.id)
-            target["progress_guild_id"] = int(ctx.guild.id) if ctx.guild else None
-            target["progress_user_id"] = int(ctx.author.id)
-            save_purchases(purchases)
+            await ctx.send("❌ You do not have any unclaimed dinosaur purchases.")
+            return
+        await run_simple_claim_flow(ctx, purchase_index, steam_id)
 
 
-@bot.command()
-async def myclaims(ctx):
+@bot.tree.command(name="myclaims", description="List your purchases", guild=GUILD)
+async def myclaims(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     expire_old_purchases()
 
     player, steam_id = get_player(ctx)
 
     if not player:
-        await ctx.send("❌ Use !link first")
+        await ctx.send("❌ Use /link first")
         return
 
     purchases = load_purchases()
@@ -3918,21 +5126,35 @@ async def myclaims(ctx):
         await ctx.send("📭 You have no purchases.")
         return
 
-    lines = ["📦 **Your Purchases**\n"]
-    for p in mine[-10:]:
-        label, pct = get_claim_status_display(p.get("status"))
-        pct_text = f"{pct}% complete" if pct is not None else "Not completed"
-        extra_note = clean_claim_note_for_user(p.get("failure_note") or p.get("delivery_note") or "")
+    lines = ["📦 **Your Purchases (Newest First)**\n"]
+    for p in reversed(mine[-10:]):
+        status = str(p.get("status") or "").upper()
+        if status == "DELIVERED":
+            label = "✅ Completed"
+        elif status == "CLAIMING":
+            label = "🔄 Claiming"
+        elif status == "FAILED":
+            label = "❌ Failed"
+        elif status == "EXPIRED":
+            label = "⌛ Expired"
+        else:
+            label = "⏳ Unclaimed"
+        raw_note = str(p.get("failure_note") or p.get("delivery_note") or "")
+        if "Old claim flow retired" in raw_note or "timed out" in raw_note.lower():
+            extra_note = raw_note.strip()
+        else:
+            extra_note = clean_claim_note_for_user(raw_note)
         lines.append(
-            f"{p.get('item', '?').upper()} — {label} — {pct_text}"
+            f"{p.get('item', '?').upper()} — {label}"
             + (f" — {extra_note}" if extra_note else "")
         )
 
     await ctx.send("\n".join(lines))
 
 
-@bot.command()
-async def invites(ctx):
+@bot.tree.command(name="invites", description="Show your invite count", guild=GUILD)
+async def invites(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     referrals = load_referrals()
     discord_id = str(ctx.author.id)
     ensure_referral_record(referrals, discord_id)
@@ -3945,32 +5167,49 @@ async def invites(ctx):
     )
 
 
-@bot.command()
-async def leaderboard(ctx):
-    referrals = load_referrals()
+@bot.tree.command(name="leaderboard", description="Top players", guild=GUILD)
+async def leaderboard(interaction: discord.Interaction):
+    try:
+        data = load_json(DATA_FILE, {})
+        links = load_json(LINK_FILE, {})
+        steam_to_discord = {v: k for k, v in links.items()}
+        sorted_players = sorted(
+            data.items(),
+            key=lambda x: int(x[1].get("energy", 0)),
+            reverse=True,
+        )[:10]
+        if not sorted_players:
+            await interaction.response.send_message("📭 No players found.")
+            return
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, (steam_id, pdata) in enumerate(sorted_players):
+            energy = int(pdata.get("energy", 0))
+            discord_id = steam_to_discord.get(str(steam_id))
+            if discord_id:
+                try:
+                    user = await bot.fetch_user(int(discord_id))
+                    name = user.name
+                except Exception:
+                    name = f"User({discord_id})"
+            else:
+                name = "Unlinked"
+            prefix = medals[i] if i < 3 else f"#{i+1}"
+            lines.append(f"{prefix} **{name}** — {energy} ⚡")
+        embed = discord.Embed(
+            title="🏆 Primal Abyss Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        logger.error("leaderboard command failed: %s", e)
+        await interaction.response.send_message("❌ Command failed.", ephemeral=True)
 
-    leaderboard_rows = []
-    for discord_id, record in referrals.items():
-        leaderboard_rows.append((discord_id, int(record.get("count", 0))))
 
-    if not leaderboard_rows:
-        await ctx.send("📭 No invite referrals tracked yet.")
-        return
-
-    leaderboard_rows.sort(key=lambda x: x[1], reverse=True)
-    top_five = leaderboard_rows[:5]
-
-    lines = ["🏆 **Top Inviters**\n"]
-    for idx, (discord_id, count) in enumerate(top_five, start=1):
-        user = bot.get_user(int(discord_id))
-        display_name = user.name if user else f"User {discord_id}"
-        lines.append(f"{idx}. **{display_name}** — {count} invites")
-
-    await ctx.send("\n".join(lines))
-
-
-@bot.command()
-async def patreon(ctx):
+@bot.tree.command(name="patreon", description="Show Patreon benefits", guild=GUILD)
+async def patreon(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     embed = discord.Embed(
         title="Patreon Benefits",
         description="Support the server and unlock higher passive energy rates.",
@@ -3983,18 +5222,19 @@ async def patreon(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command()
-async def tiers(ctx):
-    await patreon(ctx)
+@bot.tree.command(name="tiers", description="Alias for patreon", guild=GUILD)
+async def tiers(interaction: discord.Interaction):
+    await patreon(interaction)
 
 
-@bot.command()
-async def checktier(ctx):
+@bot.tree.command(name="checktier", description="Check your Patreon tier", guild=GUILD)
+async def checktier(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     await refresh_patreon_role_cache(force=True)
     links = load_json(LINK_FILE, {})
     steam_id = links.get(str(ctx.author.id))
     if not steam_id:
-        await ctx.send(embed=build_action_embed("Tier Check", "Use `!link <steamid>` first.", ctx.author.display_name, None, discord.Color.red()))
+        await ctx.send(embed=build_action_embed("Tier Check", "Use `/link <steamid>` first.", ctx.author.display_name, None, discord.Color.red()))
         return
     info = patreon_role_cache.get(str(steam_id), {})
     tier = info.get("tier", "Default")
@@ -4011,8 +5251,9 @@ async def checktier(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command()
-async def botstatus(ctx):
+@bot.tree.command(name="botstatus", description="Admin bot status dashboard", guild=GUILD)
+async def botstatus(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
         await ctx.send("❌ Admin only.")
         return
@@ -4020,8 +5261,9 @@ async def botstatus(ctx):
     await ctx.send(embed=build_admin_dashboard_embed())
 
 
-@bot.command()
-async def botissues(ctx):
+@bot.tree.command(name="botissues", description="List blocked requests during outage", guild=GUILD)
+async def botissues(interaction: discord.Interaction):
+    ctx = InteractionContextAdapter(interaction)
     if not (ctx.author.guild_permissions and ctx.author.guild_permissions.administrator):
         await ctx.send("❌ Admin only.")
         return
@@ -4040,4 +5282,11 @@ async def botissues(ctx):
 
 if __name__ == "__main__":
     hydrate_runtime_secrets()
-    bot.run(TOKEN)
+    while True:
+        try:
+            logger.info("Starting bot...")
+            bot.run(TOKEN)
+        except Exception as e:
+            logger.critical(f"Bot crashed: {e}")
+            logger.critical(traceback.format_exc())
+            time.sleep(5)

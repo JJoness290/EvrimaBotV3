@@ -1,11 +1,25 @@
 import json
+import logging
 import os
 import tempfile
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyautogui
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "executor.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 GAME_COMMANDS_FILE = Path("game_commands.json")
 CONFIG_FILE = Path("config.json")
@@ -14,13 +28,15 @@ PLAYER_STATE_FILE = Path("player_state.json")
 
 DEFAULT_POST_SEND_DELAYS = {
     "/elder": 3,
-    "/growth": 2,
-    "/diet1": 1,
-    "/diet2": 1,
-    "/diet3": 1,
-    "/hunger": 1,
+    "/growth": 1,
+    "/diet1": 0,
+    "/diet2": 0,
+    "/diet3": 0,
+    "/hunger": 0,
+    "/thirst": 1,
     "/health": 1,
 }
+KEEP_ALIVE_INTERVAL = 600  # seconds (easy to change)
 
 
 def load_json(path: Path, default):
@@ -81,20 +97,113 @@ def write_heartbeat(state: str, extra: dict | None = None):
     if extra:
         payload.update(extra)
     save_json(EXECUTOR_HEARTBEAT_FILE, payload)
-    print("[EXECUTOR] heartbeat updated")
+
+
+def find_game_window():
+    try:
+        import pygetwindow as gw
+        titles = gw.getAllTitles()
+        for title in titles:
+            t = str(title or "").strip()
+            if not t:
+                continue
+            lowered = t.lower()
+            if ("theisle" in lowered) or ("isle" in lowered):
+                matches = gw.getWindowsWithTitle(t)
+                if matches:
+                    logger.info("[WINDOW FOUND] %s", t)
+                    return matches[0]
+    except Exception as e:
+        logger.error("WINDOW LOOKUP ERROR: %s", e)
+    logger.warning("Game window not found")
+    return None
+
+
+def send_chat_command(command: str):
+    try:
+        import time
+        import pyautogui
+
+        win = find_game_window()
+        if not win:
+            return
+
+        try:
+            win.activate()
+            time.sleep(0.5)
+        except Exception:
+            try:
+                win.restore()
+                time.sleep(0.2)
+                win.activate()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+        try:
+            pyautogui.click(win.left + 100, win.top + 100)
+            time.sleep(0.2)
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
+
+        logger.info("[CHAT CMD] %s", command)
+        try:
+            pyautogui.press("enter")
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
+        time.sleep(0.3)
+        try:
+            pyautogui.write(command, interval=0.02)
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
+        time.sleep(0.2)
+        try:
+            pyautogui.press("enter")
+        except Exception as e:
+            logger.error("PYAUTOGUI ERROR: %s", e)
+            return
+        time.sleep(0.2)
+        logger.info("[CHAT CMD SENT]")
+    except Exception as e:
+        logger.error("[CHAT ERROR] %s", e)
+
+
+def safe_command(cmd: str):
+    try:
+        logger.info("SENDING: %s", cmd)
+        send_chat_command(cmd)
+        logger.info("SENT: %s", cmd)
+    except Exception as e:
+        logger.error("FAILED: %s -> %s", cmd, e)
 
 
 def type_command(cmd: str):
-    pyautogui.press("enter")
-    time.sleep(0.25)
-    pyautogui.write(cmd)
-    time.sleep(0.25)
-    pyautogui.press("enter")
+    safe_command(cmd)
 
 
 def is_bot_in_game():
     state = load_json(PLAYER_STATE_FILE, {})
     return str(state.get("bot_presence_state", "")).strip().upper() == "BOT_IN_GAME"
+
+
+def keep_alive_commands():
+    if not is_bot_in_game():
+        print("[KEEPALIVE] Skipped (bot not in game)")
+        return
+
+    print("[KEEPALIVE] Running sustain commands")
+
+    type_command("/health 100")
+    time.sleep(1)
+
+    type_command("/hunger 100")
+    time.sleep(1)
+
+    type_command("/thirst 100")
+    time.sleep(1)
 
 
 def get_delay_overrides():
@@ -116,7 +225,7 @@ def get_delay_for_command(command_text: str) -> int:
     delays = get_delay_overrides()
     for prefix, delay in delays.items():
         if normalized.startswith(prefix):
-            return int(delay)
+            return max(0, int(delay))
     return 3
 
 
@@ -175,6 +284,11 @@ def process_group(commands_data, claim_group_id: str) -> bool:
     group_cmds.sort(key=lambda c: (int(c.get("claim_step", 9999)), str(c.get("id", ""))))
 
     for command_entry in group_cmds:
+        cmd_id = command_entry.get("id")
+        step = command_entry.get("step_index", command_entry.get("claim_step"))
+        phase = command_entry.get("phase") or command_entry.get("claim_phase")
+        command_text = command_entry.get("command", "")
+        item = str(command_entry.get("item", "")).lower().strip()
         if is_command_expired(command_entry):
             command_entry["status"] = "EXPIRED"
             command_entry["completed_at"] = now_iso()
@@ -189,9 +303,9 @@ def process_group(commands_data, claim_group_id: str) -> bool:
             print("[EXECUTOR] processing sustain command skipped (bot not in game)")
             continue
 
-        command_text = command_entry.get("command", "")
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
+        print(f"[EXEC] {command_text}")
         save_commands(commands_data)
         write_heartbeat("executing", {"group": claim_group_id, "command": command_text})
 
@@ -206,21 +320,26 @@ def process_group(commands_data, claim_group_id: str) -> bool:
                 continue
             elif ctype in {"sustain", "sustain_command"}:
                 print("[EXECUTOR] processing sustain command")
-                type_command(command_text)
+                safe_command(command_text)
                 time.sleep(get_delay_for_command(command_text))
             else:
                 print(f"[EXECUTOR] group={claim_group_id} step={command_entry.get('claim_step')} cmd={command_text}")
-                type_command(command_text)
+                safe_command(command_text)
                 time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
+            print(f"[DONE] {command_text}")
+            if item == "allo":
+                print(f"[EXECUTOR] allo executed cmd_id={cmd_id} step={step} phase={phase}")
             changed = True
             save_commands(commands_data)
+            break
         except Exception as e:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
+            print(f"[FAIL] {command_text} error={e}")
             changed = True
             save_commands(commands_data)
             write_heartbeat("error", {"group": claim_group_id, "error": str(e)})
@@ -238,25 +357,33 @@ def process_legacy(commands_data):
 
     for command_entry in legacy_pending:
         command_text = command_entry.get("command", "")
+        if (
+            str(command_entry.get("command_type", "")).lower() == "claim_command"
+            or command_entry.get("phase")
+            or command_entry.get("claim_phase")
+        ):
+            print(f"[EXECUTOR ERROR] claim command fell into legacy path cmd_id={command_entry.get('id')} command={command_text}")
         command_entry["status"] = "EXECUTING"
         command_entry["started_at"] = now_iso()
         save_commands(commands_data)
         write_heartbeat("executing", {"command": command_text, "type": "legacy"})
 
         try:
-            print(f"[EXECUTOR] legacy cmd={command_text}")
-            type_command(command_text)
+            print(f"[EXEC] {command_text}")
+            safe_command(command_text)
             time.sleep(get_delay_for_command(command_text))
             command_entry["status"] = "DONE"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = None
             changed = True
+            print(f"[DONE] {command_text}")
             save_commands(commands_data)
         except Exception as e:
             command_entry["status"] = "FAILED"
             command_entry["completed_at"] = now_iso()
             command_entry["error"] = str(e)
             changed = True
+            print(f"[FAIL] {command_text} error={e}")
             save_commands(commands_data)
             write_heartbeat("error", {"error": str(e), "type": "legacy"})
             break
@@ -272,8 +399,14 @@ def main():
         print("[EXECUTOR] stale command recovered on startup")
 
     loop_delay = max(1, int(load_config().get("executor_loop_delay_seconds", 2)))
+    last_keep_alive = 0
 
     while True:
+        now = time.time()
+        if now - last_keep_alive >= KEEP_ALIVE_INTERVAL:
+            keep_alive_commands()
+            last_keep_alive = now
+
         write_heartbeat("idle")
         commands_data = load_commands()
         changed = False
@@ -292,4 +425,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            logger.info("EXECUTOR LOOP START")
+            main()
+        except Exception as e:
+            logger.critical("CRASH: %s", e)
+            logger.critical(traceback.format_exc())
+            time.sleep(5)
