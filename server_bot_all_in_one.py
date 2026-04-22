@@ -42,6 +42,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TICKET_CATEGORY_NAME = "Tickets"
+TICKET_STAFF_ROLES = ("Higher Ups", "Ticket Admin")
+
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     LOG_DIR.mkdir(exist_ok=True)
@@ -4208,6 +4211,7 @@ async def on_ready():
     global MAIN_LOOP
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
+    bot.add_view(TicketPanelView())
     try:
         print("Syncing commands...")
         synced = await bot.tree.sync(guild=GUILD)
@@ -4390,6 +4394,125 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     raise error
+
+
+def _sanitize_ticket_username(name: str) -> str:
+    value = re.sub(r"[^a-z0-9-]+", "-", str(name or "").lower()).strip("-")
+    return value[:24] or "user"
+
+
+async def _get_or_create_tickets_category(guild: discord.Guild):
+    category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+    if category:
+        return category
+    try:
+        return await guild.create_category(TICKET_CATEGORY_NAME)
+    except Exception as e:
+        print(f"[TICKETS ERROR] category create failed: {e}")
+        return None
+
+
+def _find_existing_ticket(guild: discord.Guild, user: discord.Member):
+    marker = f"ticket_owner:{user.id}"
+    for channel in guild.text_channels:
+        if not channel.name.startswith("ticket-"):
+            continue
+        if marker in str(channel.topic or ""):
+            return channel
+    return None
+
+
+async def _create_ticket_channel(interaction: discord.Interaction, ticket_type: str):
+    guild = interaction.guild
+    user = interaction.user
+    if not guild or not isinstance(user, discord.Member):
+        return None, "❌ Ticket creation is only available in a server."
+
+    existing = _find_existing_ticket(guild, user)
+    if existing:
+        return existing, f"⚠️ You already have an open ticket: {existing.mention}"
+
+    category = await _get_or_create_tickets_category(guild)
+    if category is None:
+        return None, "❌ Could not access ticket category."
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    for role_name in TICKET_STAFF_ROLES:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    channel_name = f"ticket-{_sanitize_ticket_username(user.name)}"
+    try:
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"ticket_owner:{user.id} ticket_type:{ticket_type}",
+        )
+    except Exception as e:
+        print(f"[TICKETS ERROR] channel create failed: {e}")
+        return None, "❌ Could not create ticket channel."
+
+    return channel, None
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _handle_ticket(self, interaction: discord.Interaction, ticket_type: str):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            channel, err = await _create_ticket_channel(interaction, ticket_type)
+            if err:
+                await interaction.followup.send(err, ephemeral=True)
+                return
+            await channel.send(
+                "🎟️ Ticket Created\n"
+                f"User: {interaction.user.mention}\n"
+                f"Type: {ticket_type}\n\n"
+                "Staff will assist you shortly."
+            )
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            print(f"[TICKETS ERROR] handle ticket failed: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Ticket creation failed.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
+
+    @discord.ui.button(label="Report Admins", style=discord.ButtonStyle.danger, custom_id="ticket_report_admins")
+    async def report_admins(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Report Admins")
+
+    @discord.ui.button(label="Report Players", style=discord.ButtonStyle.primary, custom_id="ticket_report_players")
+    async def report_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Report Players")
+
+    @discord.ui.button(label="Bugs / Help", style=discord.ButtonStyle.success, custom_id="ticket_bugs_help")
+    async def bugs_help(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_ticket(interaction, "Bugs / Help")
+
+
+async def _send_ticket_panel(channel: discord.abc.Messageable):
+    view = TicketPanelView()
+    await channel.send("🎫 **Support Tickets**\nChoose a category below to open a private ticket.", view=view)
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    if str(message.content or "").strip().lower() == "!tickets":
+        try:
+            await _send_ticket_panel(message.channel)
+        except Exception as e:
+            print(f"[TICKETS ERROR] panel send failed: {e}")
 
 
 class InteractionContextAdapter:
