@@ -4513,26 +4513,59 @@ class TicketButton(discord.ui.Button):
                 await interaction.response.send_message("Ticket creation is only available in a server.", ephemeral=True)
                 return
 
-            lowered_name = _sanitize_ticket_username(user.name)
-            for ch in guild.text_channels:
-                ch_name = str(ch.name or "").lower()
-                if not ch_name.startswith("ticket-"):
-                    continue
-                if str(user.id) in ch_name or lowered_name in ch_name or f"ticket_owner:{user.id}" in str(ch.topic or ""):
-                    await interaction.response.send_message("You already have an open ticket", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+
+            existing_name = f"ticket-{user.id}".lower()
+            if discord.utils.get(guild.text_channels, name=existing_name):
+                await interaction.followup.send("You already have an open ticket", ephemeral=True)
+                return
+
+            try:
+                category = discord.utils.get(guild.categories, name="Tickets")
+            except Exception:
+                category = None
+
+            if category is None:
+                try:
+                    category = await guild.create_category("Tickets")
+                except Exception as e:
+                    print(f"[TICKETS ERROR] category create failed: {e}")
+                    await interaction.followup.send("❌ Could not create ticket category", ephemeral=True)
                     return
 
-            await interaction.response.defer(ephemeral=True)
-            channel, err = await _create_ticket_channel(interaction, self.ticket_type)
-            if err:
-                await interaction.followup.send(err, ephemeral=True)
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True),
+            }
+            for role_name in ("Higher Ups", "Ticket Admin"):
+                try:
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role:
+                        overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+                except Exception as e:
+                    print(f"[TICKETS ERROR] role lookup failed ({role_name}): {e}")
+
+            try:
+                channel = await guild.create_text_channel(
+                    name=f"ticket-{user.id}",
+                    category=category,
+                    overwrites=overwrites,
+                )
+            except Exception as e:
+                print(f"[TICKETS ERROR] channel create failed: {e}")
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
                 return
-            await channel.send(
+
+            try:
+                await channel.send(
                 "🎟️ Ticket Created\n\n"
                 f"User: {user.mention}\n"
                 f"Type: {self.ticket_type}\n\n"
                 "A staff member will assist you shortly."
             )
+            except Exception as e:
+                print(f"[TICKETS ERROR] initial ticket message failed: {e}")
             await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
         except Exception as e:
             print(f"[TICKETS ERROR] persistent button callback failed: {e}")
