@@ -4212,6 +4212,7 @@ async def on_ready():
     hydrate_runtime_secrets()
     log_info("STARTUP", "Bot logged in")
     bot.add_view(TicketPanelView())
+    bot.add_view(TicketView())
     try:
         print("Syncing commands...")
         synced = await bot.tree.sync(guild=GUILD)
@@ -4499,9 +4500,75 @@ class TicketPanelView(discord.ui.View):
         await self._handle_ticket(interaction, "Bugs / Help")
 
 
+class TicketButton(discord.ui.Button):
+    def __init__(self, label: str, style: discord.ButtonStyle, custom_id: str, ticket_type: str):
+        super().__init__(label=label, style=style, custom_id=custom_id)
+        self.ticket_type = ticket_type
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            guild = interaction.guild
+            user = interaction.user
+            if not guild or not isinstance(user, discord.Member):
+                await interaction.response.send_message("Ticket creation is only available in a server.", ephemeral=True)
+                return
+
+            lowered_name = _sanitize_ticket_username(user.name)
+            for ch in guild.text_channels:
+                ch_name = str(ch.name or "").lower()
+                if not ch_name.startswith("ticket-"):
+                    continue
+                if str(user.id) in ch_name or lowered_name in ch_name or f"ticket_owner:{user.id}" in str(ch.topic or ""):
+                    await interaction.response.send_message("You already have an open ticket", ephemeral=True)
+                    return
+
+            await interaction.response.defer(ephemeral=True)
+            channel, err = await _create_ticket_channel(interaction, self.ticket_type)
+            if err:
+                await interaction.followup.send(err, ephemeral=True)
+                return
+            await channel.send(
+                "🎟️ Ticket Created\n\n"
+                f"User: {user.mention}\n"
+                f"Type: {self.ticket_type}\n\n"
+                "A staff member will assist you shortly."
+            )
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            print(f"[TICKETS ERROR] persistent button callback failed: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Ticket creation failed.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Ticket creation failed.", ephemeral=True)
+
+
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketButton("Report Admins", discord.ButtonStyle.danger, "ticket_admin", "Report Admins"))
+        self.add_item(TicketButton("Report Players", discord.ButtonStyle.primary, "ticket_player", "Report Players"))
+        self.add_item(TicketButton("Bugs / Help", discord.ButtonStyle.success, "ticket_help", "Bugs / Help"))
+
+
 async def _send_ticket_panel(channel: discord.abc.Messageable):
     view = TicketPanelView()
     await channel.send("🎫 **Support Tickets**\nChoose a category below to open a private ticket.", view=view)
+
+
+@bot.tree.command(name="setup", description="Create ticket panel", guild=GUILD)
+async def setup(interaction: discord.Interaction):
+    roles = getattr(interaction.user, "roles", []) or []
+    if not any(str(getattr(role, "name", "")).strip().lower() == "higher ups" for role in roles):
+        await interaction.response.send_message("You do not have permission", ephemeral=True)
+        return
+    try:
+        await interaction.response.send_message("✅ Ticket panel sent.", ephemeral=True)
+        await interaction.channel.send(
+            "🎫 **Support Tickets**\nChoose a category below to open a private ticket.",
+            view=TicketView(),
+        )
+    except Exception as e:
+        print(f"[TICKETS ERROR] setup panel send failed: {e}")
 
 
 @bot.event
