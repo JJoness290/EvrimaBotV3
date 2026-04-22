@@ -4674,11 +4674,20 @@ class TicketButton(discord.ui.Button):
                 return
 
             try:
+                higher_role = discord.utils.get(guild.roles, name="Higher Ups")
+                admin_role = discord.utils.get(guild.roles, name="Ticket Admin")
+                mentions = ""
+                if higher_role:
+                    mentions += higher_role.mention + " "
+                if admin_role:
+                    mentions += admin_role.mention
                 await channel.send(
+                    f"{mentions}\n"
                     "🎟️ Ticket Created\n\n"
                     f"User: {user.mention}\n"
                     "Staff will assist you shortly.",
                     view=CloseTicketView(),
+                    allowed_mentions=discord.AllowedMentions(roles=True),
                 )
             except Exception as e:
                 print(f"[TICKETS ERROR] initial ticket message failed: {e}")
