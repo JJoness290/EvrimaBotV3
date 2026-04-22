@@ -4304,29 +4304,44 @@ async def on_member_join(member):
     if member.bot:
         return
 
-    guild = member.guild
+    try:
+        print(f"[JOIN DETECTED] {member.name}")
+        guild = member.guild
 
-    role = guild.get_role(ROLE_ID)
-    if role:
-        try:
-            await member.add_roles(role)
-            print(f"[JOIN] Role given to {member.name}")
-        except Exception as e:
-            print(f"[ERROR] Role assign failed: {e}")
+        if ROLE_ID != 0:
+            role = guild.get_role(ROLE_ID)
+            if role:
+                try:
+                    await member.add_roles(role)
+                    print("[WELCOME] Role given")
+                except Exception as e:
+                    print(f"[WELCOME ERROR] {e}")
+            else:
+                print("[WELCOME ERROR] Role not found")
+        else:
+            print("[WELCOME ERROR] ROLE_ID not set")
 
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel:
-        try:
-            await channel.send(
-                f"🌑 Welcome to Primal Abyss! 🌑\n\n"
-                f"Hey {member.mention}!\n"
-                f"Please check out the rules to get started.\n\n"
-                f"🔥 Earn Primal Energy\n"
-                f"🛒 Use it in the shop\n"
-                f"⚔️ Dominate the server"
-            )
-        except Exception as e:
-            print(f"[ERROR] Welcome message failed: {e}")
+        if CHANNEL_ID != 0:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel:
+                try:
+                    await channel.send(
+                        f"🌑 Welcome to Primal Abyss! 🌑\n\n"
+                        f"Hey {member.mention}!\n"
+                        f"Please check out the rules.\n\n"
+                        f"🔥 Earn Primal Energy\n"
+                        f"🛒 Use it in the shop\n"
+                        f"⚔️ Dominate the server"
+                    )
+                    print("[WELCOME] Message sent")
+                except Exception as e:
+                    print(f"[WELCOME ERROR] {e}")
+            else:
+                print("[WELCOME ERROR] Channel not found")
+        else:
+            print("[WELCOME ERROR] CHANNEL_ID not set")
+    except Exception as e:
+        print(f"[WELCOME ERROR] {e}")
 
     general_channel = discord.utils.get(member.guild.text_channels, name="general")
     if general_channel:
