@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 TICKET_CATEGORY_NAME = "Tickets"
 TICKET_STAFF_ROLES = ("Higher Ups", "Ticket Admin")
+LOG_CHANNEL_NAME = "ticket-logs"
+TRANSCRIPTS_DIR = Path("transcripts")
 
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
@@ -4213,6 +4215,7 @@ async def on_ready():
     log_info("STARTUP", "Bot logged in")
     bot.add_view(TicketPanelView())
     bot.add_view(TicketView())
+    bot.add_view(CloseTicketView())
     try:
         print("Syncing commands...")
         synced = await bot.tree.sync(guild=GUILD)
@@ -4500,6 +4503,89 @@ class TicketPanelView(discord.ui.View):
         await self._handle_ticket(interaction, "Bugs / Help")
 
 
+async def _get_or_create_ticket_log_channel(guild: discord.Guild):
+    channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if channel:
+        return channel
+    try:
+        return await guild.create_text_channel(LOG_CHANNEL_NAME)
+    except Exception as e:
+        print(f"[TICKETS ERROR] log channel create failed: {e}")
+        return None
+
+
+async def _save_and_send_ticket_transcript(channel: discord.TextChannel):
+    try:
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        lines = []
+        async for msg in channel.history(limit=100, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            author = getattr(msg.author, "name", "Unknown")
+            content = msg.content or "[no text]"
+            lines.append(f"[{ts}] {author}: {content}")
+
+        transcript_path = TRANSCRIPTS_DIR / f"ticket-{channel.name}.txt"
+        transcript_path.write_text("\n".join(lines), encoding="utf-8")
+
+        log_channel = await _get_or_create_ticket_log_channel(channel.guild)
+        if log_channel:
+            try:
+                await log_channel.send(
+                    f"🧾 Transcript for {channel.name}",
+                    file=discord.File(str(transcript_path)),
+                )
+            except Exception as e:
+                print(f"[TICKETS ERROR] transcript upload failed: {e}")
+    except Exception as e:
+        print(f"[TICKETS ERROR] transcript generation failed: {e}")
+
+
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            channel = interaction.channel
+            guild = interaction.guild
+            user = interaction.user
+            if not isinstance(channel, discord.TextChannel) or not guild or not isinstance(user, discord.Member):
+                await interaction.response.send_message("You cannot close this ticket.", ephemeral=True)
+                return
+
+            owner_id = None
+            if channel.name.startswith("ticket-"):
+                tail = channel.name.split("ticket-", 1)[-1].strip()
+                if tail.isdigit():
+                    owner_id = int(tail)
+            if owner_id is None:
+                topic = str(channel.topic or "")
+                if "ticket_owner:" in topic:
+                    try:
+                        owner_id = int(topic.split("ticket_owner:", 1)[1].split()[0].strip())
+                    except Exception:
+                        owner_id = None
+
+            allowed = (owner_id == user.id)
+            if not allowed:
+                for role_name in ("Higher Ups", "Ticket Admin"):
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role and role in getattr(user, "roles", []):
+                        allowed = True
+                        break
+            if not allowed:
+                await interaction.response.send_message("You cannot close this ticket.", ephemeral=True)
+                return
+
+            await interaction.response.send_message("🔒 Closing ticket... generating transcript.")
+            await _save_and_send_ticket_transcript(channel)
+            await asyncio.sleep(5)
+            await channel.delete(reason=f"Ticket closed by {user}")
+        except Exception as e:
+            print(f"[TICKETS ERROR] close ticket failed: {e}")
+
+
 class TicketButton(discord.ui.Button):
     def __init__(self, label: str, style: discord.ButtonStyle, custom_id: str, ticket_type: str):
         super().__init__(label=label, style=style, custom_id=custom_id)
@@ -4535,14 +4621,28 @@ class TicketButton(discord.ui.Button):
 
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True),
+                user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True
+                ),
             }
             for role_name in ("Higher Ups", "Ticket Admin"):
                 try:
                     role = discord.utils.get(guild.roles, name=role_name)
                     if role:
-                        overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+                        overwrites[role] = discord.PermissionOverwrite(
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            manage_messages=True
+                        )
                 except Exception as e:
                     print(f"[TICKETS ERROR] role lookup failed ({role_name}): {e}")
 
@@ -4551,6 +4651,7 @@ class TicketButton(discord.ui.Button):
                     name=f"ticket-{user.id}",
                     category=category,
                     overwrites=overwrites,
+                    topic=f"ticket_owner:{user.id}",
                 )
             except Exception as e:
                 print(f"[TICKETS ERROR] channel create failed: {e}")
@@ -4559,11 +4660,11 @@ class TicketButton(discord.ui.Button):
 
             try:
                 await channel.send(
-                "🎟️ Ticket Created\n\n"
-                f"User: {user.mention}\n"
-                f"Type: {self.ticket_type}\n\n"
-                "A staff member will assist you shortly."
-            )
+                    "🎟️ Ticket Created\n\n"
+                    f"User: {user.mention}\n"
+                    "Staff will assist you shortly.",
+                    view=CloseTicketView(),
+                )
             except Exception as e:
                 print(f"[TICKETS ERROR] initial ticket message failed: {e}")
             await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
